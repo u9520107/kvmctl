@@ -227,12 +227,15 @@ M1 exit: the implemented vertical slice passes its security, scripted HID, owner
 
 ### M2: Native Windows client
 
-- Build `kvmctl` CLI discovery, authorize, connect, list, and switch commands.
+- Build standalone `kvmctl` CLI USB enumeration/enrollment, mDNS discovery, target management, and foreground KVM sessions without requiring the tray app.
 - Expose the M1 identity storage and USB-only administration/revoke behavior through complete CLI workflows.
-- Add Windows global hotkey and target switching.
-- Add `kvmctld` only when a background process is needed for persistent behavior.
+- Build the resident Rust tray application with no-target, connected/local, and remote-control icons, plus visible connecting/recovery/unavailable/ownership states and target tooltips.
+- Share Rust session functionality, per-user settings, enrollment records, and multiple escape bindings between modes. Choose and verify a broadly usable default; require a working escape binding before remote capture.
+- Add Windows global hotkey, explicit remote activation, safe target switching, and short OSD notices. Local input retains the tray connection, ownership, and heartbeats; takeover prompts return local before interaction.
+- Implement the [control app interaction contract](design.md#control-app-interaction-contract). CLI escape disconnects/exits; tray escape returns local while staying connected. Reconnect restores only the connection, with input local.
+- No separate service, CLI-to-tray command broker, or special simultaneous-process detection is required initially. Prepare shared video-window behavior for video-capable adapters; verify actual video with M3 hardware.
 
-M2 exit: arming, emergency escape, switching, revoke, and reconnect match the resolved design; no stuck input or unexpected routing to inactive targets.
+M2 exit: standalone CLI and resident tray workflows, shared settings, status icons/OSD, ownership while local, arming, emergency escape, switching, revoke, and reconnect match the resolved design; no stuck input or unexpected routing to inactive targets.
 
 ### M3: JetKVM adapter, later
 
@@ -240,6 +243,7 @@ M2 exit: arming, emergency escape, switching, revoke, and reconnect match the re
 - Implement discovery and authorization integration.
 - Map JetKVM input and available video into the shared session model. JetKVM video belongs to this milestone; ESP32 remains input-only.
 - Test JetKVM restart, network changes, and sleep/resume paths.
+- With a JetKVM sample, verify standalone CLI sessions and normal resizable/minimizable video windows: click-to-activate consumes its click; minimize returns local without disconnecting; close releases input and ownership and ends the session. Verify cursor visibility before hiding the local cursor during capture.
 
 ### M4: Video refinement and opt-in power features
 
@@ -264,9 +268,13 @@ Implement report schemas and repeatable tests with their M1 features; stabilize 
 - **Transport mode:** deterministic events use the same authentication, WSS signaling, WebRTC, CBOR, and ESP32 decoder as live mode; no USB HID is emitted. Compare sequence numbers, normalized reports, drop/reorder counts, and queue telemetry.
 - **HID bench mode:** observer filters by ESP32 Raw Input device identity; expected key/modifier/button/wheel/relative-motion reports arrive without suppressing physical devices.
 - **Ownership:** exactly one active control lease; old lease invalid before new owner emits input. Test explicit rejection and no-response takeover after 10 seconds. Implement the documented single-pending-request policy and its race tests together in M1.4.
+- **Enrollment visibility:** normal lists default to enrolled boards; an optional filter shows unenrolled discovery results. Unenrolled clients cannot control or generate takeover prompts. Verify independent enrolled controller/board pairs cannot interfere through unauthorized requests.
+- **Local/remote modes:** returning local in tray mode releases held input but retains connection, lease, and heartbeats. Takeover prompts first return local; rejection retains ownership without automatically resuming remote input. CLI management and foreground sessions work without a resident process; CLI escape disconnects and exits. Both modes use shared per-user settings and bindings; remote capture requires a usable escape binding.
+- **Tray/OSD:** distinguish no target, connected/local, and remote input, plus non-ready connection/ownership conditions. Show target and routing changes through short OSD notices, including recovered-but-local. Explicit disconnect clears selection but preserves enrollment.
+- **Video lifecycle (M3 hardware):** resizing/minimizing uses ordinary window controls. Minimize returns local and retains connection/lease; close releases held input, disconnects, and clears selection, leaving tray running or ending the CLI command. Activation clicks do not reach the target. Cursor restoration works on escape/loss; hiding depends on verified remote-cursor visibility. Input-only targets require no video window or focus.
 - **Held-input safety:** switch, disconnect, timeout, revoke, endpoint restart, and emergency escape clear or reconcile held keys/buttons. Define heartbeat/lease expiry and maximum cleanup delay before implementation.
-- **Selected-target sessions:** switching releases the old lease and closes its network session before connecting the new target. Inactive targets retain no warm WebRTC/signaling sessions. USB HID remains attached. Measure new-session setup and switch latency on the LAN; do not assume it meets an unmeasured target.
-- **Reconnect:** test endpoint restart, address change, network loss, and Windows sleep/resume. Revalidate identity, authorization, capabilities, and ownership before input resumes. Recover automatically to the same selected target only while the outage has not exceeded 60 seconds; discard outage input. Test recovery just before the deadline and failure to recover beyond it, including sleep lasting over one minute. Partial handshakes must not reset the deadline. After timeout, pending connections close, retries stop, input stays disarmed, and late completions cannot resume it. Explicit target selection/connection through the app rearms using saved enrollment. Manual disconnect/disarm/escape cancels recovery immediately. Never silently select another target.
+- **Selected-target sessions:** switching releases the old lease and closes its network session before connecting the new target with input local. Remote activation is explicit. Inactive targets retain no warm WebRTC/signaling sessions. USB HID remains attached. Measure new-session setup and switch latency on the LAN; do not assume it meets an unmeasured target.
+- **Reconnect:** test endpoint restart, address change, network loss, and Windows sleep/resume. Revalidate identity, authorization, capabilities, and ownership before restoring the connection. Recovery leaves input local, restores the local cursor, and shows OSD; remote input requires explicit activation. Recover automatically to the same selected target only while the outage has not exceeded 60 seconds; discard outage input. Test recovery just before the deadline and failure to recover beyond it, including sleep lasting over one minute. Partial handshakes must not reset the deadline. After timeout, pending connections close, retries stop, input stays disarmed, and late completions cannot resume it. Explicit target selection/connection through the app rearms using saved enrollment. Manual disconnect/disarm/escape cancels recovery immediately. Never silently select another target.
 - **Latency/resources:** record transport RTT, board-local processing/queue time, same-host send-to-HID receipt, CPU, flash, PSRAM, and internal-heap use during TLS/WSS setup and sustained traffic. Report one-way timing only with clock mapping and uncertainty.
 - **Recovery:** verify deliberate BOOT factory reset, RST reboot-only behavior, COM recovery, and key-loss USB re-enrollment. Document agreed erase scope and recovery authorization.
 
@@ -380,3 +388,21 @@ Board run `20261116-102913` did not establish a valid patched DataChannel baseli
 A separate Rust peer and USB bridge in `verification/m0/rust-peer` build offline; boundary/framing checks pass. ESP32 serial-peer module syntax checks pass, but firmware integration and actual ESP32-to-Windows traffic are untested. No new LAN interop result exists.
 
 The [certificate-fixture test design](../verification/m0/peer-fingerprint/certificate-tests.md) specifies ordinary unit and integration cases with synthetic certificates A/B, expected matching/mismatching identities, and explicit pass/fail evidence. DTLS fingerprints cover the full certificate; WSS pins cover SPKI and additionally enforce SAN, validity, and handshake signatures. Fixture integration cases remain unimplemented/unrun. This preserves the required rejection coverage rather than substituting naming changes for verification.
+
+### M1.1 firmware first slice (2026-11-16)
+
+Product firmware now starts in `firmware/`. Its first `app_main` action initializes the addressable RGB strip and clears it with pinned `espressif/led_strip` 3.0.3. Build passes with ESP-IDF 6.1.1 for ESP32-S3 N16R8; flash size is configured as 16 MB and the latest binary is `0x304e0` bytes. GPIO48 is the default profile, with GPIO38 and no-LED profiles available.
+
+Board 2's live partition table confirmed the factory app slot at `0x10000`, size `0x1F0000`. A fresh full-slot backup matched the previously recorded factory app SHA-256. The product image was written only at `0x10000`; esptool verified its hash, and UART logged `RGB LED initialized off`. Bootloader, partition table, NVS, and other data partitions were not written. Board 2 now runs the product image; the backup remains local at `firmware/backups/board2-app-20261116.bin`.
+
+The user visually confirmed Board 2's addressable RGB LED is off after flashing. This verifies the selected GPIO48 profile on this unit. The DORHEA N16R8 manual identifies the separate red lamp as a power indicator; it does not document software control, so it is not part of M1.1 LED settings unless a schematic confirms a controllable driver.
+
+Firmware bring-up now checks for at least 16 MiB flash and 8 MiB PSRAM, validates every partition end against detected flash size, and compile-checks the product administration UART as UART0/115200. Board 2 boot reported 16 MiB flash, 8 MiB PSRAM, valid partitions, and UART0/115200. A duplicate GPIO setup initially caused an RMT reservation warning; it was removed, and the latest boot cleared the RGB LED without that warning. The latest `0x304e0` image was app-flashed only at `0x10000`; esptool verified its hash. The existing bootloader SHA-256 warning appeared again, then boot continued normally; it remains the recorded device issue and the bootloader was not written.
+
+### M1.1 USB client and settings slice (2026-11-16)
+
+Added a Windows Rust control app with COM selection, USB status, local Wi-Fi provisioning through a masked password field, and RGB on/off, brightness, and color controls. CLI remains available. Product firmware stores Wi-Fi credentials and RGB preferences in separate NVS namespaces, restores them at boot, and suppresses firmware logs before starting binary UART framing. Wi-Fi passphrases are not logged or returned. Shared deterministic-CBOR request vectors cover status, Wi-Fi setup, and RGB settings; status includes persisted RGB values.
+
+`cargo test --workspace --offline` passed 6 checks; release build passed. ESP-IDF 6.1.1 build passed for ESP32-S3 N16R8; app image is `0xcdd50` bytes (SHA-256 `eb393f444e47d0ef25351a5a39565f936d56a4c6ea92326ebf57e52a9c760793`). The full factory-app backup remains unchanged at SHA-256 `a81d415a34f955d440a166558dce5f1769001b08f5a75bcb2d605ae5e8e55718`. The image was flashed to the factory app slot only; esptool verified written data. Bootloader, partition table, and NVS were not written.
+
+The Windows client queried Board 2 on COM6 and validated its endpoint identity and TLS pin. Endpoint fingerprint remained `e299faff8cb8d99166647efa72a1a2354a4b5271c8f3369e70ef584088926fe0` after app update and software resets. RGB off and on commands succeeded; status reported `on, 12%, #FF2200` after reset. The user then disabled RGB through the control app. After local Wi-Fi provisioning, status reported connected. A further hard reset with `esptool run` did not write flash; the next USB status still reported Wi-Fi connected, RGB off at 12% with color `#FF2200`, and the same identity fingerprint. This verifies Wi-Fi, RGB preferences, and device identity persist across ordinary reboot. Firmware contains no HID or LAN listener; Wi-Fi is station-only and control remains on USB UART0. M1.1 acceptance checks pass on Board 2.

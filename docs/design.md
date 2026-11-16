@@ -8,10 +8,9 @@ Status: draft design; product implementation has not started. The M0 probe sourc
 
 The name follows the existing `monitorctl` naming style. Planned components are:
 
-- `kvmctl`: CLI and reusable client functionality.
-- `kvmctld`: optional background service for persistent sessions and hotkeys.
+- `kvmctl`: standalone CLI using reusable Rust client functionality; no resident app is required.
 - `kvmctl-agent`: ESP32-S3 firmware endpoint.
-- KVM Control: optional Windows tray UI on top of the Rust core.
+- KVM Control: resident native Rust tray application using the same core. A separate background service is not required for the initial design.
 
 ## Goals
 
@@ -59,7 +58,7 @@ Assume a hotel or other open Wi-Fi can observe, spoof, modify, or block local tr
 - Lost client keys require USB re-enrollment. Factory reset is deliberate: hold `BOOT` while firmware is running; `RST` remains reboot-only. Keep a COM recovery command and verify both behaviors on the board.
 - A takeover request holds the current owner for a 10-second window. Explicit rejection preserves current control; otherwise, grant the requester when the window expires. If the current owner's lease expires first, release held input and grant the still-connected pending requester immediately.
 - First protocol encoding is CBOR. Control app decodes CBOR into readable diagnostics.
-- First discovery path is mDNS/DNS-SD only. If discovery is unavailable, no target is shown; add Tailscale-based discovery later if needed.
+- LAN discovery uses mDNS/DNS-SD; USB enumeration supports enrollment and administration independently. Default target lists show enrolled boards; an optional filter can show discovered unenrolled boards. Discovery grants neither control nor permission to request takeover. Add Tailscale-based discovery later if needed.
 - ESP32-S3 exposes `video: none` and relative mouse input only. The shared control app remains capability-driven so JetKVM can provide absolute mouse input when supported.
 - First latency work establishes a measured baseline; fixed targets come after hardware and WebRTC results.
 - Private travel-router LAN is the default development network. Phone hotspot is fallback. Captive-portal hotel Wi-Fi is unsupported for ESP32 onboarding.
@@ -103,7 +102,37 @@ Keep transport separate from endpoint protocol. The shared session layer should 
 
 ### Native Windows client
 
-The primary desktop client is native Rust on Windows. It should expose a CLI first, with a tray application and global hotkey integration layered on later. Windows APIs should be used for keyboard/mouse capture, hotkeys, and sleep-prevention leases; platform-specific code should remain behind small interfaces so future Linux or macOS support does not leak into the core.
+The primary desktop client is native Rust on Windows, with resident tray and standalone CLI modes. Both use the same Rust core and per-user settings, enrollment records, and escape bindings. Neither mode requires the other to run. Windows APIs should be used for keyboard/mouse capture, hotkeys, and sleep-prevention leases; platform-specific code should remain behind small interfaces so future Linux or macOS support does not leak into the core.
+
+### Control app interaction contract
+
+These are agreed product requirements, not claims about the current USB setup client. Registration/enrollment, selected target, connection, lease ownership, and input destination are distinct state. A saved board can be offline; a connected owner can keep input local.
+
+**Resident tray mode** stays running without requiring a main window. Selecting a target connects with input local; entering remote mode is explicit. Returning local releases held remote input but retains the connection and control lease, including heartbeats, for frequent local/remote switching. Inactive targets have no warm sessions.
+
+The tray must distinguish at least these primary states with different icon shapes, not color alone:
+
+| State | Meaning |
+| --- | --- |
+| No target | No selected target; input local. |
+| Connected, input local | Selected target connected and owned; keyboard/mouse control this computer. |
+| Remote control | Keyboard/mouse routed to selected target. |
+
+Connecting, recovering, unavailable, and ownership loss must be visibly distinguishable from a ready connection, for example through a badge and tooltip. Tooltip identifies the selected target and input destination. Saved enrollment alone must not produce a connected icon.
+
+**Standalone CLI mode** enumerates USB boards for enrollment/administration, discovers LAN boards through mDNS, lists/manages targets, and connects directly for a foreground KVM session. It requires no tray process or icon. A video-capable target can open a normal video window from the CLI; ESP32 remains input-only. CLI escape ends the session and disconnects rather than keeping an idle connected/local session. No special tray-process detection, command broker, or cross-process coordination is planned initially; normal access and ownership errors suffice if both modes are used together. Command spelling remains an implementation detail.
+
+**Shared escape settings:** require a usable escape binding before enabling remote capture. Ship a reasonable default so manual setup is not mandatory; allow multiple bindings, including an optional Copilot-key binding on compatible keyboards. Both modes read the same per-user configuration. In tray mode the switching binding returns remote input to local without disconnecting, and can activate remote control from a ready local session. In CLI mode escape releases input, disconnects, and ends the session. Recognized escape combinations are handled locally rather than forwarded to the target. Final default remains to be chosen after Windows/macOS/Linux shortcut and keyboard testing; Ctrl+Shift+F10 is only a candidate, not a settled cross-platform guarantee.
+
+**Ownership and takeover:** connected/local retains exclusive ownership. Only authenticated, enrolled controllers can request takeover; unenrolled discovery cannot trigger a prompt or disturb another controller. A takeover notice returns the owner to local input before displaying an interactive prompt, while keeping its connection and lease pending the decision. The existing 10-second rejection/no-response policy applies even if input was already local. Rejection keeps ownership and leaves input local until explicitly activated again. Enrollment allows separate controller/board pairs on the same LAN without granting cross-pair control.
+
+**Switching and disconnect:** selecting B while connected to A first returns input local, releases held input, relinquishes A's lease, and closes A's session before connecting B. B starts with input local and requires explicit activation. Explicit Disconnect clears the selected target and releases ownership; enrollment remains saved. Closing a video session window is also an intentional disconnect, without a confirmation dialog. In tray mode the tray remains running with no selected target; in CLI mode the session command exits. Input-only tray sessions use Disconnect; input-only CLI sessions can end through escape.
+
+**OSD:** show short local on-screen notices for connection and input-destination changes, including target name, disconnect/loss, recovery, and local/remote transitions. Reconnect must announce that input remains local. Takeover needs an actionable prompt rather than only a transient notice.
+
+**Video windows:** when supported and enabled, use a normal resizable/minimizable window; keep video updating while input is local. Remote input capture is independent of video focus and also works without video. While local, clicking the video content may activate remote mode; consume that activation click so it does not click the target. Window controls remain local controls. Minimizing video returns input local but keeps the connection and lease, including when minimization is triggered externally. Ordinary focus loss alone need not end remote mode. Closing video returns local, releases held input, disconnects, and releases ownership. Reopening requires a new connection. While remote capture is active, hide the local cursor when the remote cursor is visible in the video; restore it immediately on returning local or losing the connection. Verify remote-cursor visibility per target rather than assuming every video feed includes it.
+
+JetKVM is intended to use this same interaction model, but discovery, authentication, ownership, video/cursor behavior, and standalone CLI compatibility require testing with a hardware sample.
 
 ### WebRTC transport
 
@@ -139,7 +168,7 @@ Control/session messages should cover lease ownership, takeover request/grant/re
 
 ### HID and switching
 
-Keep the endpoint's USB HID connection attached independently of network-session lifetime. Maintain a network control session only to the selected target. A global hotkey changes the active target without requiring the user to reconfigure the physical keyboard or mouse. Switching releases or reconciles held keys/buttons, relinquishes the old lease, closes the old network session, and establishes a fresh authenticated WebRTC session to the new target before routing input. Inactive targets retain no warm network sessions.
+Keep the endpoint's USB HID connection attached independently of network-session lifetime. Maintain a network control session only to the selected target. The tray hotkey switches local/remote input without dropping that session or lease. Target switching releases or reconciles held keys/buttons, relinquishes the old lease, closes the old network session, and establishes a fresh authenticated WebRTC session to the new target with input local until explicitly activated. Inactive targets retain no warm network sessions. See the [interaction contract](#control-app-interaction-contract) for tray/CLI differences.
 
 Input routing should define behavior for:
 
@@ -157,6 +186,8 @@ Input routing should define behavior for:
 Start with an HID-only endpoint targeting ESP32-S3 N16R8 hardware: 16 MB flash, 8 MB PSRAM, native USB HID, and a separate USB-UART administration path. The available DORHEA dual-USB-C units are interchangeable development samples. Product support is defined by these capabilities, not a batch size, sample number, USB serial number, MAC, COM port, or IP address. Detect device resources and port capabilities during bring-up, generate a unique cryptographic identity on each device, and enroll it through the same client flow. Use representative hardware tests alongside implementation; no third-unit qualification is required. Alternate power wiring or USB topologies need investigation only if the product actually uses them.
 
 Onboard RGB LED control is a first M1.1 usability feature. Set the addressable LED off at the earliest application initialization and keep it off by default; avoid full-brightness startup/status animations. The local client exposes simple off/on, brightness, and RGB color settings over USB when the hardware supports them. Persist those settings with device configuration, restore them on boot, and keep them stable across reconnects. Status/error indications must honor the user's off/brightness setting. Define LED wiring through the supported hardware profile, report unsupported controls clearly, and extend the USB setting codec/tests with this feature rather than relying on a specific sample's serial number.
+
+The DORHEA N16R8 board manual labels its separate red lamp as `PWR` and describes it as indicating power delivery; it does not document a GPIO control. Treat that lamp as a hardware power indicator, outside software LED settings, unless a board schematic confirms a controllable driver.
 
 M0 bench decision (2026-11-15): use a temporary visible Windows PowerShell form over the board's CH343 UART0 to enter Wi-Fi details locally and display connection status. The bench firmware starts station mode only after an explicit UART command, selects `WIFI_STORAGE_RAM`, and builds with `CONFIG_ESP_WIFI_NVS_ENABLED=n`; it does not persist credentials. Once an IP arrives, it initializes the Espressif mDNS responder with hostname `kvmctl-m0-probe`. This is only an association, IP, and hostname-discovery probe: it publishes no DNS-SD service, opens no signaling listener, and sends no HID reports. Its line-oriented UART commands and setup form are test tooling, not the product USB administration protocol specified below. This follows the ESP-IDF station initialization/event pattern, the documented RAM storage option, and the separate mDNS component model ([station scenarios](https://docs.espressif.com/projects/esp-idf/en/v6.1.1/esp32s3/api-guides/wifi-driver/station-scenarios.html), [`esp_wifi_set_storage`](https://docs.espressif.com/projects/esp-idf/en/stable/esp32s3/api-reference/network/esp_wifi.html), [mDNS](https://docs.espressif.com/projects/esp-idf/en/v6.1.1/esp32s3/api-reference/protocols/mdns.html)). The setup path remains unverified on-device until credentials are entered locally; no credentials belong in chat or logs.
 
@@ -203,7 +234,7 @@ Treat reconnect as a normal session state, not an exceptional one.
 4. Rediscover or resolve the endpoint locally if its address changed.
 5. Re-establish signaling and WebRTC with fresh session data.
 6. Revalidate identity, protocol version, capabilities, and authorization.
-7. Restore input routing only after the session is authenticated, ready, and owns the control lease, provided live mode remains armed and the outage has not exceeded 60 seconds.
+7. Restore the connection only after authentication, readiness, and control-lease checks, within the 60-second recovery deadline. Keep input local, restore the local cursor, and show an OSD notice; remote input never resumes automatically. Require explicit activation to route input remotely again.
 
 Use bounded backoff, clear UI/CLI state, and an explicit user escape path. Avoid reconnect loops that keep the machine awake or silently switch to another target.
 
@@ -245,7 +276,7 @@ ESP32-S3 USB-OTG and USB-Serial-JTAG share one internal PHY and cannot operate s
 - Host HTTPS/WSS uses a self-signed certificate checked by the enrolled SPKI pin. Certificate renewal with the same TLS public key keeps the pin. A TLS key change requires explicit USB pin refresh/re-enrollment; no network pin-rotation statement exists in protocol 1.0. A device identity key change requires factory reset and client re-enrollment. Never offer a certificate-accept-anyway path.
 - Endpoint identity, TLS key, client keys, and enrolled-client records survive ordinary reboot. USB revoke removes the selected client, invalidates all its active sessions and pending takeover requests, and releases its held input. Revoke-all does the same for every client. Persist the complete updated authorization list and verify the commit before returning success; if persistence fails, return `internal_error`, keep affected clients blocked in RAM, and do not report revocation success. A running-firmware BOOT hold of 10 seconds performs factory reset; reset erases all kvmctl-managed NVS, including Wi-Fi credentials, device identity/TLS keys, clients, and revocations. `RST` only reboots. Re-enrollment is required after reset. Implement and verify the hold timing and erase scope with the real storage/recovery feature in M1.5.
 - Keep enrollment, per-client revoke, revoke-all, and recovery administration on the direct USB serial path. Network authorization grants control only.
-- Frame USB serial administration as 115200 8-N-1 with a four-byte big-endian payload length followed by one deterministic-CBOR request or response, capped at 4096 bytes. USB commands cover Wi-Fi provisioning, device status, enrollment, client listing/revoke, and revoke-all. Accept an administration command only when it arrives through UART0/CH343; do not infer host COM-open state because UART does not report it.
+- Frame USB serial administration as 115200 8-N-1 with a four-byte big-endian payload length followed by one deterministic-CBOR request or response, capped at 4096 bytes. Version 1.0 requests use `{0: major, 1: minor, 2: command, 3: request_id bstr16, 4: payload}`; responses echo version, command, and request ID, with key `4` as result/error code and successful result map at key `5`. Command `0x60 wifi_set` carries `{0: SSID UTF-8 tstr (1–32 bytes), 1: passphrase bstr (8–63 printable ASCII bytes or 64 hexadecimal bytes)}`; `0x61 status` carries an empty map and returns result keys `0` endpoint fingerprint, `1` TLS pin, `2` Wi-Fi state (`0` unconfigured, `1` connecting, `2` connected, `3` failed), `3` firmware version, `4` endpoint SPKI DER, and `5` LED state map `{0: supported bool, 1: enabled bool, 2: brightness uint, 3: RGB bstr3}`; `0x66 led_set` carries `{0: enabled bool, 1: brightness uint (0–100), 2: RGB bstr3}`. Wi-Fi credentials are entered locally, never logged or returned, and stored in device NVS for this prototype. Identity-key/settings-at-rest protections remain assigned to their implementation security milestones. Unsupported LED profiles return error `7`. USB commands also cover enrollment, client listing/revoke, and revoke-all. Accept an administration command only when it arrives through UART0/CH343; do not infer host COM-open state because UART does not report it.
 
 ### Authenticated signaling and session establishment
 

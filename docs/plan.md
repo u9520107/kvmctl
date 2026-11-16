@@ -21,19 +21,24 @@ Next deliverable is M1.1: LED-off firmware first, then a buildable product works
 - Build the application and firmware in vertical slices. Add unit, certificate-fixture, and hardware integration tests alongside each feature. Security gates control when capabilities can be enabled, rather than whether unrelated implementation can begin.
 - Onboard RGB LED control is an early M1.1 priority: default off, optional brightness/color through the local client, persisted across reboot. Status indications must respect the user's LED preference.
 - Client administration requires direct USB access. Enrolled LAN clients cannot change the authorization list or revoke other clients.
-- Only the selected target has an active network control session. Switching closes the old session and establishes a new WebRTC connection; inactive targets have no warm sessions. Measure switching delay rather than assuming a latency bound.
+- Native Rust resident tray and standalone CLI share core functionality, per-user settings, enrollment records, and escape bindings. CLI discovery, USB enrollment/management, and foreground KVM sessions require no tray app. No separate service or special process coordination is planned initially.
+- Tray distinguishes no target, connected/local, and remote input, with visible non-ready states. Returning local keeps connection, ownership, and heartbeats. Short OSD notices identify connection/input changes.
+- Enrolled boards appear by default; an optional filter exposes unenrolled discoveries. Only enrolled controllers can control or request takeover. A takeover prompt returns input local while retaining ownership pending the existing 10-second decision rule.
+- Share multiple configurable escape bindings, with a usable default required before capture. Exact default awaits shortcut/keyboard testing. Tray binding switches local/remote; CLI escape disconnects and exits.
+- Video uses a normal resizable/minimizable window independent of capture focus. Click-to-activate consumes its click; minimize returns local while retaining connection. Close releases input, disconnects, releases ownership, and clears selection; tray stays running, CLI session exits. Enrollment remains saved. Hide local cursor during capture only with verified remote-cursor visibility; restore on local/loss.
+- Only the selected target has an active network control session. Switching closes the old session before establishing a new WebRTC connection with input local until explicitly activated; inactive targets have no warm sessions. Measure switching delay rather than assuming a latency bound.
 
-- Reconnect automatically to the same selected target while an outage lasts no more than 60 seconds, revalidating identity, authorization, and ownership before resuming input. Discard outage input; never replay it.
+- Reconnect automatically to the same selected target while an outage lasts no more than 60 seconds, revalidating identity, authorization, and ownership before restoring the connection. Keep input local, show OSD, and require explicit remote activation. Discard outage input; never replay it.
 - If disconnected for more than 60 seconds, close pending connections, stop retries, and disarm. The user rearms through the control app by selecting/connecting a target again, including the same saved target. Saved target information and enrollment remain intact; USB re-enrollment is unnecessary.
 - Manual disconnect, disarm, or emergency escape stops automatic recovery immediately. Initial live control always requires explicit arming.
 
 ## Questions needing user input
 
-No outstanding user policy questions from this review. Engineering details and hardware verification remain below.
+No outstanding user policy questions from this review. Engineering details and hardware verification remain below. Full agreed behavior is in the [control app interaction contract](design.md#control-app-interaction-contract).
 
 ## Review findings addressed
 
-- M1 includes the minimal Windows enrollment/signaling/test client required to validate the ESP32 slice. M2 adds complete CLI workflows and hotkeys.
+- M1 includes the minimal Windows enrollment/signaling/test client required to validate the ESP32 slice. M2 adds standalone CLI workflows, resident tray behavior, shared settings, OSD, and hotkeys.
 - CBOR, USB enrollment, key-loss re-enrollment, 10-second takeover, relative mouse, and no ESP32 video remain settled decisions.
 - Channel delivery semantics and HID message shapes are recorded in the design; add shared Rust/C vectors and parser rejection cases with their M1 codecs before those messages can affect control.
 - JetKVM video belongs to M3 integration; M4 covers further video/power work.

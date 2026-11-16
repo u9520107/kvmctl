@@ -1,0 +1,18 @@
+menu "kvmctl hardware profile"
+
+choice KVMCTL_RGB_LED_PROFILE
+    prompt "Onboard addressable RGB LED"
+    default KVMCTL_RGB_LED_GPIO48
+
+config KVMCTL_RGB_LED_GPIO48
+    bool "GPIO48 (ESP32-S3-DevKitC-1 v1.0 profile)"
+
+config KVMCTL_RGB_LED_GPIO38
+    bool "GPIO38 (ESP32-S3-DevKitC-1 v1.1 profile)"
+
+config KVMCTL_RGB_LED_UNSUPPORTED
+    bool "No supported onboard RGB LED"
+
+endchoice
+
+endmenu
