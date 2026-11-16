@@ -1,18 +1,20 @@
 # kvmctl execution plan
 
-Status: M0 in progress. Architecture and security requirements live in [design.md](design.md); this document tracks order, gates, and evidence.
+Status: M0 bootstrap closed; M1 implementation is next. Plan revised 2026-11-16 to build the product and verify/harden each feature together. Architecture and security requirements live in [design.md](design.md).
+
+The milestone section is the current plan. Dated bench records preserve what was observed under the earlier plan; references there to open M0 gates do not block M1. Board numbers identify test samples only. No third-board qualification is required, and no recorded COM port, IP, MAC, or serial number is a product constant. Outstanding test results remain outstanding after this planning change.
 
 ## Current evidence
 
 | Item | Status | Evidence / next check |
 | --- | --- | --- |
 | Private local Wi-Fi separate from hotel network | Set up, user reported | Reported 2026-11-15; topology and isolation not independently tested |
-| ESP32-S3 hardware and batch | User confirmed; boards 1 and 2 identified | Three DORHEA ESP32-S3-DevKit C N16R8 boards (Amazon ASIN B0CKXJLP4B, 3-pack), each with two USB-C ports. Product docs list USB-C, 5V/GND, and 3V3/GND power options; only USB-C has been used. Boards 1 and 2 report ESP32-S3 rev 0.2, 16 MB flash, and 8 MB PSRAM. Board 3 remains sealed and untested. |
+| ESP32-S3 hardware configuration | Representative samples identified; bootstrap sufficient | N16R8 samples report ESP32-S3 rev 0.2, 16 MB flash, and 8 MB PSRAM, with CH343 UART and native USB. Product targets compatible hardware capabilities, not these specific units; no batch-wide qualification gate. |
 | COM/native USB topology | Boards 1 and 2: CH343 UART0 data + native HID coexistence confirmed | CH343 bridges (`1A86:55D3`, COM3/COM6) remain active while native USB enumerates keyboard and mouse HID (`303A:4004`). The repository M0 probe returned a 4-byte count for `PING` on both. Native USB CDC (`303A:4001`) and ROM USB-Serial/JTAG (`303A:1001`) were also observed in their respective modes. Internal routing details, pin-powered modes, and CDC+HID on one USB connection remain untested. |
-| Board 2 RST reboot | Probe recovered; ROM boot-image SHA mismatch remains open | User pressed RST once with BOOT untouched. Probe reached ready and accepted PING, but ROM reported a SHA mismatch while loading the existing second-stage bootloader at `0x0`; see evidence below. RST/recovery gate is partial, not passed. |
-| Board Wi-Fi provisioning | Local test form and RAM-only bench firmware built; no credentials entered | The Windows PowerShell form sends SSID/password only over local COM serial and displays status. Board 2 has the updated image; board 1 remains on the no-Wi-Fi probe. No Wi-Fi association result exists. |
-| mDNS, VPN compatibility, HTTPS/WSS, WebRTC | Host route state observed with Surfshark connected; board behavior untested | The updated board image can start hostname mDNS after association, but has not received credentials. Hostname reachability, DNS-SD, VPN/mDNS behavior, HTTPS/WSS, and board WebRTC remain untested. |
-| Stack documentation review | Host compile and Rust loopback passed; ESP32 secure stack not accepted | ESP-IDF C + `esp-webrtc-solution` `v1.3.0`; Windows Rust + `webrtc-rs` `0.21.1`. The upstream S3 peer demo builds with IDF v6.1.1 under a temporary conservative clock configuration. Two Rust peers exchange DataChannel messages on loopback. The HID-only heap baseline is measured below. The opaque ESP32-S3 peer archive's SDP-to-DTLS fingerprint enforcement is unproved; secure signaling, ESP32-to-Rust interop, and full-stack resource use remain untested. See [design](design.md). |
+| Sample bootloader/RST finding | Device issue retained; product recovery work in M1.5 | Probe recovered after RST, but this sample's existing bootloader reports a SHA mismatch. Preserve backups/evidence and use a safe recovery procedure; this does not block unrelated product implementation. |
+| Board Wi-Fi provisioning | Board 2 associated and received DHCP address | Local credential entry connected Board 2 at `192.168.50.137`; ICMP succeeds from Ethernet with Surfshark active. Board 1 remains on the no-Wi-Fi probe. Credentials remain RAM-only. See dated evidence below. |
+| mDNS, VPN compatibility, HTTPS/WSS, WebRTC | Unicast mDNS works; multicast unresolved; unmodified backend fails fingerprint gate | The restored Wi-Fi probe publishes no DNS-SD service and implements no HTTPS/WSS or WebRTC. Separate two-peer board firmware passed a DataChannel baseline but accepted mismatched fingerprints in both DTLS roles. LAN reachability with Surfshark active does not pass discovery or secure-stack gates. |
+| Stack documentation review | Board transport baseline passed; unmodified ESP32 secure stack rejected | ESP-IDF C + `esp-webrtc-solution` tag `v1.3.0` / component `esp_peer` 1.5.3; Windows Rust + `webrtc-rs` 0.21.1. Exact board runtime test allowed payloads with wrong SDP fingerprints in both roles. A source patch is being evaluated separately. Secure signaling, ESP32-to-Rust interop, and full-stack resource use remain untested. See [design](design.md). |
 | Firmware/client implementation | M0 bench firmware only; product implementation not started | Firmware source is in `verification/m0/usb-hid-uart`; the local setup form is `verification/m0/wifi-setup.ps1`. The board 2 image has Wi-Fi/mDNS code, but Wi-Fi starts only on a UART command. The probe reads no physical input and sends no HID reports. Product client and firmware work remain unstarted. |
 
 ### Read-only host inventory (2026-11-15)
@@ -118,7 +120,7 @@ Flashed the repository-built no-report M0 app only at `0x10000` over COM6 at 115
 
 After boot, opened COM6 at 115200 8-N-1 with DTR/RTS deasserted and sent `PING`. UART0 returned `M0 UART0 received 4 bytes` and heap counters: internal free 383,651 bytes, minimum internal free 351,620 bytes, PSRAM free 8,386,128 of 8,388,608 bytes. PnP reported native USB `303A:4004` with started keyboard (`Col01`) and mouse (`Col02`) children, while CH343 COM6 stayed started. Thus board 2 confirms the same dual-port serial/HID operation and HID-only heap baseline observed on board 1. Firmware does not read physical input and sent no HID reports.
 
-This passes the two tested boards' CH343 UART0 + native-HID coexistence subgate. Board 3 remains sealed and untested. USB-OTG routing details, same-port CDC+HID, pin-powered modes, Wi-Fi, and full-stack resource use remain open; do not infer the full M0 USB or stack gate passed.
+This passes the tested samples' CH343 UART0 + native-HID coexistence subgate. Other USB configurations and full-stack operation were not established by this test. Under the revised plan, representative evidence is sufficient for bootstrap; further checks belong to their implemented features rather than batch qualification.
 
 ### Board 2 RST-only reboot (2026-11-15)
 
@@ -148,7 +150,7 @@ COM3 automatically entered ROM mode for a read-only chip check. The first flash 
 
 The earlier probe was intended to advertise _kvmctl._tcp with TXT markers probe=m0 and secure=off; it did not listen on the advertised port or provide TLS/WSS. Wi-Fi association, mDNS reachability, and runtime resource counters remain untested for that image. It sent no HID reports and read no physical input.
 
-Evidence now includes the host toolchain, ESP32-S3 peer-demo compile, Rust-to-Rust loopback DataChannel, two-board chip/flash/PSRAM identification, native HID keyboard/mouse enumeration concurrent with successful CH343 UART0 data round trips, and HID-only internal-heap/PSRAM measurements on both boards. The user deferred Wi-Fi credential entry until a minimal control-app interaction UX exists. Board 3 remains sealed and untested. The full board stack gate remains open: USB routing details, Wi-Fi provisioning, mDNS reachability, VPN/mDNS behavior, secure WSS/authentication, ESP32-to-Rust WebRTC, full-stack heap/PSRAM use, CPU/network load, and sustained traffic remain unmeasured.
+At this point in the original bench work, evidence included the host toolchain, ESP32-S3 peer-demo compile, Rust-to-Rust loopback DataChannel, sample chip/flash/PSRAM identification, native HID enumeration alongside CH343 UART0 data, and HID-only heap measurements. The user deferred credential entry until a minimal control-app interaction existed. Network, secure transport, and full-stack measurements were still outstanding; later evidence follows. The revised implementation slices own unfinished work without requiring additional batch samples.
 
 ### Protocol/security contract review (2026-11-15)
 
@@ -165,43 +167,63 @@ Primary-source checks: [RFC 6455 §5.4](https://www.rfc-editor.org/rfc/rfc6455#s
 
 ## Milestones
 
-### M0: Paperwork, then hardware and stack verification
+### M0: Bootstrap and initial feasibility — closed
 
-- Resolve user policy questions in [the planning index](plan.md).
-- Confirm repository layout and Rust workspace boundaries on paper; create the skeleton when implementation starts.
-- Use the three DORHEA ESP32-S3-DevKit C N16R8 boards; verify each board's USB behavior, detected flash/PSRAM, internal heap, ESP-IDF version, and firmware/client language boundary.
-- Document protocol, identity, capability, and error-state conventions.
-- Define USB enrollment, per-client keys, certificate pinning, authenticated signaling, revoke/reset behavior, and one-controller lease semantics before LAN control work.
-- Freeze the minimum wire protocol and test telemetry needed for scripted event comparison and latency measurement.
-- Define the same-host test rig, including the ESP32 HID observer and acceptance criteria for keyboard, mouse, reconnect, and held-input cleanup. Specify clock mapping and measurement uncertainty.
-- Choose WebRTC and mDNS/DNS-SD libraries after validating Windows and ESP32 constraints.
-- Run the hardware and stack verification gate below. Record results in this execution plan before committing to the full vertical slice.
+- Record the initial architecture, trust boundaries, candidate stack, and protocol direction.
+- Establish working firmware/client toolchains and representative UART/HID coexistence, Wi-Fi, and basic DataChannel evidence.
+- Carry unresolved findings into the implementation feature that owns them.
 
-#### M0 hardware and stack verification gate
+M0 exit is satisfied under the revised scope. This is a planning handoff, not a security acceptance. Further stand-alone feasibility work is justified only when it answers a specific implementation blocker.
 
-- Connect the board's `COM` and `USB` ports to the same Windows laptop. Confirm both enumerate, identify `COM` as USB-UART or USB-Serial/JTAG, and verify whether serial provisioning/logging remains usable while native USB runs HID.
-- Confirm whether the two physical ports expose independent usable controllers or share a controller/PHY limitation. Verify native USB HID can remain attached to a target while `COM` handles enrollment and diagnostics.
-- Provision Wi-Fi through the local bench setup form on `COM`; do not send credentials through chat. Test a known 2.4 GHz private network; captive-portal hotel Wi-Fi is out of scope for board onboarding.
-- Use a private travel-router LAN for repeatable development. Test laptop Ethernet plus ESP32 Wi-Fi, mDNS, HTTPS/WSS, and WebRTC with Surfshark enabled; repeat with local-LAN visibility settings changed only if needed.
-- Build the smallest selected WebRTC proof on the exact board and firmware stack. Measure build size, internal heap, TLS/WSS handshake, DataChannel setup, CPU, reconnect, and sustained HID-path behavior.
-- Record pass/fail results and update architecture choices before M1 implementation. If WebRTC cannot fit or USB enrollment cannot coexist with HID, stop and revise the design.
+### M1: Build the Windows client and ESP32 firmware together
 
-M0 exit: board and USB topology identified; toolchain/library versions recorded; enrollment/session contracts documented; smallest secure WebRTC proof measured on the actual board. A configured LAN alone does not pass this gate.
+Implement vertical slices in the product workspace. Reuse the existing bench modules where useful; avoid building a second complete test application before the product. Add tests and telemetry to the code being delivered. Independent work may proceed across slices while a gate is unresolved; a gate blocks its dependent capability, not all development.
 
-### M1: ESP32-S3 vertical slice
+#### M1.1: Workspace, USB setup, and device identity
 
-- Build the minimal Windows client for USB enrollment, discovery, authenticated signaling, scripted input, and HID observation. M1 must not depend on the polished M2 CLI.
-- Advertise the prototype through mDNS/DNS-SD with endpoint type and capabilities.
-- Implement local authorization and board-hosted HTTPS/WSS signaling.
-- Persist device/client identities, enrolled-client records, and revocations; verify restart behavior.
-- Establish authenticated WebRTC DataChannels.
-- Forward keyboard and mouse events to USB HID.
-- Add scripted transport/HID test modes, ESP32 telemetry, local HID observation, and latency reports.
-- Enforce one active control lease and explicit takeover.
-- Add disconnect, held-input cleanup, and reconnect tests.
-- Verify unauthorized clients, wrong endpoint pins, stale/replayed session data, and revoked clients cannot control HID; transport-test mode must never emit HID.
+- First firmware usability priority: turn the onboard RGB LED off at the earliest application initialization. Default to off, with no full-brightness startup animation; this must not wait for networking or security integration.
+- Create firmware and Rust workspace boundaries plus a minimal usable Windows client for board selection, USB status, and local Wi-Fi setup.
+- Add simple USB/client LED controls: off/on, brightness, and RGB color where supported. Save the preference with device settings and restore it on reboot; connection/error status must respect off/brightness preferences. Use the supported hardware profile's LED wiring, not unit-specific identifiers.
+- Discover compatible ports/capabilities and validate detected memory/partition bounds. Device identity comes from generated keys and USB enrollment, not sample labels or serial-number allowlists.
+- Implement product USB framing, status/provisioning codecs, identity generation, and storage. Add shared C/Rust vectors and parser rejection tests as each command is implemented.
+- Keep credentials local and redacted; test ordinary reboot/persistence alongside the storage feature. No LAN control or HID output is enabled by this slice.
 
-M1 exit: one enrolled Windows client drives one ESP32 through the real secure path; a second enrolled client demonstrates exclusive takeover; transport and HID bench results are recorded. Authorization and held-input checks pass for implemented scripted/HID/session paths. Live capture, hotkey switching, and emergency escape close in M2 before live input is enabled.
+Exit: the real client can select a compatible board, display status, provision Wi-Fi, and control supported RGB LED settings over USB. Verify off/default behavior, dim brightness, chosen color, and persistence across reboot/reconnect on representative hardware. LED-off firmware is the first usable increment; customization follows within M1.1. This deliverable does not wait for complete WebRTC/WSS verification.
+
+#### M1.2: Transport implementation and certificate binding
+
+- Integrate ESP32-to-Rust DataChannels and known-payload echo into product transport modules, initially with no HID output. USB SDP exchange is a temporary internal test aid.
+- Fix or replace the backend with the recorded fingerprint failure. Keep the unmodified failing backend excluded from secure control; do not weaken certificate verification to obtain a passing connection.
+- Add synthetic certificate fixtures and unit/integration tests with the transport: valid A/A and B/B sessions connect, B/A is rejected in each DTLS role, and absent/malformed identities fail closed. A valid baseline must pass before rejection results count.
+- Measure setup/reconnect behavior and initial heap/CPU during actual implementation. Build discovery support in parallel; defer service advertisement until a real endpoint exists in M1.3.
+
+Exit: the integrated Windows/ESP32 transport exchanges known payloads, and its exact backend passes certificate identity tests. This gates use of that transport for remote input, not work on the client, USB, storage, discovery, or WSS modules.
+
+#### M1.3: Enrollment, authenticated signaling, and discovery
+
+- Implement USB enrollment, persistent per-client authorization, revoke/revoke-all, pinned HTTPS/WSS, signed session transcripts, and replay/version checks in the product client and firmware.
+- Add WSS certificate fixtures for valid pin, different key, SAN, validity, and signature checks as the verifier is implemented. Verify failures occur before HTTP Upgrade or sensitive signaling data.
+- Publish DNS-SD for the actual endpoint, consume it in the client, and expose discovery diagnostics. Test Ethernet/Wi-Fi and Surfshark compatibility as part of that feature; discovery failure must not prevent USB setup or unrelated development.
+- Test unauthorized and revoked clients, persistence failures, and identity changes alongside the corresponding flows. Serial-only signaling is not acceptance of this slice.
+
+Exit: an enrolled client establishes the pinned/authenticated session through the real discovery/signaling path; invalid identities and unauthorized clients are rejected. Combined M1.2/M1.3 security gates must pass before network-originated input can affect USB HID.
+
+#### M1.4: Scripted HID, ownership, and measured operation
+
+- Add the event decoder, one-controller lease/takeover, and scripted transport/HID modes. Build the same-host HID observer and report schema with the events they measure.
+- Before enabling network-to-HID output, pass M1.2/M1.3 plus implemented parser/ownership/held-input tests. Transport-test mode always emits zero HID reports; live physical-input capture remains off.
+- Test cleanup on disconnect, timeout, takeover, revoke, and restart as each path is implemented. Use two enrolled client identities on one available board to test ownership; no particular pair of physical boards is required.
+- Measure combined HID/Wi-Fi/WSS/WebRTC build size, minimum internal heap, PSRAM, CPU, setup, reconnect, and sustained traffic. Set repeat counts and acceptance limits from this integrated baseline.
+
+Exit: one enrolled Windows client drives scripted HID through the real secure path, a second client demonstrates exclusive takeover, cleanup checks pass, and integrated resource/timing evidence is recorded.
+
+#### M1.5: Recovery and repeatable bring-up
+
+- Implement and test BOOT hold timing, reset erase scope, reboot-only RST, USB recovery, and key-loss re-enrollment with the actual identity/storage implementation.
+- Define safe firmware/bootloader recovery and backup procedures. Track the existing sample bootloader SHA finding as a device issue; do not make unrelated client/firmware work wait for that unit.
+- Make the same firmware/client bring-up flow work through detected capabilities and newly generated identity. Exercise that flow with the available device and fresh-identity test fixtures. Checks on another physical unit are optional sampling when available or when a hardware difference is suspected, never a third-board prerequisite.
+
+M1 exit: the implemented vertical slice passes its security, scripted HID, ownership, recovery, and resource checks. M2 adds live capture, hotkeys, switching, and emergency escape with their own tests before live input is enabled.
 
 ### M2: Native Windows client
 
@@ -226,29 +248,29 @@ M2 exit: arming, emergency escape, switching, revoke, and reconnect match the re
 - Add opt-in local sleep prevention.
 - Add opt-in remote sleep prevention only after endpoint support and authorization are proven.
 
-### M5: Hardening and portability
+### M5: Extended hardening and portability
 
-- Threat-model review, fuzz message parsing, and test downgrade/replay/identity failures.
+- Expand the security coverage built through M1/M2: threat-model review, parser fuzzing, and wider downgrade/replay/identity regression cases. Security does not wait until M5.
 - Package Windows client and firmware update/recovery paths.
 - Evaluate Linux/macOS support without weakening Windows-first behavior.
 
 
 ## Acceptance checklist
 
-Freeze report schema and exact test scripts in M0. Fixed latency targets follow the initial measured baseline. Apply session/scripted/HID checks in M1; complete live capture, target-switching, and emergency-escape checks in M2 before enabling live input.
+Implement report schemas and repeatable tests with their M1 features; stabilize them as those slices close. Fixed latency targets follow the integrated measured baseline. Apply session/scripted/HID checks in M1; complete live capture, target-switching, and emergency-escape checks in M2 before enabling live input.
 
 - **Enrollment/identity:** two clients enroll independently over direct USB; LAN discovery cannot enroll a client; an unexpected endpoint identity is rejected.
 - **Authorization:** unregistered/revoked clients cannot obtain control. Enrolled LAN clients cannot mutate the authorization list; enrollment, per-client revoke, and revoke-all require direct USB. USB revocation of active control releases held input and invalidates its lease. Restart never silently restores revoked access.
 - **Transport mode:** deterministic events use the same authentication, WSS signaling, WebRTC, CBOR, and ESP32 decoder as live mode; no USB HID is emitted. Compare sequence numbers, normalized reports, drop/reorder counts, and queue telemetry.
 - **HID bench mode:** observer filters by ESP32 Raw Input device identity; expected key/modifier/button/wheel/relative-motion reports arrive without suppressing physical devices.
-- **Ownership:** exactly one active control lease; old lease invalid before new owner emits input. Test explicit rejection and no-response takeover after 10 seconds. Resolve concurrent-request policy in M0 before testing races.
+- **Ownership:** exactly one active control lease; old lease invalid before new owner emits input. Test explicit rejection and no-response takeover after 10 seconds. Implement the documented single-pending-request policy and its race tests together in M1.4.
 - **Held-input safety:** switch, disconnect, timeout, revoke, endpoint restart, and emergency escape clear or reconcile held keys/buttons. Define heartbeat/lease expiry and maximum cleanup delay before implementation.
 - **Selected-target sessions:** switching releases the old lease and closes its network session before connecting the new target. Inactive targets retain no warm WebRTC/signaling sessions. USB HID remains attached. Measure new-session setup and switch latency on the LAN; do not assume it meets an unmeasured target.
 - **Reconnect:** test endpoint restart, address change, network loss, and Windows sleep/resume. Revalidate identity, authorization, capabilities, and ownership before input resumes. Recover automatically to the same selected target only while the outage has not exceeded 60 seconds; discard outage input. Test recovery just before the deadline and failure to recover beyond it, including sleep lasting over one minute. Partial handshakes must not reset the deadline. After timeout, pending connections close, retries stop, input stays disarmed, and late completions cannot resume it. Explicit target selection/connection through the app rearms using saved enrollment. Manual disconnect/disarm/escape cancels recovery immediately. Never silently select another target.
 - **Latency/resources:** record transport RTT, board-local processing/queue time, same-host send-to-HID receipt, CPU, flash, PSRAM, and internal-heap use during TLS/WSS setup and sustained traffic. Report one-way timing only with clock mapping and uncertainty.
 - **Recovery:** verify deliberate BOOT factory reset, RST reboot-only behavior, COM recovery, and key-loss USB re-enrollment. Document agreed erase scope and recovery authorization.
 
-M0 sets repeat counts, cleanup deadlines, resource headroom, and pass/fail limits where these depend on board/stack behavior. M1 cannot close with these fields unresolved.
+M1 implementation establishes repeat counts, cleanup deadlines, resource headroom, and pass/fail limits from the integrated behavior. M1 cannot close with these fields unresolved; they are not prerequisites for starting it.
 
 ## Evidence record for each execution gate
 
@@ -307,3 +329,54 @@ With Wi-Fi connected and Surfshark active, 20 ICMP probes (32-byte payload) from
 
 In `%TEMP%\webrtc-rs-0.21.1`, `cargo test --test data_channels_interop -- --nocapture` passed 1 test: Rust `webrtc` and Rust `rtc` peers opened a DataChannel, exchanged, and echoed a test string. The test attempted STUN at `74.125.250.129:19302`, which logged network-unreachable; the local peer connection still succeeded using local candidates. This is not ESP32/Rust interop or Internet ICE evidence. `cargo test --test remote_certificate_fingerprint -- --nocapture` passed 1 test that cross-checks Rust local/remote certificate fingerprints from stats; it does not test a mismatched fingerprint rejection. No WSS pinning or ESP32 `esp_peer` fail-closed gate was exercised.
 The local Rust checkout also contains `%TEMP%\webrtc-rs-0.21.1\rtc\tests\dtls_disable_fingerprint_verification.rs`, which constructs a mismatched SDP fingerprint and asserts default rejection; a separate test asserts that explicitly disabling verification accepts it. Execution was attempted but could not build: the online run could not reach crates.io, and offline mode lacked the `assert_matches` dev-dependency. This is Rust `rtc` reference evidence only, not a result for the ESP32 `esp_peer` archive.
+
+### M0 blocker review (2026-11-16)
+
+Read-only follow-up at repository revision `7490db6`: Board 2 still answered two ICMP requests at `192.168.50.137` (77 and 79 ms) with Surfshark active. A DNS A query for `kvmctl-m0-probe.local` returned a 55-byte unicast reply from the board with one answer, `192.168.50.137`. Separate multicast QU and QM queries to `224.0.0.251:5353`, with Ethernet selected as multicast egress and group membership on `192.168.50.2`, received no board response within 2.5 seconds each. The QM listener used shared UDP port 5353. This reproduces the discovery failure but does not identify whether host filtering/VPN, router forwarding, or the board receive path causes it. No firmware, credentials, network settings, or serial state were changed.
+
+Source review confirms the current probe cannot exercise the remaining secure-stack gates: `start_mdns()` sets only a hostname; no DNS-SD service, HTTPS/WSS listener, or WebRTC peer exists. The two review tasks independently checked firmware and temporary stack artifacts. Repeating Wi-Fi association, Rust loopback, or Rust certificate-stat tests cannot supply the missing ESP32 evidence.
+
+The following was the bench-only sequence proposed before the planning revision. It is retained as history; the current M1 slices above supersede its global ordering:
+
+1. First use the existing upstream two-peer S3 demo for a smaller backend rejection test: isolate a no-media bench variant, establish a valid DataChannel baseline, then alter the forwarded SDP SHA-256 fingerprint in each direction while leaving the presented DTLS certificate unchanged. Its `peer_msg_handler()` forwards SDP directly between peers, providing an injection point. Require rejection before DataChannel open and zero application bytes. The upstream SoftAP/audio defaults are not the desired bench configuration. Record checkout tag `v1.3.0`, resolved `esp_peer` component `1.5.3`, and ESP-IDF `6.1.1` separately. Visible DTLS code and archive symbols do not establish fail-closed behavior; reject or replace the stack if this runtime check fails.
+2. If the backend passes, build a separate no-HID-report ESP32/Rust interoperability harness with the exact S3 archive and pinned client version. Exchange SDP over local serial for this isolated transport check, restrict ICE to the private LAN, and require a valid DataChannel message/echo baseline plus wrong-fingerprint rejection in each DTLS role. Serial signaling is a bench aid, not acceptance of the product WSS path. Same-board ESP peers alone do not establish Windows interoperability.
+3. Isolate multicast failure with packet observation or a controlled second LAN host. Distinguish query egress, board receipt/reply, and Windows delivery before changing VPN/router settings. Add DNS-SD together with a real bench endpoint; hostname-only mDNS cannot pass service discovery.
+4. The earlier proposal deferred pinned/authenticated HTTPS/WSS and combined resources until after the transport gate. The revised plan instead builds those modules alongside transport, attaches their own tests, and retains the sample bootloader finding in M1.5.
+
+Firmware leaves the ESP-IDF default modem power-save setting unchanged. A controlled `WIFI_PS_NONE` comparison can investigate the recorded idle ICMP latency; current latency is not proof of a WebRTC limit. The one-association-attempt-per-boot restriction is intentional. The setup form discards non-STATUS serial replies, so errors such as `ERR wifi_already_attempted` are not displayed; this is a bench usability limitation, not evidence that the successful connection failed.
+
+### Reproducible board security bench (2026-11-16)
+
+Added [peer-fingerprint](../verification/m0/peer-fingerprint/README.md), a no-media/no-HID two-peer S3 probe, and [mdns-probe.ps1](../verification/m0/mdns-probe.ps1). Source revision for the selected peer checkout is `3971094e2e7c2ab7cb4de59e4eae710e1902d2b4`; the build rejects implementation changes. The runner validates Board 2's factory partition, backs up the complete `0x1F0000`-byte slot at `0x10000`, and restores/verifies it after each test. The original current-app slot backup SHA-256 is `a81d415a34f955d440a166558dce5f1769001b08f5a75bcb2d605ae5e8e55718`; local evidence is under `verification/m0/peer-fingerprint/logs/`. Bootloader and partition table are not written. Restoring the app does not restore RAM-only Wi-Fi credentials.
+
+Initial bench corrections: use a normal EN reset instead of the ROM-download reset helper, and put certificate generation in a dedicated 24 KiB task because it overflowed the default 3.5 KiB main-task stack. These were harness failures, not fingerprint results. Corrected runner detects panics and always attempts verified app restoration.
+
+Run `20261116-101256` (image SHA-256 `4327cafe0f40712e47aae6f2cdfee21ef5f3f4a198b7305c7963e467e744bf59`) paired both local ICE peers and entered DTLS client/server roles, but opened no channel and exchanged no payload. Baseline therefore remained inconclusive and mismatch cases were skipped. Internal heap after peer creation was 129,811 bytes; minimum reached 84,496 bytes; PSRAM free was 7,566,252 bytes. This excludes native HID, WSS, external peers, CPU measurement, and sustained traffic. It cannot pass the full-stack resource gate.
+
+That run used a too-short `agent_recv_timeout=20` ms. Archive disassembly shows its DTLS receive adapter retries 11 empty agent reads, logs `agent_recv timeout`, then returns the literal `-0x7880` (named `MBEDTLS_ERR_SSL_PEER_CLOSE_NOTIFY`). Thus the log is not proof of an actual peer close alert. The roughly 220 ms receive budget can expire before the configured 1-second DTLS initial retransmit. Next baseline uses 200 ms per agent read and records media/MID/SCTP SDP lines without ICE credentials. No fingerprint enforcement verdict exists yet.
+
+Discovery follow-up: multicast QU/QM and separate-group local multicast loopback also timed out when the probe ran outside the sandbox. Read-only firewall inspection found Public-profile Ethernet, a Private-only PowerShell UDP allowance, and a Public inbound block for an existing Rust test binary. These are possible host-side obstacles, not a proven causal diagnosis. Packet monitor access is denied even outside the sandbox; no trace/filter or firewall change was made. User-supplied Surfshark screenshot shows **Invisible on LAN off** while VPN is connected, ruling out that toggle as currently enabled. Other filtering remains unisolated.
+
+### Selected backend fingerprint gate failed (2026-11-16)
+
+Run `20261116-101724` used the sufficient receive-timeout margin and completed all three cases on Board 2. Valid baseline opened both DataChannels and each peer received 10 known payloads. Changing the remote SDP fingerprint in either direction, while keeping certificates unchanged, also opened both channels and delivered 10 payloads each way. Each negative case confirmed one fingerprint mutation and zero harness signaling errors. The selected unmodified S3 backend therefore **fails** the required SDP-to-certificate identity binding; this is no longer merely an unproved property.
+
+| Case | Mutation | Channels opened | Payloads received | Result |
+| --- | --- | --- | --- | --- |
+| Baseline | None | Both | 10 / 10 | Transport baseline passed |
+| Source 0 SDP | One SHA-256 fingerprint changed | Both | 10 / 10 | Security failure; receiving peer is DTLS client |
+| Source 1 SDP | One SHA-256 fingerprint changed | Both | 10 / 10 | Security failure; receiving peer is DTLS server |
+
+Minimum internal heap reached 84,340 bytes across the three two-peer cases; internal free returned to 248,011 bytes after peers closed. These remain isolated SoftAP/two-peer measurements without HID/WSS/Windows/CPU/sustained load. Runner restored and verified the original complete factory-app backup. Raw redacted UART evidence is local at `verification/m0/peer-fingerprint/logs/20261116-101724/uart.log`; the same directory records the exact probe-image SHA-256.
+
+Unmodified `esp_peer` 1.5.3 from this pinned checkout/IDF combination is rejected for secure control. A separately identified source patch must pass valid-certificate and mismatch checks before reconsideration; do not describe a patched result as acceptance of the upstream binary unchanged. This finding now belongs to M1.2; M0 bootstrap closure does not accept the failing backend.
+
+### Patched candidate and interop preparation (2026-11-16)
+
+Source hardening patch `verification/m0/peer-fingerprint/esp-peer-fingerprint.patch` adds strict SDP fingerprint parsing and required DTLS leaf-certificate matching in both roles. Patch SHA-256 is `d238d5cd9d5e870ec1d2e87510282e7a1c14a2eaaf917df96e3baec66224ce47`. It builds from an isolated export; linked firmware contains the parser, registry lookup, and verification callback. Extracted-C parser checks passed 1,306 cases. Independent review found no initial-handshake binding blocker; product callers must still disarm and close a session on subsequent SDP errors after callbacks unwind.
+
+Board run `20261116-102913` did not establish a valid patched DataChannel baseline, so negative cases were not run and the patch is not accepted. The original complete app slot was restored and verified against the recorded backup hash. Do not count a built patch or parser checks as a passed certificate gate.
+
+A separate Rust peer and USB bridge in `verification/m0/rust-peer` build offline; boundary/framing checks pass. ESP32 serial-peer module syntax checks pass, but firmware integration and actual ESP32-to-Windows traffic are untested. No new LAN interop result exists.
+
+The [certificate-fixture test design](../verification/m0/peer-fingerprint/certificate-tests.md) specifies ordinary unit and integration cases with synthetic certificates A/B, expected matching/mismatching identities, and explicit pass/fail evidence. DTLS fingerprints cover the full certificate; WSS pins cover SPKI and additionally enforce SAN, validity, and handshake signatures. Fixture integration cases remain unimplemented/unrun. This preserves the required rejection coverage rather than substituting naming changes for verification.

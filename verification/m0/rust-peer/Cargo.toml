@@ -1,0 +1,11 @@
+[package]
+name = "m0-rust-peer"
+version = "0.1.0"
+edition = "2024"
+publish = false
+
+[dependencies]
+anyhow = "1.0.103"
+async-trait = "0.1.89"
+bytes = "1.12.0"
+webrtc = "=0.21.1"
