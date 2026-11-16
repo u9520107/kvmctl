@@ -261,4 +261,49 @@ Record results here as work proceeds:
 - Redacted log/report paths; never credentials or private keys.
 - Failures, resulting design changes, and next gate allowed to proceed.
 
-Board identity, partition/security state, and USB coexistence evidence for boards 1 and 2 are recorded above. HID-only dynamic heap baselines exist for both, plus a board 2 idle reading with Wi-Fi code linked but not initialized. Full-stack resource measurements and all on-device Wi-Fi/mDNS/WebRTC behavior remain untested.
+Board identity, partition/security state, and USB coexistence evidence for boards 1 and 2 are recorded above. HID-only dynamic heap baselines exist for both, plus a board 2 idle reading with Wi-Fi code linked but not initialized. Wi-Fi association and the board's direct unicast mDNS response are recorded below. Windows .local resolution and multicast discovery remain unresolved; DNS-SD, WebRTC, and full-stack resource measurements remain untested.
+
+### M0 read-only follow-up (2026-11-15 23:20 PST)
+
+A fresh `ipconfig /all` and `route print -4` snapshot shows Surfshark WireGuard active at `10.14.0.2/16`; split default routes `0.0.0.0/1` and `128.0.0.0/1` point through it. Ethernet remains `192.168.50.2/24` with an on-link `192.168.50.0/24` route and multicast route. This confirms host routing only. The board has not joined Wi-Fi, so association, hostname mDNS reachability, and VPN/mDNS compatibility remain untested. `Get-Net*`/CIM queries are denied in this session; read-only `ipconfig`/`route` succeeded.
+
+COM6 is present. Existing PowerShell process `16328` remains responsive with a window titled `kvmctl M0 Wi-Fi setup`; no duplicate form was launched and no serial command was sent during this check. No credentials or Wi-Fi attempt are recorded.
+
+Read-only bootloader follow-up confirmed no safe basis to date or explain Board 2's invalid validation SHA. The 32,768-byte `%TEMP%\kvmctl-m0-board2-bootregion.bin` snapshot has SHA-256 `a16c10210c2d08d89c8b8e0867aa8b38924723de9053813e32adfabba2fe107c`; its extracted 18,704-byte bootloader image has SHA-256 `9fc58b7c1e668368e369d8c4717895098794fde7515e42c1cef0d6cfdb21c962`. `esptool v5.6.0 image-info` calculates `cbd95a816bf0b42be96621cc70ea54ca844ad51f007c6baddbfea1444d8f0913`, matching ROM's calculated digest, while stored digest remains `48304bcd6dd6bd250bc1ad011a0549e9b13e819f8aa98e34f1df27c016a39ae9`. No pre-M0 bootloader backup or manufacturer-matched reference exists. Readback is not a pre-flash backup; do not write a replacement without a safe diagnosis.
+
+No new hardware or secure-stack gate passed. Full-stack heap/CPU/traffic measurements remain absent, so numeric resource limits remain unset rather than inferred from HID-only or Wi-Fi-uninitialized readings.
+
+### Board 2 Wi-Fi attempt: reason 201 (2026-11-15)
+
+After local credential entry, Board 2 reported disconnect reason `201`. The ESP-IDF v6.1.1 `wifi_err_reason_t` enum defines `201` as `WIFI_REASON_NO_AP_FOUND`, `202` as `WIFI_REASON_AUTH_FAIL`, and `204` as `WIFI_REASON_HANDSHAKE_TIMEOUT`; probe `STATUS` prints the disconnect event's reason verbatim. This points to AP discovery, not a direct password rejection. The user reports a phone connects to the visible `whisketeers-iot` SSID with the same password and confirms 2.4 GHz. The Windows flyout shows the secured SSID but not channel or RSSI. The form clears its SSID field after sending, so exact transmitted spelling/whitespace is not retained.
+
+ESP-IDF v6.1.1 default country settings use world-safe `01`, channels 1–11 active and 12–14 passive in station mode; a hidden SSID on passive-only channels can be missed. See [ESP-IDF Wi-Fi driver overview](https://docs.espressif.com/projects/esp-idf/en/v6.1.1/esp32/api-guides/wifi-driver/overview.html). The image permits one association attempt per boot. The prior attempt has not been repeated. A board-side active scan added to the temporary probe now confirms that the exact visible SSID is detectable; the scan does not prove association or credentials. No IP or mDNS result exists, so Wi-Fi and discovery gates remain open.
+
+### Board 2 board-side SSID scan (2026-11-16)
+
+Built with ESP-IDF v6.1.1 as `d51a3d0-dirty`; app image size 858,592 bytes, SHA-256 `d53b1a38807192ff296b5eaf49fc9fa9f895f89d54a9f195007007e6e7e93598`. `esptool v5.6.0 image-info` reported a valid ESP32-S3 image checksum and validation hash. Wrote only this app at offset `0x10000`; a readback of 858,592 bytes matched the image SHA-256. Bootloader and partition table were not written.
+
+Sent `SCAN 776869736b6574656572732d696f74` over CH343 COM6. The firmware performed an active SSID-filtered scan and returned one match: channel 2, RSSI -24 dBm, WPA2. No password was sent. This confirms Board 2 can currently see the SSID with strong signal. No association retry was made; IP assignment, hostname mDNS, and VPN/client reachability remain untested. The M0 Wi-Fi gate stays open.
+
+### Board 2 invalid-length credential check (2026-11-16)
+
+Sent a six-byte dummy WPA passphrase using the bench `WIFI` command. The probe returned `ERR credentials` before station initialization because its validation requires 8–64 bytes for a non-empty password. Follow-up `STATUS` remained `wifi=disabled ip=0.0.0.0 mdns=off reason=0`. The AP was not contacted, so this was not an authentication failure and did not consume the one association attempt for this boot. A radio-level wrong-password test needs a syntactically valid 8–63-byte passphrase (or 64 hexadecimal characters); no substitute was sent. Wi-Fi association and mDNS gates remain open.
+### Board 2 valid-length wrong-password association test (2026-11-16)
+
+Sent a syntactically valid, deliberately incorrect test passphrase over CH343 COM6 using the `WIFI` command. The board completed AP discovery and reported `wifi=failed ip=0.0.0.0 mdns=off reason=15`. ESP-IDF v6.1 station-scenario documentation identifies reason 15 as `WIFI_REASON_4WAY_HANDSHAKE_TIMEOUT` and lists it as a wrong-password outcome for an encrypted AP. This matches the expected negative authentication test; the earlier scan found one WPA2 match on channel 2 at -24 dBm. No DHCP address or mDNS initialization occurred. The association attempt for this boot is consumed; successful association remains untested. See [ESP-IDF station scenarios](https://docs.espressif.com/projects/esp-idf/en/stable/esp32/api-guides/wifi-driver/station-scenarios.html).
+### Board 2 real Wi-Fi association and mDNS checks (2026-11-16)
+
+Following local credential entry, Board 2 reported `wifi=connected ip=192.168.50.137 mdns=on reason=0`. Host Ethernet is `192.168.50.2/24`; Surfshark WireGuard remains active at `10.14.0.2`. The route table has an on-link `192.168.50.0/24` route via Ethernet and a multicast route via `192.168.50.2`. ICMP from the PC to `192.168.50.137` replied in 2 ms.
+
+The configured hostname is `kvmctl-m0-probe.local`. A direct unicast mDNS A query from `192.168.50.2` to `192.168.50.137:5353` returned one answer containing `192.168.50.137`. However, Windows `Dns.GetHostAddresses()` and `ping kvmctl-m0-probe.local` could not resolve it. Repeated direct mDNS multicast queries to `224.0.0.251:5353` received no response, including probes with a UDP 5353 listener joined to the multicast group and egress explicitly selected to Ethernet (QM and QU questions). The board's mDNS responder is reachable by unicast, but Windows hostname resolution and multicast discovery across this host's LAN/VPN path are not verified. Firmware publishes no DNS-SD service. Keep the M0 discovery gate open.
+### Board 2 connected Wi-Fi idle heap snapshot (2026-11-16)
+
+With Wi-Fi connected and hostname mDNS initialized, a UART `PING` emitted heap phase `uart-line`: internal free 269,139 bytes, minimum internal free 235,016 bytes, PSRAM free 8,385,496 of 8,388,608 bytes. This is an idle connected-board snapshot; no WSS/WebRTC or sustained traffic was active, and CPU was not measured. It is not the full-stack resource gate.
+### Board 2 connected LAN latency baseline (2026-11-16)
+
+With Wi-Fi connected and Surfshark active, 20 ICMP probes (32-byte payload) from Ethernet `192.168.50.2` to Board 2 `192.168.50.137` returned 20/20 (0% loss), minimum 32 ms, maximum 128 ms, average 75 ms. A separate initial probe was 2 ms; the 20-packet sample is the recorded baseline. ICMP is only a LAN reachability measure, not app-level or WebRTC sustained traffic.
+
+### Rust-only WebRTC checks (2026-11-16)
+
+In `%TEMP%\webrtc-rs-0.21.1`, `cargo test --test data_channels_interop -- --nocapture` passed 1 test: Rust `webrtc` and Rust `rtc` peers opened a DataChannel, exchanged, and echoed a test string. The test attempted STUN at `74.125.250.129:19302`, which logged network-unreachable; the local peer connection still succeeded using local candidates. This is not ESP32/Rust interop or Internet ICE evidence. `cargo test --test remote_certificate_fingerprint -- --nocapture` passed 1 test that cross-checks Rust local/remote certificate fingerprints from stats; it does not test a mismatched fingerprint rejection. No WSS pinning or ESP32 `esp_peer` fail-closed gate was exercised.
+The local Rust checkout also contains `%TEMP%\webrtc-rs-0.21.1\rtc\tests\dtls_disable_fingerprint_verification.rs`, which constructs a mismatched SDP fingerprint and asserts default rejection; a separate test asserts that explicitly disabling verification accepts it. Execution was attempted but could not build: the online run could not reach crates.io, and offline mode lacked the `assert_matches` dev-dependency. This is Rust `rtc` reference evidence only, not a result for the ESP32 `esp_peer` archive.

@@ -38,6 +38,7 @@ static esp_ip4_addr_t s_wifi_ip;
 static uint8_t s_wifi_disconnect_reason;
 static bool s_mdns_ready;
 static bool s_wifi_initialized;
+static bool s_wifi_connect_attempted;
 
 static const char *TAG = "m0_probe";
 
@@ -177,6 +178,52 @@ static bool decode_hex(const char *text, size_t max_bytes, uint8_t *output,
     return true;
 }
 
+static bool wifi_start_station(void)
+{
+    if (s_wifi_initialized) {
+        return true;
+    }
+
+    ESP_ERROR_CHECK(esp_netif_init());
+    ESP_ERROR_CHECK(esp_event_loop_create_default());
+    if (esp_netif_create_default_wifi_sta() == NULL) {
+        return false;
+    }
+
+    wifi_init_config_t init_config = WIFI_INIT_CONFIG_DEFAULT();
+    ESP_ERROR_CHECK(esp_wifi_init(&init_config));
+    ESP_ERROR_CHECK(esp_wifi_set_storage(WIFI_STORAGE_RAM));
+    ESP_ERROR_CHECK(esp_event_handler_register(WIFI_EVENT, ESP_EVENT_ANY_ID,
+                                               wifi_event_handler, NULL));
+    ESP_ERROR_CHECK(esp_event_handler_register(IP_EVENT, IP_EVENT_STA_GOT_IP,
+                                               wifi_event_handler, NULL));
+    ESP_ERROR_CHECK(esp_wifi_set_mode(WIFI_MODE_STA));
+    ESP_ERROR_CHECK(esp_wifi_start());
+    s_wifi_initialized = true;
+    return true;
+}
+
+static const char *wifi_auth_name(wifi_auth_mode_t auth)
+{
+    switch (auth) {
+    case WIFI_AUTH_OPEN: return "open";
+    case WIFI_AUTH_WEP: return "wep";
+    case WIFI_AUTH_WPA_PSK: return "wpa";
+    case WIFI_AUTH_WPA2_PSK: return "wpa2";
+    case WIFI_AUTH_WPA_WPA2_PSK: return "wpa-wpa2";
+    case WIFI_AUTH_ENTERPRISE: return "enterprise";
+    case WIFI_AUTH_WPA3_PSK: return "wpa3";
+    case WIFI_AUTH_WPA2_WPA3_PSK: return "wpa2-wpa3";
+    case WIFI_AUTH_WAPI_PSK: return "wapi";
+    case WIFI_AUTH_OWE: return "owe";
+    case WIFI_AUTH_WPA3_ENT_192: return "wpa3-enterprise";
+    case WIFI_AUTH_WPA3_ENTERPRISE: return "wpa3-enterprise";
+    case WIFI_AUTH_WPA2_WPA3_ENTERPRISE: return "wpa2-wpa3-enterprise";
+    case WIFI_AUTH_WPA_ENTERPRISE: return "wpa-enterprise";
+    case WIFI_AUTH_UNKNOWN: return "unknown";
+    default: return "other";
+    }
+}
 static void wifi_connect_from_hex(const char *ssid_hex, const char *password_hex)
 {
     uint8_t ssid[32] = {0};
@@ -199,33 +246,20 @@ static void wifi_connect_from_hex(const char *ssid_hex, const char *password_hex
     memset(ssid, 0, sizeof(ssid));
     memset(password, 0, sizeof(password));
 
-    if (s_wifi_initialized) {
+    if (s_wifi_connect_attempted) {
         memset(&wifi_config, 0, sizeof(wifi_config));
-        printf("ERR wifi_already_started; reset board to retry\r\n");
+        printf("ERR wifi_already_attempted; reset board to retry\r\n");
         fflush(stdout);
         return;
     }
-
-    ESP_ERROR_CHECK(esp_netif_init());
-    ESP_ERROR_CHECK(esp_event_loop_create_default());
-    esp_netif_t *sta_netif = esp_netif_create_default_wifi_sta();
-    if (sta_netif == NULL) {
+    if (!wifi_start_station()) {
         memset(&wifi_config, 0, sizeof(wifi_config));
         printf("ERR wifi_netif\r\n");
         fflush(stdout);
         return;
     }
-    wifi_init_config_t init_config = WIFI_INIT_CONFIG_DEFAULT();
-    ESP_ERROR_CHECK(esp_wifi_init(&init_config));
-    ESP_ERROR_CHECK(esp_wifi_set_storage(WIFI_STORAGE_RAM));
-    ESP_ERROR_CHECK(esp_event_handler_register(WIFI_EVENT, ESP_EVENT_ANY_ID,
-                                               wifi_event_handler, NULL));
-    ESP_ERROR_CHECK(esp_event_handler_register(IP_EVENT, IP_EVENT_STA_GOT_IP,
-                                               wifi_event_handler, NULL));
-    ESP_ERROR_CHECK(esp_wifi_set_mode(WIFI_MODE_STA));
     ESP_ERROR_CHECK(esp_wifi_set_config(WIFI_IF_STA, &wifi_config));
-    ESP_ERROR_CHECK(esp_wifi_start());
-    s_wifi_initialized = true;
+    s_wifi_connect_attempted = true;
     memset(&wifi_config, 0, sizeof(wifi_config));
     portENTER_CRITICAL(&s_wifi_state_mux);
     s_wifi_state = WIFI_STATE_CONNECTING;
@@ -244,6 +278,92 @@ static void wifi_connect_from_hex(const char *ssid_hex, const char *password_hex
     fflush(stdout);
 }
 
+static void wifi_scan_for_ssid_hex(const char *ssid_hex)
+{
+    uint8_t ssid[33] = {0};
+    size_t ssid_len = 0;
+    wifi_state_t state;
+
+    if (!decode_hex(ssid_hex, sizeof(ssid) - 1, ssid, &ssid_len) || ssid_len == 0) {
+        printf("M0 SCAN ERROR invalid_ssid\r\nM0 SCAN DONE\r\n");
+        fflush(stdout);
+        return;
+    }
+
+    portENTER_CRITICAL(&s_wifi_state_mux);
+    state = s_wifi_state;
+    portEXIT_CRITICAL(&s_wifi_state_mux);
+    if (state == WIFI_STATE_CONNECTING || state == WIFI_STATE_CONNECTED) {
+        printf("M0 SCAN ERROR wifi_busy\r\nM0 SCAN DONE\r\n");
+        fflush(stdout);
+        memset(ssid, 0, sizeof(ssid));
+        return;
+    }
+    if (!wifi_start_station()) {
+        printf("M0 SCAN ERROR wifi_netif\r\nM0 SCAN DONE\r\n");
+        fflush(stdout);
+        memset(ssid, 0, sizeof(ssid));
+        return;
+    }
+
+    wifi_scan_config_t scan_config = {
+        .ssid = ssid,
+        .show_hidden = false,
+        .scan_type = WIFI_SCAN_TYPE_ACTIVE,
+    };
+    esp_err_t err = esp_wifi_scan_start(&scan_config, true);
+    if (err != ESP_OK) {
+        printf("M0 SCAN ERROR start=%d\r\nM0 SCAN DONE\r\n", (int)err);
+        fflush(stdout);
+        memset(ssid, 0, sizeof(ssid));
+        return;
+    }
+
+    uint16_t found = 0;
+    err = esp_wifi_scan_get_ap_num(&found);
+    if (err != ESP_OK) {
+        esp_wifi_clear_ap_list();
+        printf("M0 SCAN ERROR count=%d\r\nM0 SCAN DONE\r\n", (int)err);
+        fflush(stdout);
+        memset(ssid, 0, sizeof(ssid));
+        return;
+    }
+    if (found == 0) {
+        esp_wifi_clear_ap_list();
+        printf("M0 SCAN no_match\r\nM0 SCAN DONE\r\n");
+        fflush(stdout);
+        memset(ssid, 0, sizeof(ssid));
+        return;
+    }
+
+    uint16_t reported = found > 8 ? 8 : found;
+    wifi_ap_record_t *records = calloc(reported, sizeof(*records));
+    if (records == NULL) {
+        esp_wifi_clear_ap_list();
+        printf("M0 SCAN ERROR memory\r\nM0 SCAN DONE\r\n");
+        fflush(stdout);
+        memset(ssid, 0, sizeof(ssid));
+        return;
+    }
+
+    uint16_t returned = reported;
+    err = esp_wifi_scan_get_ap_records(&returned, records);
+    if (err == ESP_OK) {
+        for (uint16_t i = 0; i < returned; ++i) {
+            printf("M0 SCAN AP channel=%u rssi=%d auth=%s\r\n",
+                   records[i].primary, records[i].rssi,
+                   wifi_auth_name(records[i].authmode));
+        }
+    }
+    esp_wifi_clear_ap_list();
+    free(records);
+    memset(ssid, 0, sizeof(ssid));
+    if (err != ESP_OK) {
+        printf("M0 SCAN ERROR records=%d\r\n", (int)err);
+    }
+    printf("M0 SCAN count=%u\r\nM0 SCAN DONE\r\n", found);
+    fflush(stdout);
+}
 static void print_status(void)
 {
     wifi_state_t state;
@@ -276,6 +396,16 @@ static void handle_uart_line(char *line)
     } else if (strcmp(command, "STATUS") == 0) {
         print_status();
         return;
+    } else if (strcmp(command, "SCAN") == 0) {
+        char *ssid_hex = strtok_r(NULL, " \t", &save);
+        char *extra = strtok_r(NULL, " \t", &save);
+        if (ssid_hex == NULL || extra != NULL) {
+            printf("M0 SCAN ERROR usage\r\nM0 SCAN DONE\r\n");
+            fflush(stdout);
+        } else {
+            wifi_scan_for_ssid_hex(ssid_hex);
+            return;
+        }
     } else if (strcmp(command, "WIFI") == 0) {
         char *ssid_hex = strtok_r(NULL, " \t", &save);
         char *password_hex = strtok_r(NULL, " \t", &save);
