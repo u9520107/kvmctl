@@ -3,17 +3,18 @@
 ## Documents
 
 - [Design](design.md): goals, architecture, trust model, identity, sessions, HID, endpoint scope, and unresolved design details.
-- [Execution plan](execution-plan.md): milestones, dependencies, hardware gates, acceptance checks, and evidence.
+- [Execution plan](execution-plan.md): current milestones, dependencies, and acceptance checks.
+- [Test evidence](evidence.md): dated hardware observations, test results, and verification records.
 
-Keep design decisions in the design document and progress/evidence in the execution plan.
+Keep design decisions in the design document, status in the execution plan, and detailed evidence in the evidence record.
 
 ## Current position
 
-M0 is closed as bootstrap and initial feasibility, following the 2026-11-16 planning revision. Start M1 product implementation now and verify security as each feature is built. Closing M0 does not mark outstanding security or resource tests passed; their owners and capability gates are in the [execution plan](execution-plan.md#milestones).
+M0 is closed as bootstrap and initial feasibility. M1 implementation is active; M1.1 closed on 2026-11-16 after user QA confirmed board selection/confirmation, hidden-SSID provisioning, LED operation, and removal of an unavailable SSID from the refreshed host list. Portable bridge-marker provisioning and full UI redesign are deferred and do not gate M1.1. Closing M0 or M1.1 does not mark outstanding M1.2 security/resource gates passed; see the [execution plan](execution-plan.md#milestones) and [test evidence](evidence.md).
 
-Evidence is sufficient to build: ESP-IDF and Rust toolchains work; representative N16R8 samples support CH343 UART administration alongside native HID, Wi-Fi association, and a basic same-board DataChannel exchange. Multicast discovery remains unresolved. The unmodified `esp_peer` 1.5.3 backend failed certificate identity checks and stays prohibited for secure control; the proposed patch has not passed its valid-session baseline. Rust interop tooling builds, but board-to-Rust and WSS integration remain to implement and test. Preserve these [findings](execution-plan.md#selected-backend-fingerprint-gate-failed-2026-11-16) while developing the real client and firmware.
+Evidence is sufficient to build: ESP-IDF and Rust toolchains work; representative N16R8 samples support CH343 UART administration alongside native HID, Wi-Fi association, and a basic same-board DataChannel exchange. Multicast discovery remains unresolved. The unmodified `esp_peer` 1.5.3 backend failed certificate identity checks and stays prohibited for secure control; the proposed patch has not passed its valid-session baseline. Rust interop tooling builds, but board-to-Rust and WSS integration remain to implement and test. Preserve these [findings](evidence.md#selected-backend-fingerprint-gate-failed-2026-11-16) while developing the real client and firmware.
 
-Next deliverable is M1.1: LED-off firmware first, then a buildable product workspace and minimal Windows client that identifies compatible boards through USB Plug and Play, displays USB status, provisions Wi-Fi from an editable visible-SSID list with manual hidden-SSID entry, and controls supported RGB LED brightness/color. Users should not have to guess COM numbers, and the client must not probe arbitrary serial ports. M1.1 also includes portable USB identification: verify the bridge supports writable descriptors, provision a board-specific product string separately from ESP32 flashing, and verify recognition on a fresh PC plus descriptor persistence and driver compatibility. This provisioning remains pending; unknown CH343 adapters require explicit confirmation before opening, while previously confirmed mappings support automatic selection. Default the LED off and persist user preferences. Reuse useful code from `verification/m0` in product modules and attach tests to those modules. Keep unverified transport work in no-HID mode; independent client, USB, discovery, and storage work can proceed while certificate enforcement is fixed.
+M1.1 delivered LED-off firmware, the Rust USB client, Plug and Play discovery, editable Wi-Fi provisioning, and persisted RGB settings. User QA passed; unknown CH343 adapters still require explicit confirmation because portable bridge-marker provisioning is deferred. Keep unverified transport work in no-HID mode while certificate enforcement is fixed.
 
 ## Confirmed decisions
 
@@ -50,3 +51,7 @@ No outstanding user policy questions from this review. Engineering details and h
 M1 owns transport interoperability, certificate enforcement, USB identity/storage/reset, discovery, signaling, protocol vectors, and measured acceptance limits as part of the working product. M2 adds live capture and user-facing control flows only after their safety checks pass. M5 expands hardening coverage; it is not the first security milestone. A fault found on a sample is tracked as a device/recovery issue, not a dependency on qualifying an entire batch.
 
 JetKVM API behavior, optional relay support, wake/power features, portability, and publishing-name checks stay deferred to their milestones.
+
+A full visual redesign or migration from native Win32 controls to Slint/egui is deferred beyond M1.1. Keep M1.1 changes limited to usability fixes needed for acceptance.
+
+The M1.1 RGB controls are a working prototype. In a later control-status slice, expose only LED enable/disable and brightness, then use red for disconnected, blue for connected/idle, and green while receiving control signals. Define other colors, blink patterns, and transitions with that implementation.

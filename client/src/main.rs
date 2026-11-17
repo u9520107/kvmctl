@@ -808,11 +808,86 @@ mod wifi_networks {
     use std::ffi::c_void;
     use std::ptr;
     use std::slice;
+    use std::sync::mpsc::{self, Receiver, Sender};
+    use std::time::{Duration, Instant};
     use windows_sys::Win32::Foundation::HANDLE;
     use windows_sys::Win32::NetworkManagement::WiFi::{
-        WLAN_AVAILABLE_NETWORK_LIST, WLAN_INTERFACE_INFO_LIST, WlanCloseHandle, WlanEnumInterfaces,
-        WlanFreeMemory, WlanGetAvailableNetworkList, WlanOpenHandle,
+        L2_NOTIFICATION_DATA, WLAN_AVAILABLE_NETWORK_LIST, WLAN_INTERFACE_INFO_LIST,
+        WLAN_NOTIFICATION_SOURCE_ACM, WlanCloseHandle, WlanEnumInterfaces, WlanFreeMemory,
+        WlanGetAvailableNetworkList, WlanOpenHandle, WlanRegisterNotification, WlanScan,
+        wlan_notification_acm_scan_complete, wlan_notification_acm_scan_fail,
     };
+    use windows_sys::core::GUID;
+
+    #[derive(Clone, Copy)]
+    struct ScanEvent {
+        interface: GUID,
+        code: u32,
+    }
+
+    fn same_guid(left: &GUID, right: &GUID) -> bool {
+        left.data1 == right.data1
+            && left.data2 == right.data2
+            && left.data3 == right.data3
+            && left.data4 == right.data4
+    }
+
+    unsafe extern "system" fn scan_notification(
+        data: *mut L2_NOTIFICATION_DATA,
+        context: *mut c_void,
+    ) {
+        if data.is_null() || context.is_null() {
+            return;
+        }
+        let data = unsafe { &*data };
+        if data.NotificationSource != WLAN_NOTIFICATION_SOURCE_ACM
+            || (data.NotificationCode != wlan_notification_acm_scan_complete as u32
+                && data.NotificationCode != wlan_notification_acm_scan_fail as u32)
+        {
+            return;
+        }
+        let sender = unsafe { &*context.cast::<Sender<ScanEvent>>() };
+        let _ = sender.send(ScanEvent {
+            interface: data.InterfaceGuid,
+            code: data.NotificationCode,
+        });
+    }
+
+    struct Notifications(HANDLE);
+
+    impl Drop for Notifications {
+        fn drop(&mut self) {
+            unsafe {
+                WlanRegisterNotification(
+                    self.0,
+                    0,
+                    0,
+                    None,
+                    ptr::null(),
+                    ptr::null(),
+                    ptr::null_mut(),
+                );
+            }
+        }
+    }
+
+    fn wait_for_scan(receiver: &Receiver<ScanEvent>, interface: &GUID) -> Result<(), String> {
+        let deadline = Instant::now() + Duration::from_secs(4);
+        loop {
+            let remaining = deadline.saturating_duration_since(Instant::now());
+            let event = receiver.recv_timeout(remaining).map_err(|_| {
+                "Windows Wi-Fi scan did not finish within 4 seconds; refresh again".to_owned()
+            })?;
+            if !same_guid(&event.interface, interface) {
+                continue;
+            }
+            return if event.code == wlan_notification_acm_scan_complete as u32 {
+                Ok(())
+            } else {
+                Err("Windows Wi-Fi scan failed; refresh again".into())
+            };
+        }
+    }
 
     struct Client(HANDLE);
 
@@ -859,8 +934,42 @@ mod wifi_networks {
             )
         };
 
+        let (sender, receiver) = mpsc::channel();
+        let result = unsafe {
+            WlanRegisterNotification(
+                client.0,
+                WLAN_NOTIFICATION_SOURCE_ACM,
+                0,
+                Some(scan_notification),
+                (&sender as *const Sender<ScanEvent>).cast(),
+                ptr::null(),
+                ptr::null_mut(),
+            )
+        };
+        if result != 0 {
+            return Err(format!(
+                "cannot register Wi-Fi scan notifications (error {result})"
+            ));
+        }
+        let _notifications = Notifications(client.0);
+
         let mut ssids = BTreeSet::new();
         for interface in interfaces {
+            while receiver.try_recv().is_ok() {}
+            let result = unsafe {
+                WlanScan(
+                    client.0,
+                    &interface.InterfaceGuid,
+                    ptr::null(),
+                    ptr::null(),
+                    ptr::null(),
+                )
+            };
+            if result != 0 {
+                return Err(format!("cannot scan Wi-Fi networks (error {result})"));
+            }
+            wait_for_scan(&receiver, &interface.InterfaceGuid)?;
+
             let mut raw_networks: *mut WLAN_AVAILABLE_NETWORK_LIST = ptr::null_mut();
             let result = unsafe {
                 WlanGetAvailableNetworkList(
