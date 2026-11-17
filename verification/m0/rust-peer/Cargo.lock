@@ -768,6 +768,7 @@ dependencies = [
  "anyhow",
  "async-trait",
  "bytes",
+ "rtc",
  "webrtc",
 ]
 

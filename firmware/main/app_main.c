@@ -6,6 +6,7 @@
 #include "device_identity.h"
 #include "led_control.h"
 #include "usb_admin.h"
+#include "transport.h"
 #include "wifi_setup.h"
 #include <stdbool.h>
 #include <stdint.h>
@@ -71,6 +72,11 @@ void app_main(void)
     }
     usb_admin_silence_logs();
     wifi_setup_init();
+    err = transport_init();
+    if (err != ESP_OK) {
+        ESP_LOGE(TAG, "WebRTC transport initialization failed: %s", esp_err_to_name(err));
+        abort();
+    }
     err = usb_admin_start();
     if (err != ESP_OK) {
         ESP_LOGE(TAG, "USB administration initialization failed: %s", esp_err_to_name(err));

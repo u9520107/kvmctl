@@ -11,9 +11,9 @@ Dated test results and hardware observations for the [execution plan](execution-
 | COM/native USB topology | Boards 1 and 2: CH343 UART0 data + native HID coexistence confirmed | CH343 bridges (`1A86:55D3`, COM3/COM6) remain active while native USB enumerates keyboard and mouse HID (`303A:4004`). The repository M0 probe returned a 4-byte count for `PING` on both. Native USB CDC (`303A:4001`) and ROM USB-Serial/JTAG (`303A:1001`) were also observed in their respective modes. Internal routing details, pin-powered modes, and CDC+HID on one USB connection remain untested. |
 | Sample bootloader/RST finding | Device issue retained; product recovery work in M1.5 | Probe recovered after RST, but this sample's existing bootloader reports a SHA mismatch. Preserve backups/evidence and use a safe recovery procedure; this does not block unrelated product implementation. |
 | Board Wi-Fi provisioning | Board 2 associated and received DHCP address | Local credential entry connected Board 2 at `192.168.50.137`; ICMP succeeds from Ethernet with Surfshark active. Board 1 remains on the no-Wi-Fi probe. Credentials remain RAM-only. See dated evidence below. |
-| mDNS, VPN compatibility, HTTPS/WSS, WebRTC | Unicast mDNS works; multicast unresolved; unmodified backend fails fingerprint gate | The restored Wi-Fi probe publishes no DNS-SD service and implements no HTTPS/WSS or WebRTC. Separate two-peer board firmware passed a DataChannel baseline but accepted mismatched fingerprints in both DTLS roles. LAN reachability with Surfshark active does not pass discovery or secure-stack gates. |
-| Stack documentation review | Board transport baseline passed; unmodified ESP32 secure stack rejected | ESP-IDF C + `esp-webrtc-solution` tag `v1.3.0` / component `esp_peer` 1.5.3; Windows Rust + `webrtc-rs` 0.21.1. Exact board runtime test allowed payloads with wrong SDP fingerprints in both roles. A source patch is being evaluated separately. Secure signaling, ESP32-to-Rust interop, and full-stack resource use remain untested. See [design](design.md). |
-| Firmware/client implementation | M1.1 product code present; hardware/UI checks open | Product firmware and Windows USB client are under `firmware/` and `client/`. Board 2 USB settings and persistence have prior evidence below. Portable bridge-marker provisioning is deferred; interactive Windows acceptance remains open. |
+| mDNS, VPN compatibility, HTTPS/WSS, WebRTC | Multicast unresolved; M1.2 closed | Product firmware and the Rust client exchanged known payloads over USB-signaled DataChannels with fingerprint enforcement. DNS-SD and authenticated WSS remain M1.3 work. |
+| Stack documentation review | Unmodified ESP32 backend rejected; patched backend verified | ESP-IDF C + `esp-webrtc-solution` commit `3971094e2e7c2ab7cb4de59e4eae710e1902d2b4` / `esp_peer` 1.5.3 with recorded fingerprint patch; Windows Rust + `webrtc-rs` 0.21.1. The isolated firmware probe rejected mismatches in both DTLS roles; product cross-stack evidence is below. Product heap and peer-task CPU were sampled in transport-test mode; total system CPU and sustained-load resources remain unmeasured. See [design](design.md). |
+| Firmware/client implementation | M1.1 and M1.2 closed | App-only product images preserved Board 2 identity, settings, and LED behavior. Product transport tests passed both channels, reconnect, invalidation, certificate cases, and resource sampling. Portable bridge-marker provisioning is deferred. |
 
 ### Read-only host inventory (2026-11-15)
 
@@ -257,13 +257,156 @@ Unmodified `esp_peer` 1.5.3 from this pinned checkout/IDF combination is rejecte
 
 ### Patched candidate and interop preparation (2026-11-16)
 
-Source hardening patch `verification/m0/peer-fingerprint/esp-peer-fingerprint.patch` adds strict SDP fingerprint parsing and required DTLS leaf-certificate matching in both roles. Patch SHA-256 is `d238d5cd9d5e870ec1d2e87510282e7a1c14a2eaaf917df96e3baec66224ce47`. It builds from an isolated export; linked firmware contains the parser, registry lookup, and verification callback. Extracted-C parser checks passed 1,306 cases. Independent review found no initial-handshake binding blocker; product callers must still disarm and close a session on subsequent SDP errors after callbacks unwind.
+The initial source hardening patch `verification/m0/peer-fingerprint/esp-peer-fingerprint.patch` adds strict SDP fingerprint parsing and required DTLS leaf-certificate matching in both roles. Its first candidate hash was `d238d5cd9d5e870ec1d2e87510282e7a1c14a2eaaf917df96e3baec66224ce47`; the final candidate and tested behavior are recorded below. It builds from an isolated export; linked firmware contains the parser, registry lookup, and verification callback. Extracted-C parser checks passed 1,306 cases. Independent review found no initial-handshake binding blocker; product callers must still disarm and close a session on subsequent SDP errors after callbacks unwind.
 
-Board run `20261116-102913` did not establish a valid patched DataChannel baseline, so negative cases were not run and the patch is not accepted. The original complete app slot was restored and verified against the recorded backup hash. Do not count a built patch or parser checks as a passed certificate gate.
+The first patched board run, `20261116-102913`, did not establish a valid DataChannel baseline. That result was inconclusive and is superseded by the later verified run below. The original complete app slot was restored and verified against the recorded backup hash.
 
-A separate Rust peer and USB bridge in `verification/m0/rust-peer` build offline; boundary/framing checks pass. ESP32 serial-peer module syntax checks pass, but firmware integration and actual ESP32-to-Windows traffic are untested. No new LAN interop result exists.
+A separate Rust peer and USB bridge in `verification/m0/rust-peer` build offline. Product firmware/client transport integration and actual ESP32-to-Windows traffic status are recorded below.
 
-The [certificate-fixture test design](../verification/m0/peer-fingerprint/certificate-tests.md) specifies ordinary unit and integration cases with synthetic certificates A/B, expected matching/mismatching identities, and explicit pass/fail evidence. DTLS fingerprints cover the full certificate; WSS pins cover SPKI and additionally enforce SAN, validity, and handshake signatures. Fixture integration cases remain unimplemented/unrun. This preserves the required rejection coverage rather than substituting naming changes for verification.
+The [certificate-fixture test design](../verification/m0/peer-fingerprint/certificate-tests.md) specifies unit and integration cases with synthetic certificates A/B, expected matching/mismatching identities, and explicit pass/fail evidence. DTLS fingerprints cover the full certificate; WSS pins cover SPKI and additionally enforce SAN, validity, and handshake signatures. Product DTLS fixture cases are recorded below; WSS certificate validation remains M1.3 work.
+
+### M1.2 transport implementation and patched backend gate (2026-11-16)
+
+The backend remains Espressif `esp_peer` 1.5.3 from `esp-webrtc-solution`
+commit `3971094e2e7c2ab7cb4de59e4eae710e1902d2b4`, with the local patch
+`verification/m0/peer-fingerprint/esp-peer-fingerprint.patch` (current SHA-256
+`6631fed27750b4cf444c82bdf5afd1eb316674abd8bad97875166660aa5eb8ca`). The
+board probe used patch-file SHA-256
+`060214cb4e77cae952216eb7e8a23ad9ee0af12b9d9ef1b43b7ba3629e536f57`; patched
+`esp_peer.c`, `dtls_srtp_v6.c`, `dtls_common.h`, and `dtls_srtp.h` sources in the
+current export match the probe export byte-for-byte. The patch requires a
+SHA-256 SDP fingerprint, checks the peer DTLS leaf certificate against it in
+both roles, and retains required certificate verification. The unmodified
+1.5.3 backend remains prohibited for secure control.
+
+On Board 2, isolated probe run `20261116-202453` used probe image SHA-256
+`93b7d72038c8791e9fa57fe0d60bd97951336bcf5df7c01fc07675b5a231429c`. The
+valid baseline opened one DataChannel at each peer and exchanged 10 known
+messages each way. Mutating source 0's SDP fingerprint produced explicit
+`pin_mismatch` rejection in the DTLS client role; mutating source 1's produced
+the same explicit rejection in the server role. Both negative cases had zero
+channel opens, zero received application messages, and zero reported harness
+errors. The runner's `M0 VERIFIED_SUITE PASS` requires the valid baseline,
+expected role-specific rejection, zero open/receive/error counts, and matching
+offerer/answerer roles. The generic per-case label is `INCONCLUSIVE` because
+those negative cases intentionally never reach a DataChannel.
+
+The isolated two-peer probe started with 248,319 bytes free internal heap and
+8,385,692 bytes free PSRAM before peer setup. It reached a minimum of 74,340
+bytes free internal heap and 7,565,916 bytes free PSRAM during the second
+negative case; internal heap after both peers closed was 233,387 bytes. The
+valid baseline case reached 84,040 bytes minimum internal heap and had 247,995
+bytes free after close. CPU, Windows interoperability, product reconnect, and
+sustained-load measurements were not part of this probe. The runner restored
+the original full app slot and verified backup SHA-256
+`2a26bdfa8e4228f43607cb4baa00e23fb24d86f07d2ee56d6a09e6f5d7bfbbdd`.
+Redacted UART evidence is local in
+`verification/m0/peer-fingerprint/logs/20261116-202453/uart.log`.
+
+Product transport code is integrated in `firmware/main/transport.c` and
+`client/src/transport.rs`. The device is the answerer and echoes bounded
+payloads on `control` and `motion`; the Rust client creates reliable ordered
+`control` and unordered zero-retransmission `motion`, checks those settings,
+tests malformed-SDP active-session invalidation, and exercises a fresh-session
+reconnect. A USB status request reports a captured backend fingerprint
+rejection to the Windows test client while keeping UART logs suppressed. HID
+output and physical-input capture remain disabled. USB SDP is an internal test
+aid, not production signaling.
+
+The ESP-IDF 6.1.1 product image is 1,083,856 bytes, SHA-256
+`412361f2b331f854dd99890504e5921e7a7d13af9fdac55817f43218e135d65c`. Board 2
+was flashed through the app-only USB updater; bootloader, partition table, NVS,
+and VFS were not written. The app-partition backup SHA-256 is
+`2a26bdfa8e4228f43607cb4baa00e23fb24d86f07d2ee56d6a09e6f5d7bfbbdd`. USB
+status after flashing confirmed the board identity and saved settings remained
+available. The backend source and patch hashes are recorded above.
+
+Test-only certificate A, B, and renewed A are in
+`verification/m0/peer-fingerprint/fixtures`. Renewed A uses A's public key but
+has different DER. No fixture key was installed on hardware. On Board 2,
+`cargo run -p kvmctl -- transport-test COM6` completed valid fixture A and B
+sessions. Each session exchanged 10 payloads on each channel, rejected one
+conflicting SDP while connected, closed after callbacks unwound, then rejected
+malformed SDP on a fresh session and reconnected cleanly. The certificate
+matrix below used firmware image SHA-256
+`412361f2b331f854dd99890504e5921e7a7d13af9fdac55817f43218e135d65c` and the
+same patched `esp_peer` backend revision/hash recorded above. The final
+telemetry image retained that backend and passed a separate payload, channel,
+invalidation, reconnect, heap, and peer-task CPU run.
+
+| Fixture | Initial/reconnect open (ms) | Control RTT (µs), initial/reconnect | Motion RTT (µs), initial/reconnect |
+| --- | ---: | ---: | ---: |
+| A | 1643 / 1646 | 10942–28881 / 11722–31930 | 11051–27075 / 10902–28838 |
+| B | 1708 / 1637 | 11198–28539 / 11212–27764 | 11057–23259 / 13148–30408 |
+
+Both channels reported their required delivery settings: control reliable and
+ordered; motion unordered with zero retransmissions. These setup values include
+ICE gathering, temporary USB SDP exchange, DTLS, and channel open. No COM port,
+address, identity, or bench /24 restriction is embedded in product constants.
+
+| Receiving path | Case | Result |
+| --- | --- | --- |
+| ESP32 | Fixture B presented with fixture A fingerprint | Explicit `ESP32 rejected the remote DTLS certificate fingerprint`; no channel opened and no application echo ran. Valid A/A and B/B baselines passed first. |
+| ESP32 | Renewed A presented with old A fingerprint | Same explicit rejection. Renewal has same key and different DER. |
+| ESP32 | Missing, malformed, or duplicate offer fingerprint | Each rejected as malformed SDP/certificate identity before a channel opened. |
+| Windows | Product ESP certificate presented with fixture A as expected fingerprint | Rust verifier's certificate-mismatch warning was captured without printing backend logs; client reported explicit rejection with `DataChannels opened=0, application messages sent=0`. Board's product certificate matched in preceding baselines. Fixture B was not installed on the board. |
+| Windows | Missing, malformed, or duplicate answer fingerprint | Each rejected by the client parser before remote description was applied. |
+
+The pinned Rust WebRTC 0.21.1 stack leaves peer state `Connecting` after its
+DTLS verifier rejects a certificate. The test client now captures only
+warning/error classification (never raw SDP/ICE or backend log text), recognizes
+the verifier's exact certificate mismatch, reports zero opened channels and
+application messages, then closes the session. The integrated transport tests
+prove the production certificate gate without treating a timeout as a pass.
+
+The Python USB-admin host harness could not run because this environment lacks
+the native `cc` compiler it invokes. The ESP-IDF product build did compile the
+USB request decoder and transport-status response paths.
+
+The first telemetry image (1,087,024 bytes, SHA-256
+`3f2b6011b227c529cfebc98378a6a0b41224d76b4184e116ea2021fd9d0123c9`) was
+flashed app-only to Board 2. Its verified full app-partition backup is
+`firmware/backups/factory-app-before-resource-metrics.bin`, SHA-256
+`0c0ff352f610931b800432f619b578c8c01d3958ff97650d7a435c616afda349`.
+That run exchanged 10 messages per channel and reconnected cleanly, but showed
+state 4 after requested shutdown. It exposed expected DataChannel close
+callbacks being classified as failures and an after-close heap reading taken
+before the worker stack was reclaimed. Firmware was corrected to ignore those
+expected callbacks, sample after task cleanup, and collect `webrtc_peer` task
+runtime using FreeRTOS stats and the 1 MHz ESP Timer clock.
+
+The final image is 1,087,760 bytes, SHA-256
+`c66667cbae9a408d8cdd527420c543bfa401bb227741cc38f6cfe5068d8d3798`; it fits
+the app partition with 29% free. Board 2 ran it after an app-only update. The
+verified full app-partition backup is
+`firmware/backups/factory-app-before-close-state-fix.bin`, SHA-256
+`55cb39fb1748fdb8242b27ef55f88ffd32b6f3265268e9916d840ad2c41106f9`.
+After one transient initial-status framing error, the read-only status retry
+succeeded and the following run passed:
+
+| Stage | Open (ms) | Control RTT (µs) | Motion RTT (µs) | Internal free start/min/after (bytes) | PSRAM free start/min/after (bytes) | Opens / received bytes | `webrtc_peer` CPU (µs) |
+| --- | ---: | ---: | ---: | --- | --- | ---: | ---: |
+| Initial | 1614 | 11669–30298 | 11062–36483 | 225859 / 140407 / 224967 | 8375984 / 7966096 / 8375984 | 2 / 510 | 1182326 |
+| Reconnect | 1685 | 12091–36477 | 14346–43543 | 225003 / 139743 / 224967 | 8375984 / 7966096 / 8375984 | 2 / 510 | 1172428 |
+
+Both runs reported idle state 0 after close, exchanged 10 messages per
+channel, rejected conflicting SDP and malformed SDP after callbacks unwound,
+then reconnected cleanly. Control was reliable and ordered; motion was
+unordered with zero retransmissions. CPU values measure the `webrtc_peer`
+worker task for each full test session, not total SoC CPU; Wi-Fi/other task CPU
+and sustained-load resource behavior remain unmeasured. UART0 startup logs can
+transiently precede the binary frame; the host retries only the idempotent
+status query and keeps transport/certificate parsing fail-closed.
+
+Product M1.2 payload, channel, setup/reconnect, active-session invalidation,
+certificate-gate, integrated heap, and peer-task CPU checks passed. Total SoC
+CPU and sustained-load resource behavior remain unmeasured. The earlier
+isolated two-peer probe memory figures above are not a substitute for the
+integrated firmware baseline.
+The command is reproducible from source with
+`cargo run -p kvmctl -- transport-test COMx`; use the port reported by
+`cargo run -p kvmctl -- ports`. It does not capture physical input or emit HID
+reports, and it does not log SDP or ICE secrets.
 
 ### M1.1 firmware first slice (2026-11-16)
 

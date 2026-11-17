@@ -7,7 +7,8 @@ The milestone section is current scope. Dated test results and hardware observat
 ## Current status
 
 - **M1.1: closed (2026-11-16).** User verified board selection/confirmation, hidden-SSID provisioning, LED controls, and that a disappeared network also disappears from the refreshed host SSID list.
-- **M1: active.** M1.2 secure transport remains gated by the recorded certificate-binding failure; detailed results are in [evidence.md](evidence.md).
+- **M1.2: closed (2026-11-17).** Product ESP32/Windows payload exchange, both channel settings, reconnect, active-session invalidation, certificate rejection, and integrated heap/peer-task CPU sampling passed. Worker-task CPU is measured; total SoC CPU and sustained-load behavior remain unmeasured limitations. See [evidence.md](evidence.md).
+- **M1: active.** Keep HID output and physical-input capture disabled while M1.3 authorization and authenticated signaling remain unimplemented.
 - **Deferred by user:** CH343 bridge EEPROM marker provisioning and full UI redesign.
 
 Product firmware in this slice has no LAN control or HID output. See [evidence.md](evidence.md) for test records and hardware observations.

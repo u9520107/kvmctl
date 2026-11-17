@@ -2,10 +2,18 @@
 
 use std::io::{self, Write};
 
+#[cfg(windows)]
+mod flash;
+#[cfg(windows)]
+mod transport;
+
 const MAX_FRAME: usize = 4096;
 const WIFI_SET_COMMAND: u64 = 0x60;
 const STATUS_COMMAND: u64 = 0x61;
 const LED_SET_COMMAND: u64 = 0x66;
+const TRANSPORT_OFFER_COMMAND: u64 = 0x67;
+const TRANSPORT_CLOSE_COMMAND: u64 = 0x68;
+const TRANSPORT_STATUS_COMMAND: u64 = 0x69;
 
 #[derive(Debug)]
 struct Status {
@@ -17,6 +25,20 @@ struct Status {
     led_enabled: bool,
     led_brightness: u64,
     led_rgb: [u8; 3],
+}
+
+#[derive(Clone, Copy, Default)]
+struct TransportMetrics {
+    state: u8,
+    internal_free_start: u32,
+    internal_free_min: u32,
+    internal_free_end: u32,
+    psram_free_start: u32,
+    psram_free_min: u32,
+    psram_free_end: u32,
+    channel_opens: u32,
+    application_bytes_received: u32,
+    peer_task_cpu_us: u32,
 }
 
 struct Secret(Vec<u8>);
@@ -131,6 +153,105 @@ fn encode_led_request(
     Ok(encode_request(LED_SET_COMMAND, request_id, &payload))
 }
 
+fn encode_transport_offer_request(request_id: &[u8; 16], sdp: &str) -> Result<Vec<u8>, String> {
+    if sdp.is_empty() || sdp.len() > 3500 || !sdp.is_ascii() {
+        return Err("SDP is empty, oversized, or non-ASCII".into());
+    }
+    let mut payload = vec![0xa1, 0x00];
+    put_text(&mut payload, sdp.as_bytes());
+    let request = encode_request(TRANSPORT_OFFER_COMMAND, request_id, &payload);
+    if request.len() > MAX_FRAME {
+        return Err("SDP exceeds USB signaling frame limit".into());
+    }
+    Ok(request)
+}
+
+fn decode_transport_offer_response(
+    data: &[u8],
+    request_id: &[u8; 16],
+) -> Result<String, String> {
+    let mut r = Reader::new(data);
+    let (major, map_len) = r.head()?;
+    if major != 5 || !(map_len == 5 || map_len == 6) {
+        return Err("invalid transport offer response".into());
+    }
+    r.expect_uint(0)?;
+    r.expect_uint(1)?;
+    r.expect_uint(1)?;
+    r.expect_uint(0)?;
+    r.expect_uint(2)?;
+    r.expect_uint(TRANSPORT_OFFER_COMMAND)?;
+    r.expect_uint(3)?;
+    if r.expect_bytes(16)? != request_id {
+        return Err("response request ID mismatch".into());
+    }
+    r.expect_uint(4)?;
+    let code = r.uint()?;
+    if code != 0 {
+        if map_len != 5 || !r.done() {
+            return Err("invalid transport offer error response".into());
+        }
+        if code == 1 {
+            return Err("device rejected malformed SDP or certificate fingerprint identity".into());
+        }
+        return Err(format!("device rejected SDP offer with code {code}"));
+    }
+    if map_len != 6 {
+        return Err("successful transport offer omitted answer".into());
+    }
+    r.expect_uint(5)?;
+    let answer = r.long_text(3500)?;
+    if !r.done() {
+        return Err("trailing CBOR data".into());
+    }
+    Ok(answer)
+}
+
+fn decode_transport_status_response(
+    data: &[u8],
+    request_id: &[u8; 16],
+) -> Result<TransportMetrics, String> {
+    let mut r = Reader::new(data);
+    r.expect_map(6)?;
+    r.expect_uint(0)?;
+    r.expect_uint(1)?;
+    r.expect_uint(1)?;
+    r.expect_uint(0)?;
+    r.expect_uint(2)?;
+    r.expect_uint(TRANSPORT_STATUS_COMMAND)?;
+    r.expect_uint(3)?;
+    if r.expect_bytes(16)? != request_id {
+        return Err("response request ID mismatch".into());
+    }
+    r.expect_uint(4)?;
+    let code = r.uint()?;
+    if code != 0 {
+        return Err(format!("device rejected transport status request with code {code}"));
+    }
+    r.expect_uint(5)?;
+    r.expect_map(10)?;
+    let mut values = [0; 10];
+    for (key, value) in values.iter_mut().enumerate() {
+        r.expect_uint(key as u64)?;
+        *value = r.uint()?;
+    }
+    if values[0] > 4 || values[1..].iter().any(|value| *value > u32::MAX as u64) || !r.done() {
+        return Err("invalid transport status response".into());
+    }
+    Ok(TransportMetrics {
+        state: values[0] as u8,
+        internal_free_start: values[1] as u32,
+        internal_free_min: values[2] as u32,
+        internal_free_end: values[3] as u32,
+        psram_free_start: values[4] as u32,
+        psram_free_min: values[5] as u32,
+        psram_free_end: values[6] as u32,
+        channel_opens: values[7] as u32,
+        application_bytes_received: values[8] as u32,
+        peer_task_cpu_us: values[9] as u32,
+    })
+}
+
 fn parse_rgb(color: &str) -> Result<[u8; 3], String> {
     let color = color.strip_prefix('#').unwrap_or(color);
     if color.len() != 6 || !color.bytes().all(|b| b.is_ascii_hexdigit()) {
@@ -240,6 +361,16 @@ impl<'a> Reader<'a> {
         let (major, len) = self.head()?;
         if major != 3 || len > 128 {
             return Err("expected short UTF-8 text".into());
+        }
+        std::str::from_utf8(self.take(len as usize)?)
+            .map(str::to_owned)
+            .map_err(|_| "invalid UTF-8 text".into())
+    }
+
+    fn long_text(&mut self, max_len: usize) -> Result<String, String> {
+        let (major, len) = self.head()?;
+        if major != 3 || len > max_len as u64 {
+            return Err("invalid UTF-8 text length".into());
         }
         std::str::from_utf8(self.take(len as usize)?)
             .map(str::to_owned)
@@ -477,7 +608,10 @@ mod serial {
         (ports.len() == 1 && ports[0].recognized).then_some(0)
     }
 
-    pub struct Port(HANDLE);
+    pub(crate) struct Port(HANDLE);
+
+    // Port ownership moves to one signaling thread; the handle is never shared.
+    unsafe impl Send for Port {}
 
     impl Drop for Port {
         fn drop(&mut self) {
@@ -764,10 +898,35 @@ mod serial {
         }
 
         pub fn status(&mut self) -> Result<Status, String> {
-            let id = random_id()?;
-            let payload = encode_status_request(&id);
-            let response = self.exchange(&payload)?;
-            decode_status_response(&response, &id)
+            let mut last_error = String::new();
+            // UART0 may still be flushing reset logs; retry only this read-only query.
+            for attempt in 0..3 {
+                let id = random_id()?;
+                match self
+                    .exchange(&encode_status_request(&id))
+                    .and_then(|response| decode_status_response(&response, &id))
+                {
+                    Ok(status) => return Ok(status),
+                    Err(error)
+                        if matches!(
+                            error.as_str(),
+                            "invalid response frame length"
+                                | "device did not return a complete status response"
+                                | "response request ID mismatch"
+                        ) =>
+                    {
+                        last_error = error;
+                        if attempt < 2 {
+                            unsafe {
+                                PurgeComm(self.0, PURGE_RXCLEAR | PURGE_TXCLEAR);
+                            }
+                            std::thread::sleep(std::time::Duration::from_millis(250));
+                        }
+                    }
+                    Err(error) => return Err(error),
+                }
+            }
+            Err(format!("device status unavailable after serial startup retries: {last_error}"))
         }
 
         pub fn mutate(
@@ -778,6 +937,26 @@ mod serial {
         ) -> Result<(), String> {
             let response = self.exchange(payload)?;
             decode_mutation_response(&response, request_id, command)
+        }
+
+        pub(crate) fn transport_offer(&mut self, sdp: &str) -> Result<String, String> {
+            let id = random_id()?;
+            let payload = encode_transport_offer_request(&id, sdp)?;
+            let response = self.exchange(&payload)?;
+            decode_transport_offer_response(&response, &id)
+        }
+
+        pub(crate) fn transport_close(&mut self) -> Result<(), String> {
+            let id = random_id()?;
+            let request = encode_request(TRANSPORT_CLOSE_COMMAND, &id, &[0xa0]);
+            let response = self.exchange(&request)?;
+            decode_mutation_response(&response, &id, TRANSPORT_CLOSE_COMMAND)
+        }
+
+        pub(crate) fn transport_status(&mut self) -> Result<TransportMetrics, String> {
+            let id = random_id()?;
+            let response = self.exchange(&encode_request(TRANSPORT_STATUS_COMMAND, &id, &[0xa0]))?;
+            decode_transport_status_response(&response, &id)
         }
 
         fn exchange(&mut self, payload: &[u8]) -> Result<Vec<u8>, String> {
@@ -1092,7 +1271,7 @@ fn run() -> Result<(), String> {
     let command = args.first().map(String::as_str).unwrap_or("status");
     if command == "--help" || command == "-h" {
         println!(
-            "kvmctl [status [COMx] | wifi [COMx] | led [COMx] on|off <brightness> <RRGGBB> | ports]; no arguments opens the control window"
+            "kvmctl [status [COMx] | wifi [COMx] | led [COMx] on|off <brightness> <RRGGBB> | transport-test [COMx] | flash [COMx] <firmware.bin> <backup.bin> | ports]; no arguments opens the control window"
         );
         return Ok(());
     }
@@ -1109,16 +1288,24 @@ fn run() -> Result<(), String> {
             args.get(2..).unwrap_or(&[]),
         ),
         "led" => (None, args.get(1..).unwrap_or(&[])),
+        "flash" if args.get(1).is_some_and(|arg| arg.starts_with("COM")) => (
+            args.get(1).map(String::as_str),
+            args.get(2..).unwrap_or(&[]),
+        ),
+        "flash" => (None, args.get(1..).unwrap_or(&[])),
         _ => (
             args.get(1).map(String::as_str),
             args.get(2..).unwrap_or(&[]),
         ),
     };
-    if !matches!(command, "status" | "wifi" | "led") {
+    if !matches!(command, "status" | "wifi" | "led" | "transport-test" | "flash") {
         return Err("unknown command; use --help".into());
     }
-    if command == "status" && !params.is_empty() || command == "wifi" && !params.is_empty() {
-        return Err("usage: kvmctl [status [COMx] | wifi [COMx] | led [COMx] on|off <brightness> <RRGGBB> | ports]".into());
+    if command == "flash" && params.len() != 2 {
+        return Err("usage: kvmctl flash [COMx] <firmware.bin> <backup.bin>".into());
+    }
+    if matches!(command, "status" | "wifi" | "transport-test") && !params.is_empty() {
+        return Err("usage: kvmctl [status [COMx] | wifi [COMx] | led [COMx] on|off <brightness> <RRGGBB> | transport-test [COMx] | ports]".into());
     }
     let selected = select_port(&ports, requested_port)?;
     if !selected.recognized {
@@ -1136,7 +1323,26 @@ fn run() -> Result<(), String> {
             return Err("device not confirmed; port was not opened".into());
         }
     }
+    if command == "flash" {
+        return flash::run(
+            &selected.name,
+            std::path::Path::new(&params[0]),
+            std::path::Path::new(&params[1]),
+        );
+    }
     let mut port = serial::Port::open(&selected.name)?;
+    if command == "transport-test" {
+        let status = port.status()?;
+        serial::remember_board(&selected, &status.identity_fingerprint);
+        if status.wifi_state != 2 {
+            return Err(format!(
+                "Wi-Fi is {}; connect the board before running transport-test",
+                wifi_name(status.wifi_state)
+            ));
+        }
+        println!("Transport test only; HID output and physical-input capture remain disabled.");
+        return transport::run_test(port).map_err(|error| error.to_string());
+    }
     match command {
         "status" => {
             let status = port.status()?;
@@ -1325,6 +1531,75 @@ mod tests {
         ];
         assert!(decode_mutation_response(&response, &id, LED_SET_COMMAND).is_ok());
         assert!(decode_mutation_response(&response, &id, WIFI_SET_COMMAND).is_err());
+    }
+
+    #[test]
+    fn transport_offer_decodes_success_and_error_response_shapes() {
+        let id = [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15];
+        let mut rejected = vec![0xa5];
+        for (key, value) in [(0, 1), (1, 0), (2, TRANSPORT_OFFER_COMMAND)] {
+            put_uint(&mut rejected, key);
+            put_uint(&mut rejected, value);
+        }
+        put_uint(&mut rejected, 3);
+        put_bytes(&mut rejected, &id);
+        put_uint(&mut rejected, 4);
+        put_uint(&mut rejected, 3);
+        assert_eq!(
+            decode_transport_offer_response(&rejected, &id).unwrap_err(),
+            "device rejected SDP offer with code 3"
+        );
+
+        let mut accepted = vec![0xa6];
+        for (key, value) in [(0, 1), (1, 0), (2, TRANSPORT_OFFER_COMMAND)] {
+            put_uint(&mut accepted, key);
+            put_uint(&mut accepted, value);
+        }
+        put_uint(&mut accepted, 3);
+        put_bytes(&mut accepted, &id);
+        put_uint(&mut accepted, 4);
+        put_uint(&mut accepted, 0);
+        put_uint(&mut accepted, 5);
+        put_text(&mut accepted, b"v=0\r\n");
+        assert_eq!(decode_transport_offer_response(&accepted, &id).unwrap(), "v=0\r\n");
+    }
+
+    #[test]
+    fn decodes_transport_identity_failure_status_and_metrics() {
+        let id = [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15];
+        let mut response = vec![0xa6];
+        for (key, value) in [(0, 1), (1, 0), (2, TRANSPORT_STATUS_COMMAND)] {
+            put_uint(&mut response, key);
+            put_uint(&mut response, value);
+        }
+        put_uint(&mut response, 3);
+        put_bytes(&mut response, &id);
+        put_uint(&mut response, 4);
+        put_uint(&mut response, 0);
+        put_uint(&mut response, 5);
+        put_head(&mut response, 5, 10);
+        for (key, value) in [
+            (0, 3),
+            (1, 50_000),
+            (2, 40_000),
+            (3, 48_000),
+            (4, 1_000_000),
+            (5, 900_000),
+            (6, 999_000),
+            (7, 0),
+            (8, 0),
+            (9, 321),
+        ] {
+            put_uint(&mut response, key);
+            put_uint(&mut response, value);
+        }
+        let metrics = decode_transport_status_response(&response, &id).unwrap();
+        assert_eq!(metrics.state, 3);
+        assert_eq!(metrics.internal_free_min, 40_000);
+        assert_eq!(metrics.psram_free_min, 900_000);
+        assert_eq!(metrics.channel_opens, 0);
+        assert_eq!(metrics.application_bytes_received, 0);
+        assert_eq!(metrics.peer_task_cpu_us, 321);
     }
 
     #[test]

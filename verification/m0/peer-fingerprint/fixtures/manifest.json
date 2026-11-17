@@ -1,0 +1,17 @@
+{
+  "warning": "PUBLIC TEST DATA ONLY; NEVER DEPLOY THESE CERTIFICATES OR KEYS",
+  "fixtures": {
+    "certificate_a": {
+      "certificate_der_sha256": "7075725af47a019feaa2925c5e5ebbdb5605ea33bcba2827147b4d1bd1ae59db",
+      "public_key_der_sha256": "5cd252fb0ce8932436faf8ccd1040981b89ee4ad6b9fe9e2a2b7e71aacb27cd3"
+    },
+    "certificate_b": {
+      "certificate_der_sha256": "4d54c6c99f0c6610da0219ac31babb13b6363dfd3e4453b540eb6bbfe6d7f23e",
+      "public_key_der_sha256": "dc0ce633dbcc913dafafa4b89ac44d8ce683fdfc3f60c8bdf21213b9f2b534ba"
+    },
+    "certificate_a_renewed": {
+      "certificate_der_sha256": "80479a1b7749d81272ae58374a95891142b191a293f25582b053e859e71dee8d",
+      "public_key_der_sha256": "5cd252fb0ce8932436faf8ccd1040981b89ee4ad6b9fe9e2a2b7e71aacb27cd3"
+    }
+  }
+}

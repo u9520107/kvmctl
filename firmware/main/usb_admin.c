@@ -4,13 +4,12 @@
 #include "driver/uart.h"
 #include "esp_app_desc.h"
 #include "esp_err.h"
-#include "esp_log.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
 #include "led_control.h"
+#include "transport.h"
 #include "mbedtls/platform_util.h"
 #include "wifi_setup.h"
-#include <stdarg.h>
 #include <stdbool.h>
 #include <string.h>
 
@@ -21,6 +20,9 @@
 #define ADMIN_WIFI_SET 0x60
 #define ADMIN_STATUS 0x61
 #define ADMIN_LED_SET 0x66
+#define ADMIN_TRANSPORT_OFFER 0x67
+#define ADMIN_TRANSPORT_CLOSE 0x68
+#define ADMIN_TRANSPORT_STATUS 0x69
 
 typedef struct {
     const uint8_t *data;
@@ -40,22 +42,18 @@ typedef struct {
     bool led_enabled;
     uint8_t led_brightness;
     uint8_t led_rgb[3];
+    const uint8_t *offer;
+    size_t offer_len;
 } admin_request_t;
 
 static uint8_t s_request[ADMIN_MAX_PAYLOAD];
 static uint8_t s_response[ADMIN_MAX_PAYLOAD];
 static uint8_t s_spki[DEVICE_IDENTITY_SPKI_MAX];
-
-static int discard_log(const char *format, va_list args)
-{
-    (void)format;
-    (void)args;
-    return 0;
-}
+static uint8_t s_transport_answer[ADMIN_MAX_PAYLOAD];
 
 void usb_admin_silence_logs(void)
 {
-    esp_log_set_vprintf(discard_log);
+    transport_silence_logs();
 }
 
 static bool read_head(cbor_reader_t *r, uint8_t *major, uint64_t *value)
@@ -147,6 +145,20 @@ static bool valid_utf8(const uint8_t *data, size_t len)
     return true;
 }
 
+static bool read_text_view(cbor_reader_t *r, const uint8_t **out, size_t *out_len)
+{
+    uint8_t major;
+    uint64_t len;
+    if (!read_head(r, &major, &len) || major != 3 || len == 0 ||
+        len > 3500 || len > r->len - r->pos ||
+        !valid_utf8(r->data + r->pos, (size_t)len) ||
+        memchr(r->data + r->pos, 0, (size_t)len)) return false;
+    *out = r->data + r->pos;
+    *out_len = (size_t)len;
+    r->pos += (size_t)len;
+    return true;
+}
+
 /* Validate structure without imposing this version's command payload schema. */
 static bool skip_value(cbor_reader_t *r, unsigned depth)
 {
@@ -219,6 +231,17 @@ static request_decode_result_t decode_request(const uint8_t *data, size_t len,
                (request->led_brightness = (uint8_t)brightness, true) && r.pos == r.len
             ? REQUEST_SUPPORTED : REQUEST_INVALID;
     }
+    if (request->command == ADMIN_TRANSPORT_OFFER) {
+        return read_map(&r, 1) && read_expected_uint(&r, 0) &&
+               read_text_view(&r, &request->offer, &request->offer_len) && r.pos == r.len
+            ? REQUEST_SUPPORTED : REQUEST_INVALID;
+    }
+    if (request->command == ADMIN_TRANSPORT_CLOSE) {
+        return read_map(&r, 0) && r.pos == r.len ? REQUEST_SUPPORTED : REQUEST_INVALID;
+    }
+    if (request->command == ADMIN_TRANSPORT_STATUS) {
+        return read_map(&r, 0) && r.pos == r.len ? REQUEST_SUPPORTED : REQUEST_INVALID;
+    }
     return REQUEST_INVALID;
 }
 
@@ -283,6 +306,36 @@ static size_t encode_empty_result(const admin_request_t *request)
     return pos;
 }
 
+static size_t encode_transport_status_response(const admin_request_t *request)
+{
+    size_t pos;
+    transport_metrics_t metrics;
+    transport_get_metrics(&metrics);
+    if (!begin_response(request, 0, true, &pos) ||
+        !put_head(s_response, sizeof(s_response), &pos, 5, 10) ||
+        !put_uint(s_response, sizeof(s_response), &pos, 0) || !put_uint(s_response, sizeof(s_response), &pos, metrics.state) ||
+        !put_uint(s_response, sizeof(s_response), &pos, 1) || !put_uint(s_response, sizeof(s_response), &pos, metrics.internal_free_start) ||
+        !put_uint(s_response, sizeof(s_response), &pos, 2) || !put_uint(s_response, sizeof(s_response), &pos, metrics.internal_free_min) ||
+        !put_uint(s_response, sizeof(s_response), &pos, 3) || !put_uint(s_response, sizeof(s_response), &pos, metrics.internal_free_end) ||
+        !put_uint(s_response, sizeof(s_response), &pos, 4) || !put_uint(s_response, sizeof(s_response), &pos, metrics.psram_free_start) ||
+        !put_uint(s_response, sizeof(s_response), &pos, 5) || !put_uint(s_response, sizeof(s_response), &pos, metrics.psram_free_min) ||
+        !put_uint(s_response, sizeof(s_response), &pos, 6) || !put_uint(s_response, sizeof(s_response), &pos, metrics.psram_free_end) ||
+        !put_uint(s_response, sizeof(s_response), &pos, 7) || !put_uint(s_response, sizeof(s_response), &pos, metrics.channel_opens) ||
+        !put_uint(s_response, sizeof(s_response), &pos, 8) || !put_uint(s_response, sizeof(s_response), &pos, metrics.application_bytes_received) ||
+        !put_uint(s_response, sizeof(s_response), &pos, 9) || !put_uint(s_response, sizeof(s_response), &pos, metrics.peer_task_cpu_us)) return 0;
+    return pos;
+}
+
+static size_t encode_text_result(const admin_request_t *request, const uint8_t *text, size_t len)
+{
+    size_t pos;
+    if (!begin_response(request, 0, true, &pos) ||
+        !put_head(s_response, sizeof(s_response), &pos, 3, len) ||
+        len > sizeof(s_response) - pos) return 0;
+    memcpy(s_response + pos, text, len);
+    return pos + len;
+}
+
 static size_t encode_error(const admin_request_t *request, uint64_t code)
 {
     size_t pos;
@@ -326,6 +379,20 @@ static size_t dispatch_request(admin_request_t *request)
         if (err == ESP_OK) return encode_empty_result(request);
         return encode_error(request, err == ESP_ERR_NOT_SUPPORTED ? 7 : err == ESP_ERR_INVALID_ARG ? 1 : 6);
     }
+    if (request->command == ADMIN_TRANSPORT_OFFER) {
+        size_t answer_len = 0;
+        esp_err_t err = transport_offer(request->offer, request->offer_len,
+                                        s_transport_answer, sizeof(s_transport_answer) - 64,
+                                        &answer_len);
+        if (err == ESP_OK) return encode_text_result(request, s_transport_answer, answer_len);
+        uint64_t code = err == ESP_ERR_INVALID_ARG ? 1 : err == ESP_ERR_INVALID_STATE ? 3 : 6;
+        return encode_error(request, code);
+    }
+    if (request->command == ADMIN_TRANSPORT_CLOSE) {
+        esp_err_t err = transport_close();
+        return err == ESP_OK ? encode_empty_result(request) : encode_error(request, 6);
+    }
+    if (request->command == ADMIN_TRANSPORT_STATUS) return encode_transport_status_response(request);
     return encode_error(request, 7);
 }
 

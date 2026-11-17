@@ -37,7 +37,7 @@ Run the DTLS cases with the ESP32 acting as client and as server:
 | B | SHA-256(DER B) | Channel opens; known payload exchange succeeds |
 | B | SHA-256(DER A) | Certificate verification fails; no channel or application bytes |
 | A renewed | SHA-256(DER A) | Certificate verification fails; DER certificate changed |
-| Absent | SHA-256(DER A) | Certificate verification fails |
+| Absent | SHA-256(DER A) | SDP/identity validation rejects; no channel or application bytes |
 
 For WSS, pin SHA-256(DER SubjectPublicKeyInfo), not the whole certificate.
 Certificate A renewed can pass the same SPKI pin if its SAN, validity,
@@ -56,8 +56,43 @@ is inconclusive. Store no raw SDP credentials or deployed secrets in reports.
 
 ## Current status
 
-Fixture-driven integration cases above are a design, not completed results.
-The original backend's valid baseline passed, but wrong-fingerprint cases also
-passed traffic, so it is rejected. The proposed patch builds and its parser
-checks pass, but its valid board baseline has not passed. Original board app
-was restored and verified after the latest run.
+Synthetic test-only certificates A, B, and renewed A are generated under
+`fixtures/`; their DER and SPKI digests are recorded in `fixtures/manifest.json`.
+The renewed A fixture uses the same key as A but has different DER. Parsing and
+fingerprint extraction with the pinned Rust RTC certificate implementation
+(`rtc` 0.21.1) passed, as did the Windows SDP fingerprint parser tests. These
+are unit checks and do not prove a DTLS handshake.
+
+The patched ESP32 backend's valid same-board probe baseline passed. Mutating
+either side's SDP fingerprint produced explicit `pin_mismatch` failures as DTLS
+client and server, with zero transient channel opens and zero received
+application messages. The unmodified `esp_peer` 1.5.3 backend remains rejected.
+Product firmware passed integrated Windows/ESP32 fixture A and B payload
+baselines, clean reconnect, and active-session invalidation. Exact image,
+patch, timing, and channel evidence is recorded in `docs/evidence.md`.
+The integrated certificate matrix used product image SHA-256
+`412361f2b331f854dd99890504e5921e7a7d13af9fdac55817f43218e135d65c` with the
+same patched backend as the final telemetry image
+`c66667cbae9a408d8cdd527420c543bfa401bb227741cc38f6cfe5068d8d3798`. Product
+signaling roles were Rust offerer and ESP32 answerer; both receiving stacks
+were exercised. The isolated backend matrix covered DTLS client and server.
+
+| Product path | Case | Result |
+| --- | --- | --- |
+| ESP32 receives | A/A and B/B | Each matching fixture baseline exchanged 10 known payloads on both channels in initial and reconnect sessions. |
+| ESP32 receives | B/A | Explicit fingerprint rejection before any DataChannel open or application echo. |
+| ESP32 receives | Renewed A/old A | Explicit rejection despite the same public key; DER certificate changed. |
+| ESP32 receives | Missing, malformed, duplicate identity | Each explicitly rejected before channel setup. |
+| Windows receives | Product ESP certificate/expected fixture A | Explicit verifier mismatch; 0 DataChannels opened, 0 application messages sent. The product certificate matched in valid baselines. No fixture key was installed on hardware. |
+| Windows receives | Missing, malformed, duplicate answer identity | Each rejected by strict client SDP parsing before remote description application. |
+
+The Rust 0.21.1 verifier emits certificate mismatch as a warning while leaving
+peer state `Connecting`. The client captures only warning/error classification,
+not raw backend logs, and reports the explicit identity error before closing.
+The first active session sends a conflicting fingerprint; the fresh reconnect
+session sends malformed SDP. Both close, then reconnect opens cleanly.
+
+The transport and certificate gate passed. The final telemetry image records
+internal/PSRAM heap and `webrtc_peer` worker CPU; total SoC CPU and sustained
+load remain unmeasured. See `docs/evidence.md`. Fixture material stays
+test-only and must never be installed on a device or used for enrollment.

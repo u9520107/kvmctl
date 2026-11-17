@@ -4,6 +4,7 @@ use std::io::{self, BufRead, Write};
 use std::net::Ipv4Addr;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
+use webrtc::peer_connection::RTCCertificate;
 use webrtc::data_channel::DataChannelEvent;
 use webrtc::peer_connection::{
     PeerConnection, PeerConnectionBuilder, PeerConnectionEventHandler, RTCConfigurationBuilder,
@@ -25,6 +26,39 @@ impl PeerConnectionEventHandler for Handler {
 
 fn hex(bytes: &[u8]) -> String {
     bytes.iter().map(|byte| format!("{byte:02x}")).collect()
+}
+
+fn override_fingerprint(sdp: &str, expected: Option<&str>) -> Result<String> {
+    let Some(expected) = expected else {
+        return Ok(sdp.to_owned());
+    };
+    ensure!(
+        expected.len() == 95
+            && expected
+                .bytes()
+                .enumerate()
+                .all(|(index, byte)| if index % 3 == 2 { byte == b':' } else { byte.is_ascii_hexdigit() }),
+        "test fingerprint must be SHA-256 hex"
+    );
+    let mut count = 0;
+    let mut output = String::with_capacity(sdp.len());
+    for line in sdp.split_inclusive('\n') {
+        if line.starts_with("a=fingerprint:sha-256 ") {
+            output.push_str("a=fingerprint:sha-256 ");
+            output.push_str(expected);
+            output.push_str(if line.ends_with("\r\n") { "\r\n" } else { "\n" });
+            count += 1;
+        } else {
+            output.push_str(line);
+        }
+    }
+    ensure!(count == 1, "expected exactly one SHA-256 SDP fingerprint");
+    Ok(output)
+}
+
+fn parse_test_certificate(pem: &str) -> Result<RTCCertificate> {
+    let provider = rtc::crypto::default_provider().context("no RTC crypto provider")?;
+    Ok(RTCCertificate::from_pem(pem, provider.crypto())?)
 }
 
 fn unhex(text: &str) -> Result<Vec<u8>> {
@@ -52,11 +86,20 @@ fn check_candidates(sdp: &str, bind: Ipv4Addr, local: bool) -> Result<()> {
     Ok(())
 }
 
-async fn run(runtime: Arc<dyn Runtime>, bind: Ipv4Addr, count: u32) -> Result<()> {
+async fn run(
+    runtime: Arc<dyn Runtime>,
+    bind: Ipv4Addr,
+    count: u32,
+    certificate: Option<RTCCertificate>,
+) -> Result<()> {
     let start = Instant::now();
     let (gather_tx, mut gather_rx) = channel(1);
+    let mut configuration = RTCConfigurationBuilder::new().with_ice_servers(vec![]);
+    if let Some(certificate) = certificate {
+        configuration = configuration.with_certificates(vec![certificate]);
+    }
     let pc = PeerConnectionBuilder::new()
-        .with_configuration(RTCConfigurationBuilder::new().with_ice_servers(vec![]).build())
+        .with_configuration(configuration.build())
         .with_handler(Arc::new(Handler(gather_tx)))
         .with_runtime(runtime.clone())
         .with_udp_addrs(vec![format!("{bind}:0")])
@@ -67,7 +110,11 @@ async fn run(runtime: Arc<dyn Runtime>, bind: Ipv4Addr, count: u32) -> Result<()
         pc.set_local_description(offer).await?;
         timeout(&*runtime, Duration::from_secs(10), gather_rx.recv()).await
             .map_err(|_| anyhow::anyhow!("ICE gathering timeout"))?;
-        let offer = pc.local_description().await.context("no local SDP")?;
+        let mut offer = pc.local_description().await.context("no local SDP")?;
+        offer.sdp = override_fingerprint(
+            &offer.sdp,
+            std::env::var("KVMCTL_TEST_EXPECTED_FINGERPRINT").ok().as_deref(),
+        )?;
         ensure!(offer.sdp.len() <= 8192, "offer exceeds firmware limit");
         check_candidates(&offer.sdp, bind, true)?;
         println!("M0 RUST OFFER {}", hex(offer.sdp.as_bytes()));
@@ -82,7 +129,11 @@ async fn run(runtime: Arc<dyn Runtime>, bind: Ipv4Addr, count: u32) -> Result<()
             .map_err(|_| anyhow::anyhow!("serial SDP answer timeout"))?
             .context("answer reader closed")??.context("answer input EOF")?;
         let raw = unhex(line.strip_prefix("ANSWER ").context("expected ANSWER hex")?.trim())?;
-        let answer = String::from_utf8(raw)?;
+        let mut answer = String::from_utf8(raw)?;
+        answer = override_fingerprint(
+            &answer,
+            std::env::var("KVMCTL_TEST_REMOTE_FINGERPRINT").ok().as_deref(),
+        )?;
         check_candidates(&answer, bind, false)?;
         pc.set_remote_description(RTCSessionDescription::answer(answer)?).await?;
         let open_start = Instant::now();
@@ -130,10 +181,20 @@ fn main() -> Result<()> {
     ensure!(bind.is_private() || bind.is_loopback(), "bind to private LAN or loopback only");
     let count: u32 = args.get(2).map(String::as_str).unwrap_or("100").parse()?;
     ensure!((1..=100_000).contains(&count), "message count outside 1..100000");
+    let certificate = if let Some(path) = std::env::var_os("KVMCTL_TEST_CERT") {
+        let pem = std::fs::read_to_string(path)?;
+        Some(parse_test_certificate(&pem)?)
+    } else {
+        None
+    };
+    if certificate.is_some() || std::env::var_os("KVMCTL_TEST_EXPECTED_FINGERPRINT").is_some()
+    {
+        eprintln!("M0 RUST TEST_CERT fixture mode enabled");
+    }
     let runtime = default_runtime().context("no runtime")?;
     let rt = runtime.clone();
     let mut result = None;
-    runtime.block_on(Box::pin(async { result = Some(run(rt, bind, count).await); }));
+    runtime.block_on(Box::pin(async { result = Some(run(rt, bind, count, certificate).await); }));
     result.context("runtime did not execute")?
 }
 
@@ -149,5 +210,41 @@ mod tests {
         assert!(check_candidates("a=candidate:1 1 UDP 1 192.168.50.2 12345 typ host\r\n", bind, true).is_ok());
         assert!(check_candidates("a=candidate:1 1 UDP 1 10.14.0.2 12345 typ host\r\n", bind, false).is_err());
         assert!(check_candidates("a=candidate:1 1 UDP 1 192.168.50.2 12345 typ srflx\r\n", bind, false).is_err());
+    }
+
+    #[test]
+    fn test_fingerprint_override_is_strict_and_single() {
+        let fingerprint = "00:11:22:33:44:55:66:77:88:99:AA:BB:CC:DD:EE:FF:00:11:22:33:44:55:66:77:88:99:AA:BB:CC:DD:EE:FF";
+        assert!(override_fingerprint("a=fingerprint:sha-256 old\r\n", Some(fingerprint)).is_ok());
+        assert!(override_fingerprint("a=fingerprint:sha-256 old\r\na=fingerprint:sha-256 old\r\n", Some(fingerprint)).is_err());
+        assert!(override_fingerprint("a=fingerprint:sha-256 old\r\n", Some("invalid")).is_err());
+    }
+
+    #[test]
+    fn synthetic_certificate_fixtures_parse_and_have_distinct_der_fingerprints() {
+        let provider = rtc::crypto::default_provider().unwrap();
+        let a = parse_test_certificate(include_str!(
+            "../../peer-fingerprint/fixtures/certificate_a.rtc.pem"
+        ))
+        .unwrap();
+        let b = parse_test_certificate(include_str!(
+            "../../peer-fingerprint/fixtures/certificate_b.rtc.pem"
+        ))
+        .unwrap();
+        let renewed = parse_test_certificate(include_str!(
+            "../../peer-fingerprint/fixtures/certificate_a_renewed.rtc.pem"
+        ))
+        .unwrap();
+        let fingerprint = |certificate: &RTCCertificate| {
+            certificate
+                .get_fingerprints(provider.crypto())
+                .unwrap()
+                .into_iter()
+                .find(|fingerprint| fingerprint.algorithm == "sha-256")
+                .unwrap()
+                .value
+        };
+        assert_ne!(fingerprint(&a), fingerprint(&b));
+        assert_ne!(fingerprint(&a), fingerprint(&renewed));
     }
 }

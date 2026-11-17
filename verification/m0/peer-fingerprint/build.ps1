@@ -1,8 +1,13 @@
 param(
     [string]$WebrtcSource = (Join-Path $env:TEMP 'esp-peer-v1.3.0'),
+    [string]$ProjectDirectory = $PSScriptRoot,
     [switch]$Harden
 )
 $ErrorActionPreference = 'Stop'
+$project = (Resolve-Path -LiteralPath $ProjectDirectory).Path
+if (-not (Test-Path -LiteralPath (Join-Path $project 'CMakeLists.txt'))) {
+    throw 'ProjectDirectory must contain an ESP-IDF CMakeLists.txt.'
+}
 $trustedSource = (Resolve-Path -LiteralPath $WebrtcSource).Path.Replace('\', '/')
 $revision = git -c "safe.directory=$trustedSource" -C $WebrtcSource rev-parse HEAD
 if ($LASTEXITCODE -ne 0 -or $revision -ne '3971094e2e7c2ab7cb4de59e4eae710e1902d2b4') {
@@ -27,7 +32,11 @@ if ($Harden) {
         $archive = Join-Path $vendor 'upstream.zip'
         git -c "safe.directory=$trustedSource" -C $WebrtcSource archive --format=zip --output=$archive HEAD components/esp_peer
         if ($LASTEXITCODE -ne 0) { throw 'Could not export pinned peer source.' }
-        Expand-Archive -LiteralPath $archive -DestinationPath $vendor -Force
+        Add-Type -AssemblyName System.IO.Compression.FileSystem
+        $extract = Join-Path $vendor 'extract'
+        [IO.Compression.ZipFile]::ExtractToDirectory($archive, $extract)
+        Move-Item -LiteralPath (Join-Path $extract 'components') -Destination $vendor
+        Remove-Item -LiteralPath $extract -Recurse
         # git apply filters paths when invoked below the worktree root.
         $workspace = (Resolve-Path (Join-Path $PSScriptRoot '../../..')).Path
         git -C $workspace apply --unsafe-paths --directory=$vendor $patch
@@ -42,5 +51,19 @@ if ($Harden) {
     $env:KVMCTL_PEER_SOURCE = Join-Path $vendor 'components/esp_peer'
     Write-Output "M0 patched peer: $patchHash"
 }
-idf.py --no-ccache build
-exit $LASTEXITCODE
+$lock = Join-Path $project 'dependencies.lock'
+$workspace = (git -C $project rev-parse --show-toplevel).Trim()
+$relativeLock = $lock.Substring($workspace.Length + 1).Replace('\', '/')
+git -C $workspace ls-files --error-unmatch -- $relativeLock *> $null
+$trackedLock = $LASTEXITCODE -eq 0
+$lockBackup = if ($trackedLock) { [IO.File]::ReadAllBytes($lock) } else { $null }
+$buildResult = 1
+try {
+    if (Test-Path -LiteralPath $lock) { Remove-Item -LiteralPath $lock }
+    Set-Location $project
+    idf.py --no-ccache reconfigure build
+    $buildResult = $LASTEXITCODE
+} finally {
+    if ($trackedLock) { [IO.File]::WriteAllBytes($lock, $lockBackup) }
+}
+exit $buildResult
