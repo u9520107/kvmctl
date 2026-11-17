@@ -2,6 +2,7 @@
 
 #include "esp_event.h"
 #include "esp_netif.h"
+#include "esp_timer.h"
 #include "esp_wifi.h"
 #include "mbedtls/platform_util.h"
 #include "nvs.h"
@@ -13,6 +14,53 @@
 static uint8_t s_state;
 static bool s_initialized;
 static bool s_started;
+static esp_timer_handle_t s_reconnect_timer;
+static uint8_t s_retry_step;
+
+static void schedule_reconnect(void);
+
+static void reconnect_timer_callback(void *arg)
+{
+    (void)arg;
+    esp_err_t err = esp_wifi_connect();
+    if (err == ESP_OK) {
+        s_state = 1;
+    } else {
+        s_state = 3;
+        schedule_reconnect();
+    }
+}
+
+static void schedule_reconnect(void)
+{
+    if (s_reconnect_timer == NULL) {
+        s_state = 3;
+        return;
+    }
+    if (esp_timer_is_active(s_reconnect_timer)) {
+        s_state = 1;
+        return;
+    }
+
+    static const uint64_t delays_us[] = {
+        1000000, 2000000, 4000000, 8000000, 16000000, 30000000,
+    };
+    size_t index = s_retry_step;
+    if (index >= sizeof(delays_us) / sizeof(delays_us[0]) - 1) {
+        index = sizeof(delays_us) / sizeof(delays_us[0]) - 1;
+    } else {
+        ++s_retry_step;
+    }
+    s_state = esp_timer_start_once(s_reconnect_timer, delays_us[index]) == ESP_OK ? 1 : 3;
+}
+
+static void reset_reconnect(void)
+{
+    s_retry_step = 0;
+    if (s_reconnect_timer != NULL && esp_timer_is_active(s_reconnect_timer)) {
+        esp_timer_stop(s_reconnect_timer);
+    }
+}
 
 static bool valid_passphrase(const uint8_t *passphrase, size_t len)
 {
@@ -61,13 +109,21 @@ static void wifi_event_handler(void *arg, esp_event_base_t base, int32_t id, voi
     (void)data;
     if (base == WIFI_EVENT && id == WIFI_EVENT_STA_START) {
         s_state = 1;
-        if (esp_wifi_connect() != ESP_OK) s_state = 3;
+        if (esp_wifi_connect() != ESP_OK) {
+            s_state = 3;
+            schedule_reconnect();
+        }
     } else if (base == WIFI_EVENT && id == WIFI_EVENT_STA_CONNECTED) {
         s_state = 1;
+        if (s_reconnect_timer != NULL && esp_timer_is_active(s_reconnect_timer)) {
+            esp_timer_stop(s_reconnect_timer);
+        }
     } else if (base == WIFI_EVENT && id == WIFI_EVENT_STA_DISCONNECTED) {
         s_state = 3;
+        schedule_reconnect();
     } else if (base == IP_EVENT && id == IP_EVENT_STA_GOT_IP) {
         s_state = 2;
+        reset_reconnect();
     }
 }
 
@@ -82,6 +138,12 @@ static esp_err_t wifi_stack_init(void)
 
     wifi_init_config_t config = WIFI_INIT_CONFIG_DEFAULT();
     err = esp_wifi_init(&config);
+    if (err != ESP_OK) return err;
+    const esp_timer_create_args_t timer_args = {
+        .callback = reconnect_timer_callback,
+        .name = "wifi_reconnect",
+    };
+    err = esp_timer_create(&timer_args, &s_reconnect_timer);
     if (err != ESP_OK) return err;
     err = esp_wifi_set_storage(WIFI_STORAGE_RAM);
     if (err == ESP_OK) err = esp_wifi_set_mode(WIFI_MODE_STA);
@@ -114,7 +176,10 @@ static esp_err_t apply_credentials(const uint8_t *ssid, size_t ssid_len,
     } else {
         err = esp_wifi_connect();
     }
-    if (err != ESP_OK) s_state = 3;
+    if (err != ESP_OK) {
+        s_state = 3;
+        schedule_reconnect();
+    }
     return err;
 }
 

@@ -73,26 +73,38 @@ static esp_err_t apply_preferences(const led_preferences_t *preferences)
     return err == ESP_OK ? led_strip_refresh(s_strip) : err;
 }
 
+static void reset_preferences(void)
+{
+    s_preferences = (led_preferences_t){
+        .enabled = false,
+        .brightness = 25,
+        .rgb = {255, 255, 255},
+    };
+}
+
 esp_err_t led_control_load_preferences(void)
 {
+    reset_preferences();
     if (!s_supported) return ESP_OK;
     nvs_handle_t nvs;
     esp_err_t err = nvs_open(LED_NAMESPACE, NVS_READWRITE, &nvs);
     if (err != ESP_OK) return err;
+    led_preferences_t loaded = s_preferences;
     uint8_t enabled = 0;
     err = nvs_get_u8(nvs, "enabled", &enabled);
-    if (err == ESP_OK && enabled <= 1) s_preferences.enabled = enabled == 1;
+    if (err == ESP_OK && enabled <= 1) loaded.enabled = enabled == 1;
     else if (err == ESP_OK) { nvs_close(nvs); return ESP_ERR_INVALID_STATE; }
     else if (err != ESP_ERR_NVS_NOT_FOUND) { nvs_close(nvs); return err; }
     uint8_t brightness = 0;
     err = nvs_get_u8(nvs, "brightness", &brightness);
-    if (err == ESP_OK && brightness <= 100) s_preferences.brightness = brightness;
+    if (err == ESP_OK && brightness <= 100) loaded.brightness = brightness;
     else if (err != ESP_ERR_NVS_NOT_FOUND) { nvs_close(nvs); return err == ESP_OK ? ESP_ERR_INVALID_STATE : err; }
-    size_t rgb_len = sizeof(s_preferences.rgb);
-    err = nvs_get_blob(nvs, "rgb", s_preferences.rgb, &rgb_len);
-    if (err == ESP_OK && rgb_len != sizeof(s_preferences.rgb)) { nvs_close(nvs); return ESP_ERR_INVALID_SIZE; }
+    size_t rgb_len = sizeof(loaded.rgb);
+    err = nvs_get_blob(nvs, "rgb", loaded.rgb, &rgb_len);
+    if (err == ESP_OK && rgb_len != sizeof(loaded.rgb)) { nvs_close(nvs); return ESP_ERR_INVALID_SIZE; }
     if (err != ESP_OK && err != ESP_ERR_NVS_NOT_FOUND) { nvs_close(nvs); return err; }
     nvs_close(nvs);
+    s_preferences = loaded;
     return apply_preferences(&s_preferences);
 }
 

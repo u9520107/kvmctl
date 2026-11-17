@@ -29,6 +29,8 @@ typedef struct {
 } cbor_reader_t;
 
 typedef struct {
+    uint64_t version_major;
+    uint64_t version_minor;
     uint64_t command;
     uint8_t request_id[16];
     uint8_t ssid[32];
@@ -124,36 +126,49 @@ static bool read_bool(cbor_reader_t *r, bool *out)
     return true;
 }
 
-static bool decode_request(const uint8_t *data, size_t len, admin_request_t *request)
+typedef enum {
+    REQUEST_INVALID,
+    REQUEST_UNSUPPORTED_VERSION,
+    REQUEST_SUPPORTED,
+} request_decode_result_t;
+
+static request_decode_result_t decode_request(const uint8_t *data, size_t len,
+                                              admin_request_t *request)
 {
     cbor_reader_t r = { .data = data, .len = len };
     uint8_t major;
     uint64_t map_len;
     if (!read_head(&r, &major, &map_len) || major != 5 || map_len != 5 ||
-        !read_expected_uint(&r, 0) || !read_expected_uint(&r, ADMIN_VERSION_MAJOR) ||
-        !read_expected_uint(&r, 1) || !read_expected_uint(&r, ADMIN_VERSION_MINOR) ||
+        !read_expected_uint(&r, 0) || !read_uint(&r, &request->version_major) ||
+        !read_expected_uint(&r, 1) || !read_uint(&r, &request->version_minor) ||
         !read_expected_uint(&r, 2) || !read_uint(&r, &request->command) ||
         !read_expected_uint(&r, 3) || !read_bytes(&r, request->request_id, sizeof(request->request_id)) ||
-        !read_expected_uint(&r, 4)) return false;
+        !read_expected_uint(&r, 4)) return REQUEST_INVALID;
+
+    if (request->version_major != ADMIN_VERSION_MAJOR ||
+        request->version_minor != ADMIN_VERSION_MINOR) {
+        return r.pos < r.len ? REQUEST_UNSUPPORTED_VERSION : REQUEST_INVALID;
+    }
 
     if (request->command == ADMIN_STATUS) {
-        return read_map(&r, 0) && r.pos == r.len;
+        return read_map(&r, 0) && r.pos == r.len ? REQUEST_SUPPORTED : REQUEST_INVALID;
     }
     if (request->command == ADMIN_WIFI_SET) {
         return read_map(&r, 2) && read_expected_uint(&r, 0) &&
                read_bounded_string(&r, 3, request->ssid, sizeof(request->ssid), &request->ssid_len) &&
                read_expected_uint(&r, 1) &&
                read_bounded_string(&r, 2, request->passphrase, sizeof(request->passphrase), &request->passphrase_len) &&
-               r.pos == r.len;
+               r.pos == r.len ? REQUEST_SUPPORTED : REQUEST_INVALID;
     }
     if (request->command == ADMIN_LED_SET) {
         uint64_t brightness;
         return read_map(&r, 3) && read_expected_uint(&r, 0) && read_bool(&r, &request->led_enabled) &&
                read_expected_uint(&r, 1) && read_uint(&r, &brightness) && brightness <= 100 &&
                read_expected_uint(&r, 2) && read_bytes(&r, request->led_rgb, sizeof(request->led_rgb)) &&
-               (request->led_brightness = (uint8_t)brightness, true) && r.pos == r.len;
+               (request->led_brightness = (uint8_t)brightness, true) && r.pos == r.len
+            ? REQUEST_SUPPORTED : REQUEST_INVALID;
     }
-    return false;
+    return REQUEST_INVALID;
 }
 
 static bool put_head(uint8_t *out, size_t cap, size_t *pos, uint8_t major, uint64_t value)
@@ -201,8 +216,8 @@ static size_t begin_response(const admin_request_t *request, uint64_t code, bool
 {
     *pos = 0;
     if (!put_head(s_response, sizeof(s_response), pos, 5, result ? 6 : 5) ||
-        !put_uint(s_response, sizeof(s_response), pos, 0) || !put_uint(s_response, sizeof(s_response), pos, 1) ||
-        !put_uint(s_response, sizeof(s_response), pos, 1) || !put_uint(s_response, sizeof(s_response), pos, 0) ||
+        !put_uint(s_response, sizeof(s_response), pos, 0) || !put_uint(s_response, sizeof(s_response), pos, request->version_major) ||
+        !put_uint(s_response, sizeof(s_response), pos, 1) || !put_uint(s_response, sizeof(s_response), pos, request->version_minor) ||
         !put_uint(s_response, sizeof(s_response), pos, 2) || !put_uint(s_response, sizeof(s_response), pos, request->command) ||
         !put_uint(s_response, sizeof(s_response), pos, 3) || !put_bytes(s_response, sizeof(s_response), pos, request->request_id, 16) ||
         !put_uint(s_response, sizeof(s_response), pos, 4) || !put_uint(s_response, sizeof(s_response), pos, code)) return 0;
@@ -303,8 +318,11 @@ static void admin_task(void *arg)
             continue;
         }
         admin_request_t request = {0};
-        if (decode_request(s_request, len, &request)) {
-            size_t response_len = dispatch_request(&request);
+        request_decode_result_t decoded = decode_request(s_request, len, &request);
+        if (decoded != REQUEST_INVALID) {
+            size_t response_len = decoded == REQUEST_UNSUPPORTED_VERSION
+                ? encode_error(&request, 4)
+                : dispatch_request(&request);
             if (response_len != 0) write_frame(s_response, response_len);
         }
         mbedtls_platform_zeroize(request.passphrase, sizeof(request.passphrase));

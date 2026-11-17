@@ -7,12 +7,12 @@ use windows_sys::Win32::Graphics::Gdi::{COLOR_WINDOW, UpdateWindow};
 use windows_sys::Win32::System::LibraryLoader::GetModuleHandleW;
 use windows_sys::Win32::UI::Controls::BST_CHECKED;
 use windows_sys::Win32::UI::WindowsAndMessaging::{
-    BM_GETCHECK, BM_SETCHECK, CB_ADDSTRING, CB_GETCURSEL, CB_GETLBTEXT, CB_GETLBTEXTLEN,
-    CB_RESETCONTENT, CB_SETCURSEL, CBN_SELCHANGE, CS_HREDRAW, CS_VREDRAW, CW_USEDEFAULT,
-    CreateWindowExW, DefWindowProcW, DispatchMessageW, GetMessageW, GetWindowTextLengthW,
-    GetWindowTextW, MSG, PostQuitMessage, RegisterClassW, SendMessageW, SetWindowTextW, ShowWindow,
-    TranslateMessage, WM_COMMAND, WM_DESTROY, WNDCLASSW, WS_BORDER, WS_CHILD, WS_OVERLAPPEDWINDOW,
-    WS_TABSTOP, WS_VISIBLE, WS_VSCROLL,
+    BM_GETCHECK, BM_SETCHECK, CB_ADDSTRING, CB_GETCURSEL, CB_RESETCONTENT, CB_SETCURSEL,
+    CBN_SELCHANGE, CS_HREDRAW, CS_VREDRAW, CW_USEDEFAULT, CreateWindowExW, DefWindowProcW,
+    DispatchMessageW, GetMessageW, GetWindowTextLengthW, GetWindowTextW, MSG, PostQuitMessage,
+    RegisterClassW, SendMessageW, SetWindowTextW, ShowWindow, TranslateMessage, WM_COMMAND,
+    WM_DESTROY, WNDCLASSW, WS_BORDER, WS_CHILD, WS_OVERLAPPEDWINDOW, WS_TABSTOP, WS_VISIBLE,
+    WS_VSCROLL,
 };
 
 const PORTS: u16 = 1;
@@ -26,8 +26,11 @@ const WIFI_SAVE: u16 = 8;
 const LED_SAVE: u16 = 9;
 const REFRESH: u16 = 10;
 const RESCAN: u16 = 11;
+const WIFI_SCAN: u16 = 12;
 const CBN_SELCHANGE_U16: u16 = CBN_SELCHANGE as u16;
+const CBS_DROPDOWN: u32 = 0x0002;
 const CBS_DROPDOWNLIST: u32 = 0x0003;
+const CBS_AUTOHSCROLL: u32 = 0x0040;
 const ES_AUTOHSCROLL: u32 = 0x0080;
 const ES_PASSWORD: u32 = 0x0020;
 const BS_AUTOCHECKBOX: u32 = 0x0003;
@@ -36,13 +39,13 @@ const BS_GROUPBOX: u32 = 0x0007;
 struct UiState {
     window: HWND,
     ports: HWND,
+    port_infos: Vec<serial::PortInfo>,
     summary: HWND,
     ssid: HWND,
     passphrase: HWND,
     brightness: HWND,
     color: HWND,
     led_enabled: HWND,
-    port_names: Vec<String>,
 }
 
 thread_local! {
@@ -103,25 +106,16 @@ fn add_combo_item(combo: HWND, value: &str) {
     unsafe { SendMessageW(combo, CB_ADDSTRING, 0, value.as_ptr() as LPARAM) };
 }
 
-fn selected_port(state: &UiState) -> Result<String, String> {
+fn selected_port(state: &UiState) -> Result<serial::PortInfo, String> {
     let selected = unsafe { SendMessageW(state.ports, CB_GETCURSEL, 0, 0) };
     if selected < 0 {
-        return Err("select a USB-UART port".into());
+        return Err("select a detected kvmctl board".into());
     }
-    let length = unsafe { SendMessageW(state.ports, CB_GETLBTEXTLEN, selected as usize, 0) };
-    if length < 0 || length > 32 {
-        return Err("invalid port selection".into());
-    }
-    let mut buffer = vec![0u16; length as usize + 1];
-    unsafe {
-        SendMessageW(
-            state.ports,
-            CB_GETLBTEXT,
-            selected as usize,
-            buffer.as_mut_ptr() as LPARAM,
-        );
-    }
-    String::from_utf16(&buffer[..length as usize]).map_err(|_| "invalid COM port name".into())
+    state
+        .port_infos
+        .get(selected as usize)
+        .cloned()
+        .ok_or_else(|| "invalid board selection".into())
 }
 
 fn set_led_fields(state: &UiState, status: &Status) {
@@ -147,9 +141,9 @@ fn set_led_fields(state: &UiState, status: &Status) {
     );
 }
 
-fn status_text(port: &str, status: &Status) -> String {
+fn status_text(board: &str, status: &Status) -> String {
     format!(
-        "{port}  |  Firmware: {}\r\nWi-Fi: {}    RGB: {}{} at {}% #{:02X}{:02X}{:02X}\r\nDevice identity: {}\r\nTLS pin: {}",
+        "{board}  |  Firmware: {}\r\nWi-Fi: {}    RGB: {}{} at {}% #{:02X}{:02X}{:02X}\r\nDevice identity: {}\r\nTLS pin: {}",
         status.firmware_version,
         wifi_name(status.wifi_state),
         if status.led_supported {
@@ -169,12 +163,13 @@ fn status_text(port: &str, status: &Status) -> String {
 
 fn refresh(state: &mut UiState) {
     let result: Result<String, String> = (|| {
-        let port_name = selected_port(state)?;
-        set_text(state.summary, &format!("Reading {port_name}…"));
-        let mut port = serial::Port::open(&port_name)?;
+        let board = selected_port(state)?;
+        set_text(state.summary, &format!("Reading {}…", board.label));
+        let mut port = serial::Port::open(&board.name)?;
         let status = port.status()?;
+        serial::remember_board(&board, &status.identity_fingerprint);
         set_led_fields(state, &status);
-        Ok(status_text(&port_name, &status))
+        Ok(status_text(&board.label, &status))
     })();
     match result {
         Ok(value) => set_text(state.summary, &value),
@@ -184,7 +179,7 @@ fn refresh(state: &mut UiState) {
 
 fn save_wifi(state: &mut UiState) {
     let result: Result<String, String> = (|| {
-        let port_name = selected_port(state)?;
+        let board = selected_port(state)?;
         let ssid = text(state.ssid);
         let mut passphrase = Secret::new(text(state.passphrase).into_bytes());
         set_text(state.passphrase, "");
@@ -197,13 +192,14 @@ fn save_wifi(state: &mut UiState) {
         passphrase.0.fill(0);
         set_text(state.summary, "Sending Wi-Fi settings over USB…");
         unsafe { UpdateWindow(state.window) };
-        let mut port = serial::Port::open(&port_name)?;
+        let mut port = serial::Port::open(&board.name)?;
         port.mutate(payload.as_slice(), &id, WIFI_SET_COMMAND)?;
         let status = port.status()?;
+        serial::remember_board(&board, &status.identity_fingerprint);
         set_led_fields(state, &status);
         Ok(format!(
             "Wi-Fi settings stored.\r\n{}",
-            status_text(&port_name, &status)
+            status_text(&board.label, &status)
         ))
     })();
     match result {
@@ -214,7 +210,7 @@ fn save_wifi(state: &mut UiState) {
 
 fn save_led(state: &mut UiState) {
     let result: Result<String, String> = (|| {
-        let port_name = selected_port(state)?;
+        let board = selected_port(state)?;
         let enabled =
             unsafe { SendMessageW(state.led_enabled, BM_GETCHECK, 0, 0) } == BST_CHECKED as isize;
         let brightness = text(state.brightness)
@@ -225,11 +221,12 @@ fn save_led(state: &mut UiState) {
         let payload = encode_led_request(&id, enabled, brightness, rgb)?;
         set_text(state.summary, "Saving RGB preferences over USB…");
         unsafe { UpdateWindow(state.window) };
-        let mut port = serial::Port::open(&port_name)?;
+        let mut port = serial::Port::open(&board.name)?;
         port.mutate(&payload, &id, LED_SET_COMMAND)?;
         let status = port.status()?;
+        serial::remember_board(&board, &status.identity_fingerprint);
         set_led_fields(state, &status);
-        Ok(status_text(&port_name, &status))
+        Ok(status_text(&board.label, &status))
     })();
     match result {
         Ok(value) => set_text(state.summary, &value),
@@ -237,26 +234,70 @@ fn save_led(state: &mut UiState) {
     }
 }
 
+fn update_port_list(state: &mut UiState, ports: Vec<serial::PortInfo>) {
+    let previous = selected_port(state).ok().and_then(|port| port.instance_id);
+    unsafe { SendMessageW(state.ports, CB_RESETCONTENT, 0, 0) };
+    state.port_infos = ports;
+    for port in &state.port_infos {
+        add_combo_item(state.ports, &port.label);
+    }
+    let selected = previous
+        .and_then(|instance_id| {
+            state
+                .port_infos
+                .iter()
+                .position(|port| port.instance_id.as_deref() == Some(instance_id.as_str()))
+        })
+        .or_else(|| (state.port_infos.len() == 1).then_some(0));
+    if let Some(index) = selected {
+        unsafe { SendMessageW(state.ports, CB_SETCURSEL, index, 0) };
+    }
+    match state.port_infos.as_slice() {
+        [] => set_text(
+            state.summary,
+            "No supported kvmctl USB-UART board found. Connect board and rescan.",
+        ),
+        [port] => set_text(
+            state.summary,
+            &format!(
+                "Detected {}. Refresh status to identify the board.",
+                port.label
+            ),
+        ),
+        _ => set_text(
+            state.summary,
+            "Multiple compatible boards found. Choose a device by name and USB location.",
+        ),
+    }
+}
+
+fn refresh_wifi_list(state: &mut UiState) {
+    let current = text(state.ssid);
+    match wifi_networks::visible_ssids() {
+        Ok(ssids) => {
+            unsafe { SendMessageW(state.ssid, CB_RESETCONTENT, 0, 0) };
+            for ssid in &ssids {
+                add_combo_item(state.ssid, ssid);
+            }
+            set_text(state.ssid, &current);
+            set_text(
+                state.summary,
+                &format!(
+                    "Loaded {} visible SSID(s). You can also type a hidden SSID.",
+                    ssids.len()
+                ),
+            );
+        }
+        Err(error) => set_text(
+            state.summary,
+            &format!("Wi-Fi list unavailable; type SSID manually ({error})."),
+        ),
+    }
+}
+
 fn rescan(state: &mut UiState) {
     match serial::enumerate() {
-        Ok(names) => {
-            state.port_names = names;
-            unsafe {
-                SendMessageW(state.ports, CB_RESETCONTENT, 0, 0);
-            }
-            for name in &state.port_names {
-                add_combo_item(state.ports, name);
-            }
-            if !state.port_names.is_empty() {
-                unsafe { SendMessageW(state.ports, CB_SETCURSEL, 0, 0) };
-                refresh(state);
-            } else {
-                set_text(
-                    state.summary,
-                    "No serial ports found. Connect the board and rescan.",
-                );
-            }
-        }
+        Ok(ports) => update_port_list(state, ports),
         Err(error) => set_text(state.summary, &format!("Port scan failed: {error}")),
     }
 }
@@ -274,8 +315,10 @@ unsafe extern "system" fn window_proc(
     if message == WM_COMMAND {
         let id = (wparam & 0xffff) as u16;
         let notification = ((wparam >> 16) & 0xffff) as u16;
-        if !matches!(id, PORTS | WIFI_SAVE | LED_SAVE | REFRESH | RESCAN)
-            || (id == PORTS && notification != CBN_SELCHANGE_U16)
+        if !matches!(
+            id,
+            PORTS | WIFI_SAVE | LED_SAVE | REFRESH | RESCAN | WIFI_SCAN
+        ) || (id == PORTS && notification != CBN_SELCHANGE_U16)
         {
             return unsafe { DefWindowProcW(window, message, wparam, lparam) };
         }
@@ -286,6 +329,7 @@ unsafe extern "system" fn window_proc(
             };
             match (id, notification) {
                 (WIFI_SAVE, 0) => save_wifi(state),
+                (WIFI_SCAN, 0) => refresh_wifi_list(state),
                 (LED_SAVE, 0) => save_led(state),
                 (REFRESH, 0) | (PORTS, CBN_SELCHANGE_U16) => refresh(state),
                 (RESCAN, 0) => rescan(state),
@@ -313,11 +357,13 @@ fn create_controls(instance: HINSTANCE, window: HWND) -> UiState {
         PORTS,
         68,
         14,
-        150,
+        250,
         180,
     );
+    const CB_SETDROPPEDWIDTH: u32 = 0x0160;
+    unsafe { SendMessageW(ports, CB_SETDROPPEDWIDTH, 480, 0) };
     control(
-        instance, window, "BUTTON", "Rescan", basic, RESCAN, 228, 14, 80, 26,
+        instance, window, "BUTTON", "Rescan", basic, RESCAN, 330, 14, 80, 26,
     );
     control(
         instance,
@@ -326,7 +372,7 @@ fn create_controls(instance: HINSTANCE, window: HWND) -> UiState {
         "Refresh status",
         basic,
         REFRESH,
-        318,
+        420,
         14,
         110,
         26,
@@ -335,12 +381,12 @@ fn create_controls(instance: HINSTANCE, window: HWND) -> UiState {
         instance,
         window,
         "STATIC",
-        "Choose a board and refresh status.",
+        "Looking for compatible kvmctl boardsâ€¦",
         WS_BORDER,
         SUMMARY,
         18,
         50,
-        560,
+        580,
         112,
     );
 
@@ -360,25 +406,38 @@ fn create_controls(instance: HINSTANCE, window: HWND) -> UiState {
         instance,
         window,
         "STATIC",
-        "Network name",
+        "SSID (hidden OK)",
         0,
         0,
         20,
         190,
-        94,
+        104,
         22,
     );
     let ssid = control(
         instance,
         window,
-        "EDIT",
+        "COMBOBOX",
         "",
-        WS_BORDER | ES_AUTOHSCROLL | basic,
+        CBS_DROPDOWN | CBS_AUTOHSCROLL | WS_VSCROLL | basic,
         SSID,
-        124,
+        134,
         186,
-        300,
-        25,
+        290,
+        150,
+    );
+    unsafe { SendMessageW(ssid, CB_SETDROPPEDWIDTH, 320, 0) };
+    control(
+        instance,
+        window,
+        "BUTTON",
+        "Refresh list",
+        basic,
+        WIFI_SCAN,
+        438,
+        184,
+        130,
+        26,
     );
     control(
         instance,
@@ -412,7 +471,7 @@ fn create_controls(instance: HINSTANCE, window: HWND) -> UiState {
         basic,
         WIFI_SAVE,
         438,
-        203,
+        220,
         130,
         30,
     );
@@ -493,24 +552,27 @@ fn create_controls(instance: HINSTANCE, window: HWND) -> UiState {
         instance, window, "BUTTON", "Save RGB", basic, LED_SAVE, 497, 316, 70, 29,
     );
 
-    let port_names = serial::enumerate().unwrap_or_default();
-    for name in &port_names {
-        add_combo_item(ports, name);
-    }
-    if !port_names.is_empty() {
-        unsafe { SendMessageW(ports, CB_SETCURSEL, 0, 0) };
-    }
-    UiState {
+    let mut state = UiState {
         window,
         ports,
+        port_infos: Vec::new(),
         summary,
         ssid,
         passphrase,
         brightness,
         color,
         led_enabled,
-        port_names,
+    };
+    match serial::enumerate() {
+        Ok(ports) => update_port_list(&mut state, ports),
+        Err(error) => set_text(state.summary, &format!("Board scan failed: {error}")),
     }
+    if let Ok(ssids) = wifi_networks::visible_ssids() {
+        for ssid in ssids {
+            add_combo_item(state.ssid, &ssid);
+        }
+    }
+    state
 }
 
 pub fn run() -> Result<(), String> {
@@ -560,11 +622,6 @@ pub fn run() -> Result<(), String> {
         ShowWindow(window, 5);
         UpdateWindow(window);
     }
-    STATE.with(|cell| {
-        if let Some(state) = cell.borrow_mut().as_mut() {
-            refresh(state);
-        }
-    });
     let mut message: MSG = unsafe { std::mem::zeroed() };
     loop {
         let result = unsafe { GetMessageW(&mut message, std::ptr::null_mut(), 0, 0) };

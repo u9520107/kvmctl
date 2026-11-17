@@ -108,6 +108,10 @@ The primary desktop client is native Rust on Windows, with resident tray and sta
 
 These are agreed product requirements, not claims about the current USB setup client. Registration/enrollment, selected target, connection, lease ownership, and input destination are distinct state. A saved board can be offline; a connected owner can keep input local.
 
+**USB setup and board identification (M1.1):** The Windows client identifies supported boards from USB Plug and Play metadata and the board's USB-UART interface before opening the administration port. Users should not have to guess from anonymous COM numbers, and the client must not send kvmctl frames to arbitrary serial ports to discover a board. Show a friendly board/device label; COM number is diagnostic detail, not board identity. If multiple candidates or incomplete identifiers make the board ambiguous, show available device and USB-location details and ask the user to choose before communicating. After a valid status response, associate the endpoint identity fingerprint with that PnP device for later identification.
+
+**Wi-Fi setup (M1.1):** Provide an editable SSID dropdown populated with networks visible to the host. Keep the field editable so users can type hidden or otherwise unlisted SSIDs; network scanning is a convenience and must not restrict manual entry. Keep the passphrase masked and local, and never log or return it.
+
 **Resident tray mode** stays running without requiring a main window. Selecting a target connects with input local; entering remote mode is explicit. Returning local releases held remote input but retains the connection and control lease, including heartbeats, for frequent local/remote switching. Inactive targets have no warm sessions.
 
 The tray must distinguish at least these primary states with different icon shapes, not color alone:
@@ -312,6 +316,8 @@ Scripted transport mode uses the same USB-enrolled identity, pinned WSS, signed 
 Resolve and verify these items alongside the owning implementation slice. Existing contracts guide implementation; unresolved measurements do not delay unrelated modules:
 
 - M1.1: validate detected memory and supported UART/native-USB capabilities during bring-up. Investigate schematic differences only when an observed compatibility issue requires it; no batch or third-board gate.
+- M1.1: resolve Windows Plug and Play identification for supported USB-UART boards, including multiple or ambiguous candidates, without probing arbitrary serial ports. Verify automatic identification when unique and a clear user choice when ambiguous.
+- M1.1: populate the editable SSID dropdown from host-visible networks and verify manual entry remains available for hidden SSIDs.
 - M1.2: integrate the selected ESP-IDF backend with the pinned Windows `webrtc-rs` client. Resolve the known unmodified backend failure through a verified patch or replacement while building product transport modules.
 - M1.2/M1.3: add certificate fixture unit/integration tests to the actual DTLS and WSS implementations. Matching fixtures must establish a valid baseline; mismatched DTLS certificate identity in either role must fail before DataChannel open, with zero application bytes/HID reports. Wrong WSS SPKI, SAN, validity, or handshake signature must fail before HTTP Upgrade/signaling ([RFC 6455 §4.1](https://www.rfc-editor.org/rfc/rfc6455#section-4.1)). Follow [RFC 8122 §5](https://www.rfc-editor.org/rfc/rfc8122#section-5) and [RFC 8827 §9.1](https://www.rfc-editor.org/rfc/rfc8827#section-9.1); test the exact deployed ESP32 binary, not just a desktop parser. These gate the dependent session capability, not the start of product implementation.
 - M1.1–M1.4: implement shared Rust/C vectors and rejection cases with each USB, WSS, DataChannel, and lease codec before its messages affect state. The envelope, type IDs, fields, and heartbeat example above are the starting contract.

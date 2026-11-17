@@ -7,6 +7,7 @@ publish = false
 [dependencies]
 windows-sys = { version = "=0.61.2", features = [
     "Win32_Devices_Communication",
+    "Win32_Devices_DeviceAndDriverInstallation",
     "Win32_Foundation",
     "Win32_Security_Cryptography",
     "Win32_Storage_FileSystem",
@@ -14,6 +15,7 @@ windows-sys = { version = "=0.61.2", features = [
     "Win32_System_Console",
     "Win32_System_IO",
     "Win32_System_LibraryLoader",
+    "Win32_NetworkManagement_WiFi",
     "Win32_Graphics_Gdi",
     "Win32_UI_Controls",
     "Win32_UI_WindowsAndMessaging",

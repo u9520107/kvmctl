@@ -440,11 +440,20 @@ fn random_id() -> Result<[u8; 16], String> {
 #[cfg(windows)]
 mod serial {
     use super::*;
+    use std::collections::BTreeMap;
     use std::ffi::OsStr;
+    use std::fs;
     use std::os::windows::ffi::OsStrExt;
+    use std::path::PathBuf;
     use windows_sys::Win32::Devices::Communication::{
         COMMTIMEOUTS, DCB, GetCommState, NOPARITY, ONESTOPBIT, PURGE_RXCLEAR, PURGE_TXCLEAR,
         PurgeComm, SetCommState, SetCommTimeouts,
+    };
+    use windows_sys::Win32::Devices::DeviceAndDriverInstallation::{
+        DIGCF_ALLCLASSES, DIGCF_PRESENT, HDEVINFO, SP_DEVINFO_DATA, SPDRP_FRIENDLYNAME,
+        SPDRP_HARDWAREID, SPDRP_LOCATION_INFORMATION, SetupDiDestroyDeviceInfoList,
+        SetupDiEnumDeviceInfo, SetupDiGetClassDevsW, SetupDiGetDeviceInstanceIdW,
+        SetupDiGetDeviceRegistryPropertyW,
     };
     use windows_sys::Win32::Foundation::{
         GENERIC_READ, GENERIC_WRITE, GetLastError, HANDLE, INVALID_HANDLE_VALUE,
@@ -452,9 +461,16 @@ mod serial {
     use windows_sys::Win32::Storage::FileSystem::{
         CreateFileW, FILE_ATTRIBUTE_NORMAL, OPEN_EXISTING, ReadFile, WriteFile,
     };
-    use windows_sys::Win32::System::Registry::{
-        HKEY, HKEY_LOCAL_MACHINE, KEY_READ, REG_SZ, RegCloseKey, RegEnumValueW, RegOpenKeyExW,
-    };
+    use windows_sys::Win32::System::Registry::{REG_MULTI_SZ, REG_SZ};
+
+    const SUPPORTED_UART_ID: &str = "VID_1A86&PID_55D3";
+
+    #[derive(Clone)]
+    pub struct PortInfo {
+        pub name: String,
+        pub label: String,
+        pub instance_id: Option<String>,
+    }
 
     pub struct Port(HANDLE);
 
@@ -470,70 +486,176 @@ mod serial {
         format!("{context} (Windows error {})", unsafe { GetLastError() })
     }
 
-    pub fn enumerate() -> Result<Vec<String>, String> {
-        let path: Vec<u16> = OsStr::new("HARDWARE\\DEVICEMAP\\SERIALCOMM")
-            .encode_wide()
-            .chain(Some(0))
-            .collect();
-        let mut key: HKEY = std::ptr::null_mut();
-        let result =
-            unsafe { RegOpenKeyExW(HKEY_LOCAL_MACHINE, path.as_ptr(), 0, KEY_READ, &mut key) };
-        if result != 0 {
+    fn device_property(
+        devices: HDEVINFO,
+        info: &SP_DEVINFO_DATA,
+        property: u32,
+    ) -> Option<(u32, Vec<u16>)> {
+        let mut data = vec![0u16; 1024];
+        let mut value_type = 0u32;
+        let mut required = 0u32;
+        let ok = unsafe {
+            SetupDiGetDeviceRegistryPropertyW(
+                devices,
+                info,
+                property,
+                &mut value_type,
+                data.as_mut_ptr().cast(),
+                (data.len() * std::mem::size_of::<u16>()) as u32,
+                &mut required,
+            )
+        };
+        if ok == 0 || required % 2 != 0 || required as usize > data.len() * 2 {
+            return None;
+        }
+        data.truncate((required / 2) as usize);
+        Some((value_type, data))
+    }
+
+    fn property_text(devices: HDEVINFO, info: &SP_DEVINFO_DATA, property: u32) -> Option<String> {
+        let (value_type, data) = device_property(devices, info, property)?;
+        (value_type == REG_SZ).then(|| {
+            String::from_utf16_lossy(&data)
+                .trim_end_matches('\0')
+                .to_owned()
+        })
+    }
+
+    fn port_name(friendly_name: &str) -> Option<String> {
+        let start = friendly_name.rfind("(COM")? + 1;
+        let end = friendly_name[start..].find(')')? + start;
+        let name = &friendly_name[start..end];
+        (name.len() > 3 && name.starts_with("COM") && name[3..].bytes().all(|b| b.is_ascii_digit()))
+            .then(|| name.to_owned())
+    }
+
+    fn instance_id(devices: HDEVINFO, info: &SP_DEVINFO_DATA) -> Option<String> {
+        let mut data = [0u16; 512];
+        let mut required = 0u32;
+        let ok = unsafe {
+            SetupDiGetDeviceInstanceIdW(
+                devices,
+                info,
+                data.as_mut_ptr(),
+                data.len() as u32,
+                &mut required,
+            )
+        };
+        if ok == 0 || required == 0 || required as usize > data.len() {
+            return None;
+        }
+        let length = data
+            .iter()
+            .position(|&unit| unit == 0)
+            .unwrap_or(required as usize);
+        Some(String::from_utf16_lossy(&data[..length]))
+    }
+
+    fn board_map_path() -> Option<PathBuf> {
+        std::env::var_os("LOCALAPPDATA")
+            .map(PathBuf::from)
+            .map(|root| root.join("kvmctl").join("boards.tsv"))
+    }
+
+    fn load_board_identities() -> BTreeMap<String, String> {
+        let Some(path) = board_map_path() else {
+            return BTreeMap::new();
+        };
+        let Ok(contents) = fs::read_to_string(path) else {
+            return BTreeMap::new();
+        };
+        contents
+            .lines()
+            .filter_map(|line| {
+                let (instance_id, fingerprint) = line.split_once('\t')?;
+                (fingerprint.len() == 64
+                    && fingerprint.bytes().all(|byte| byte.is_ascii_hexdigit()))
+                .then(|| (instance_id.to_owned(), fingerprint.to_owned()))
+            })
+            .collect()
+    }
+
+    pub fn remember_board(info: &PortInfo, fingerprint: &[u8; 32]) {
+        let (Some(path), Some(instance_id)) = (board_map_path(), info.instance_id.as_ref()) else {
+            return;
+        };
+        if instance_id.chars().any(char::is_control) {
+            return;
+        }
+        let mut identities = load_board_identities();
+        identities.insert(instance_id.clone(), super::hex(fingerprint));
+        let contents = identities
+            .iter()
+            .map(|(id, fingerprint)| format!("{id}\t{fingerprint}\n"))
+            .collect::<String>();
+        if let Some(parent) = path.parent() {
+            let _ = fs::create_dir_all(parent);
+        }
+        let _ = fs::write(path, contents);
+    }
+
+    pub fn enumerate() -> Result<Vec<PortInfo>, String> {
+        let devices = unsafe {
+            SetupDiGetClassDevsW(
+                std::ptr::null(),
+                std::ptr::null(),
+                std::ptr::null_mut(),
+                DIGCF_ALLCLASSES | DIGCF_PRESENT,
+            )
+        };
+        if devices == -1 {
             return Err(format!(
-                "cannot enumerate Windows serial ports (registry error {result})"
+                "cannot enumerate Windows devices (error {})",
+                unsafe { GetLastError() }
             ));
         }
+
+        let known_identities = load_board_identities();
         let mut ports = Vec::new();
-        for index in 0..256u32 {
-            let mut name = [0u16; 128];
-            let mut name_len = name.len() as u32;
-            let mut data = [0u16; 128];
-            let mut data_len = (data.len() * std::mem::size_of::<u16>()) as u32;
-            let mut value_type = 0u32;
-            let result = unsafe {
-                RegEnumValueW(
-                    key,
-                    index,
-                    name.as_mut_ptr(),
-                    &mut name_len,
-                    std::ptr::null(),
-                    &mut value_type,
-                    data.as_mut_ptr().cast(),
-                    &mut data_len,
-                )
-            };
-            if result == 259 {
+        for index in 0u32.. {
+            let mut info: SP_DEVINFO_DATA = unsafe { std::mem::zeroed() };
+            info.cbSize = std::mem::size_of::<SP_DEVINFO_DATA>() as u32;
+            if unsafe { SetupDiEnumDeviceInfo(devices, index, &mut info) } == 0 {
                 break;
             }
-            if result != 0 {
-                unsafe {
-                    RegCloseKey(key);
-                }
-                return Err(format!(
-                    "serial port enumeration failed (registry error {result})"
-                ));
-            }
-            if value_type != REG_SZ
-                || data_len < 2
-                || data_len as usize > data.len() * std::mem::size_of::<u16>()
-                || data_len % 2 != 0
+            let Some((REG_MULTI_SZ, hardware_ids)) =
+                device_property(devices, &info, SPDRP_HARDWAREID)
+            else {
+                continue;
+            };
+            if !String::from_utf16_lossy(&hardware_ids)
+                .to_ascii_uppercase()
+                .contains(SUPPORTED_UART_ID)
             {
                 continue;
             }
-            let units = &data[..(data_len / 2) as usize];
-            let value = String::from_utf16(units.strip_suffix(&[0]).unwrap_or(units))
-                .map_err(|_| "invalid COM port name")?;
-            if value.starts_with("COM")
-                && value[3..].bytes().all(|b| b.is_ascii_digit())
-                && value.len() > 3
-            {
-                ports.push(value);
-            }
+            let Some(friendly_name) = property_text(devices, &info, SPDRP_FRIENDLYNAME) else {
+                continue;
+            };
+            let Some(name) = port_name(&friendly_name) else {
+                continue;
+            };
+            let instance_id = instance_id(devices, &info);
+            let known_identity = instance_id
+                .as_ref()
+                .and_then(|id| known_identities.get(id))
+                .filter(|fingerprint| fingerprint.len() >= 8);
+            let location = property_text(devices, &info, SPDRP_LOCATION_INFORMATION)
+                .filter(|value| !value.is_empty());
+            let board_name = known_identity
+                .map(|fingerprint| format!("kvmctl {} — {friendly_name}", &fingerprint[..8]))
+                .unwrap_or(friendly_name);
+            let label = location
+                .map(|location| format!("{board_name} — {location}"))
+                .unwrap_or(board_name);
+            ports.push(PortInfo {
+                name,
+                label,
+                instance_id,
+            });
         }
-        unsafe {
-            RegCloseKey(key);
-        }
-        ports.sort_by_key(|name| name[3..].parse::<u32>().unwrap_or(u32::MAX));
+        unsafe { SetupDiDestroyDeviceInfoList(devices) };
+        ports.sort_by_key(|port| port.name[3..].parse::<u32>().unwrap_or(u32::MAX));
         Ok(ports)
     }
 
@@ -675,6 +797,103 @@ mod serial {
 mod ui;
 
 #[cfg(windows)]
+mod wifi_networks {
+    use std::collections::BTreeSet;
+    use std::ffi::c_void;
+    use std::ptr;
+    use std::slice;
+    use windows_sys::Win32::Foundation::HANDLE;
+    use windows_sys::Win32::NetworkManagement::WiFi::{
+        WLAN_AVAILABLE_NETWORK_LIST, WLAN_INTERFACE_INFO_LIST, WlanCloseHandle, WlanEnumInterfaces,
+        WlanFreeMemory, WlanGetAvailableNetworkList, WlanOpenHandle,
+    };
+
+    struct Client(HANDLE);
+
+    impl Drop for Client {
+        fn drop(&mut self) {
+            unsafe { WlanCloseHandle(self.0, ptr::null()) };
+        }
+    }
+
+    struct WlanMemory(*mut c_void);
+
+    impl Drop for WlanMemory {
+        fn drop(&mut self) {
+            unsafe { WlanFreeMemory(self.0) };
+        }
+    }
+
+    pub fn visible_ssids() -> Result<Vec<String>, String> {
+        let mut negotiated_version = 0;
+        let mut handle = ptr::null_mut();
+        let result =
+            unsafe { WlanOpenHandle(2, ptr::null(), &mut negotiated_version, &mut handle) };
+        if result != 0 {
+            return Err(format!("cannot open Windows Wi-Fi API (error {result})"));
+        }
+        let client = Client(handle);
+
+        let mut raw_interfaces: *mut WLAN_INTERFACE_INFO_LIST = ptr::null_mut();
+        let result = unsafe { WlanEnumInterfaces(client.0, ptr::null(), &mut raw_interfaces) };
+        if result != 0 {
+            return Err(format!(
+                "cannot enumerate Wi-Fi interfaces (error {result})"
+            ));
+        }
+        if raw_interfaces.is_null() {
+            return Ok(Vec::new());
+        }
+        let _interface_memory = WlanMemory(raw_interfaces.cast());
+        let interface_list = unsafe { &*raw_interfaces };
+        let interfaces = unsafe {
+            slice::from_raw_parts(
+                interface_list.InterfaceInfo.as_ptr(),
+                interface_list.dwNumberOfItems as usize,
+            )
+        };
+
+        let mut ssids = BTreeSet::new();
+        for interface in interfaces {
+            let mut raw_networks: *mut WLAN_AVAILABLE_NETWORK_LIST = ptr::null_mut();
+            let result = unsafe {
+                WlanGetAvailableNetworkList(
+                    client.0,
+                    &interface.InterfaceGuid,
+                    0,
+                    ptr::null(),
+                    &mut raw_networks,
+                )
+            };
+            if result != 0 || raw_networks.is_null() {
+                continue;
+            }
+            let _network_memory = WlanMemory(raw_networks.cast());
+            let network_list = unsafe { &*raw_networks };
+            let networks = unsafe {
+                slice::from_raw_parts(
+                    network_list.Network.as_ptr(),
+                    network_list.dwNumberOfItems as usize,
+                )
+            };
+            for network in networks {
+                let ssid = &network.dot11Ssid;
+                let length = ssid.uSSIDLength as usize;
+                if length == 0 || length > ssid.ucSSID.len() {
+                    continue;
+                }
+                if let Ok(value) = String::from_utf8(ssid.ucSSID[..length].to_vec()) {
+                    if !value.chars().any(char::is_control) {
+                        ssids.insert(value);
+                    }
+                }
+            }
+        }
+        Ok(ssids.into_iter().collect())
+    }
+}
+
+#[cfg(windows)]
 fn read_hidden_line(prompt: &str) -> Result<String, String> {
     use std::io::{BufRead, stdin};
     use windows_sys::Win32::System::Console::{
@@ -707,7 +926,10 @@ fn read_hidden_line(prompt: &str) -> Result<String, String> {
 }
 
 #[cfg(windows)]
-fn select_port(ports: &[String], requested: Option<&str>) -> Result<String, String> {
+fn select_port(
+    ports: &[serial::PortInfo],
+    requested: Option<&str>,
+) -> Result<serial::PortInfo, String> {
     if let Some(port) = requested {
         if !port.starts_with("COM")
             || !port[3..].bytes().all(|b| b.is_ascii_digit())
@@ -715,15 +937,22 @@ fn select_port(ports: &[String], requested: Option<&str>) -> Result<String, Stri
         {
             return Err("invalid COM port".into());
         }
-        return Ok(port.to_owned());
+        return ports
+            .iter()
+            .find(|candidate| candidate.name.eq_ignore_ascii_case(port))
+            .cloned()
+            .ok_or_else(|| "port is not a detected compatible kvmctl board".into());
     }
     if ports.is_empty() {
-        return Err("no serial ports found".into());
+        return Err("no compatible kvmctl boards found".into());
+    }
+    if ports.len() == 1 {
+        return Ok(ports[0].clone());
     }
     for (index, port) in ports.iter().enumerate() {
-        println!("{}: {port}", index + 1);
+        println!("{}: {}", index + 1, port.label);
     }
-    print!("Select the board's USB-UART port: ");
+    print!("Select the board: ");
     io::stdout().flush().map_err(|e| e.to_string())?;
     let mut line = String::new();
     io::stdin()
@@ -755,7 +984,7 @@ fn run() -> Result<(), String> {
     let ports = serial::enumerate()?;
     if command == "ports" {
         for port in ports {
-            println!("{port}");
+            println!("{}", port.label);
         }
         return Ok(());
     }
@@ -777,11 +1006,13 @@ fn run() -> Result<(), String> {
         return Err("usage: kvmctl [status [COMx] | wifi [COMx] | led [COMx] on|off <brightness> <RRGGBB> | ports]".into());
     }
     let selected = select_port(&ports, requested_port)?;
-    let mut port = serial::Port::open(&selected)?;
+    let mut port = serial::Port::open(&selected.name)?;
     match command {
         "status" => {
             let status = port.status()?;
-            println!("Port: {selected}");
+            serial::remember_board(&selected, &status.identity_fingerprint);
+            println!("Board: {}", selected.label);
+            println!("Port: {}", selected.name);
             println!("Firmware: {}", status.firmware_version);
             println!(
                 "Wi-Fi: {}",
@@ -821,9 +1052,11 @@ fn run() -> Result<(), String> {
             )?);
             passphrase.0.fill(0);
             port.mutate(payload.as_slice(), &id, WIFI_SET_COMMAND)?;
+            let status = port.status()?;
+            serial::remember_board(&selected, &status.identity_fingerprint);
             println!(
                 "Wi-Fi settings stored; status: {}",
-                wifi_name(port.status()?.wifi_state)
+                wifi_name(status.wifi_state)
             );
             Ok(())
         }

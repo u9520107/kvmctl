@@ -67,8 +67,7 @@ void app_main(void)
     }
     err = led_control_load_preferences();
     if (err != ESP_OK) {
-        ESP_LOGE(TAG, "Could not load RGB preferences: %s", esp_err_to_name(err));
-        abort();
+        ESP_LOGW(TAG, "RGB preferences unavailable; continuing administration: %s", esp_err_to_name(err));
     }
     usb_admin_silence_logs();
     wifi_setup_init();
