@@ -5,6 +5,5 @@ dependencies:
     override_path: "${KVMCTL_PEER_SOURCE}"
   espressif/esp_libsrtp:
     version: "==1.0.0"
-    override_path: "${KVMCTL_WEBRTC_SOURCE}/components/esp_peer/examples/peer_demo/managed_components/espressif__esp_libsrtp"
   espressif/led_strip:
     version: "3.0.3"

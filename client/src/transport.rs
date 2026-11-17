@@ -287,8 +287,11 @@ async fn exchange(
                 match command_rx.recv_timeout(Duration::from_millis(200)) {
                     Ok(command) => break command,
                     Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
-                        let status = port.transport_status().unwrap_or_default();
-                        worker_device_status.store(status.state, Ordering::Release);
+                        let state = port
+                            .transport_status()
+                            .map(|status| status.state)
+                            .unwrap_or(254);
+                        worker_device_status.store(state, Ordering::Release);
                     }
                     Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => break false,
                 }

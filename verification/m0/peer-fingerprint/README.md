@@ -7,8 +7,8 @@ provides the local interface; its fresh random password is never printed.
 No client needs to join it.
 
 Prerequisites: installed ESP-IDF 6.1.1 and the `esp-webrtc-solution` checkout at
-tag `v1.3.0` (its `esp_peer` component declares version `1.5.3`). The existing
-upstream demo's cached `esp_libsrtp` 1.0.0 is reused to avoid registry access.
+tag `v1.3.0` (its `esp_peer` component declares version `1.5.3`). The pinned
+`esp_libsrtp` 1.0.0 component is fetched from the Espressif component registry.
 These paths are bench prerequisites, not vendored dependencies.
 The build script checks source revision `3971094e2e7c2ab7cb4de59e4eae710e1902d2b4`
 and rejects changes to the peer implementation.

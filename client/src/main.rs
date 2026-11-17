@@ -508,12 +508,25 @@ fn decode_mutation_response(
 
 #[cfg(windows)]
 fn sha256(data: &[u8]) -> Result<[u8; 32], String> {
-    use windows_sys::Win32::Security::Cryptography::{
-        BCRYPT_SHA256_ALGORITHM, BCryptHash, BCryptOpenAlgorithmProvider,
-    };
+    use windows_sys::Win32::Security::Cryptography::BCRYPT_SHA256_ALGORITHM;
+    bcrypt_hash::<32>(BCRYPT_SHA256_ALGORITHM, data)
+}
+
+#[cfg(windows)]
+fn md5(data: &[u8]) -> Result<[u8; 16], String> {
+    use windows_sys::Win32::Security::Cryptography::BCRYPT_MD5_ALGORITHM;
+    bcrypt_hash::<16>(BCRYPT_MD5_ALGORITHM, data)
+}
+
+#[cfg(windows)]
+fn bcrypt_hash<const N: usize>(
+    algorithm_id: windows_sys::core::PCWSTR,
+    data: &[u8],
+) -> Result<[u8; N], String> {
+    use windows_sys::Win32::Security::Cryptography::{BCryptHash, BCryptOpenAlgorithmProvider};
     let mut algorithm = std::ptr::null_mut();
     let open = unsafe {
-        BCryptOpenAlgorithmProvider(&mut algorithm, BCRYPT_SHA256_ALGORITHM, std::ptr::null(), 0)
+        BCryptOpenAlgorithmProvider(&mut algorithm, algorithm_id, std::ptr::null(), 0)
     };
     if open < 0 {
         return Err(format!(
@@ -521,8 +534,9 @@ fn sha256(data: &[u8]) -> Result<[u8; 32], String> {
             open as u32
         ));
     }
-    let mut digest = [0u8; 32];
+    let mut digest = [0u8; N];
     let len = u32::try_from(data.len()).map_err(|_| "input too large")?;
+    let digest_len = u32::try_from(N).map_err(|_| "output too large")?;
     let result = unsafe {
         BCryptHash(
             algorithm,
@@ -531,7 +545,7 @@ fn sha256(data: &[u8]) -> Result<[u8; 32], String> {
             data.as_ptr(),
             len,
             digest.as_mut_ptr(),
-            32,
+            digest_len,
         )
     };
     unsafe {

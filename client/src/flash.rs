@@ -2,7 +2,7 @@ use std::{
     env,
     ffi::{OsStr, OsString},
     fs::{self, OpenOptions},
-    io,
+    io::{self, Read, Seek, SeekFrom},
     path::{Path, PathBuf},
     process::Command,
     time::{SystemTime, UNIX_EPOCH},
@@ -16,6 +16,12 @@ const PARTITION_TABLE_MAX_DATA: usize = 0x0c00;
 const PARTITION_ENTRY_SIZE: usize = 32;
 const PARTITION_MAGIC: u16 = 0x50aa;
 const PARTITION_MD5_MAGIC: u16 = 0xebeb;
+const PARTITION_MD5_PREFIX: [u8; 16] = [
+    0xeb, 0xeb, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff,
+    0xff,
+];
+const ESP_APP_DESC_OFFSET: u64 = 32;
+const ESP_APP_DESC_MAGIC: [u8; 4] = [0x32, 0x54, 0xcd, 0xab];
 
 #[derive(Clone, Copy, Debug)]
 struct Partition {
@@ -106,6 +112,15 @@ pub fn run(port: &str, image: &Path, backup: &Path) -> Result<(), String> {
 
     let esptool = Esptool::discover()?;
     esptool.inspect_image(image)?;
+    let mut file = fs::File::open(image).map_err(|error| error.to_string())?;
+    file.seek(SeekFrom::Start(ESP_APP_DESC_OFFSET))
+        .map_err(|error| error.to_string())?;
+    let mut app_desc_magic = [0; 4];
+    file.read_exact(&mut app_desc_magic)
+        .map_err(|error| format!("cannot read ESP application metadata: {error}"))?;
+    if app_desc_magic != ESP_APP_DESC_MAGIC {
+        return Err("image is not an ESP-IDF application image".into());
+    }
 
     let table_path = temporary_path_in(&env::temp_dir(), "partition-table.bin");
     reserve_temp(&table_path)?;
@@ -318,12 +333,31 @@ fn parse_factory_partition(bytes: &[u8]) -> Result<Partition, String> {
     if bytes.len() < PARTITION_TABLE_MAX_DATA {
         return Err("live partition table read was incomplete".into());
     }
+
+    let records = bytes[..PARTITION_TABLE_MAX_DATA].chunks_exact(PARTITION_ENTRY_SIZE);
+    let terminator = records
+        .clone()
+        .position(|record| {
+            matches!(
+                u16::from_le_bytes([record[0], record[1]]),
+                PARTITION_MD5_MAGIC | 0xffff
+            )
+        })
+        .ok_or_else(|| "live partition table has no terminator".to_string())?;
+    let md5_offset = terminator * PARTITION_ENTRY_SIZE;
+    let md5_record = &bytes[md5_offset..md5_offset + PARTITION_ENTRY_SIZE];
+    if u16::from_le_bytes([md5_record[0], md5_record[1]]) != PARTITION_MD5_MAGIC {
+        return Err("live partition table has no MD5 checksum".into());
+    }
+    if md5_record[..16] != PARTITION_MD5_PREFIX
+        || super::md5(&bytes[..md5_offset])?.as_slice() != &md5_record[16..32]
+    {
+        return Err("live partition table MD5 checksum is invalid".into());
+    }
+
     let mut entries = Vec::new();
-    for record in bytes[..PARTITION_TABLE_MAX_DATA].chunks_exact(PARTITION_ENTRY_SIZE) {
+    for record in bytes[..md5_offset].chunks_exact(PARTITION_ENTRY_SIZE) {
         let magic = u16::from_le_bytes([record[0], record[1]]);
-        if magic == PARTITION_MD5_MAGIC || magic == 0xffff {
-            break;
-        }
         if magic != PARTITION_MAGIC {
             return Err("live partition table is malformed; no flash write performed".into());
         }
@@ -446,11 +480,13 @@ mod tests {
         let mut table = vec![0xff; PARTITION_TABLE_MAX_DATA];
         write_partition(&mut table, 0, 0, 0, 0x10000, 0x177000);
         write_partition(&mut table, 1, 1, 2, 0x9000, 0x5000);
+        write_md5(&mut table, 2);
         let partition = parse_factory_partition(&table).unwrap();
         assert_eq!(partition.offset, 0x10000);
         assert_eq!(partition.size, 0x177000);
 
         write_partition(&mut table, 1, 0, 1, 0x100000, 0x1000);
+        write_md5(&mut table, 2);
         assert!(
             parse_factory_partition(&table)
                 .unwrap_err()
@@ -473,5 +509,13 @@ mod tests {
         record[3] = subtype;
         record[4..8].copy_from_slice(&offset.to_le_bytes());
         record[8..12].copy_from_slice(&size.to_le_bytes());
+    }
+
+    fn write_md5(table: &mut [u8], index: usize) {
+        let offset = index * PARTITION_ENTRY_SIZE;
+        let digest = super::super::md5(&table[..offset]).unwrap();
+        let record = &mut table[offset..offset + PARTITION_ENTRY_SIZE];
+        record[..16].copy_from_slice(&PARTITION_MD5_PREFIX);
+        record[16..].copy_from_slice(&digest);
     }
 }

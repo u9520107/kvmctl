@@ -15,7 +15,6 @@ if ($LASTEXITCODE -ne 0 -or $revision -ne '3971094e2e7c2ab7cb4de59e4eae710e1902d
 }
 git -c "safe.directory=$trustedSource" -C $WebrtcSource diff --quiet HEAD -- components/esp_peer/src components/esp_peer/include components/esp_peer/libs components/esp_peer/CMakeLists.txt components/esp_peer/idf_component.yml
 if ($LASTEXITCODE -ne 0) { throw 'Peer implementation differs from the recorded revision.' }
-$env:KVMCTL_WEBRTC_SOURCE = $WebrtcSource
 $env:KVMCTL_PEER_SOURCE = Join-Path $WebrtcSource 'components/esp_peer'
 . C:/Espressif/tools/Microsoft.v6.1.1.PowerShell_profile.ps1
 $env:IDF_CCACHE_ENABLE = '0'
