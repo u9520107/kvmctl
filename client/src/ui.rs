@@ -52,6 +52,7 @@ struct UiState {
     wifi_scan_button: HWND,
     wifi_scan_rx: Option<Receiver<Result<Vec<String>, String>>>,
     wifi_scan_frame: u8,
+    wifi_scan_summary_stale: bool,
 }
 
 thread_local! {
@@ -219,6 +220,7 @@ fn refresh(state: &mut UiState) {
         Ok(value) => set_text(state.summary, &value),
         Err(error) => set_text(state.summary, &format!("Error: {error}")),
     }
+    mark_wifi_scan_summary_stale(state);
 }
 
 fn save_wifi(state: &mut UiState) {
@@ -251,6 +253,7 @@ fn save_wifi(state: &mut UiState) {
         Ok(value) => set_text(state.summary, &value),
         Err(error) => set_text(state.summary, &format!("Wi-Fi setup failed: {error}")),
     }
+    mark_wifi_scan_summary_stale(state);
 }
 
 fn save_led(state: &mut UiState) {
@@ -278,6 +281,7 @@ fn save_led(state: &mut UiState) {
         Ok(value) => set_text(state.summary, &value),
         Err(error) => set_text(state.summary, &format!("RGB update failed: {error}")),
     }
+    mark_wifi_scan_summary_stale(state);
 }
 
 fn update_port_list(state: &mut UiState, ports: Vec<serial::PortInfo>) {
@@ -318,7 +322,9 @@ fn update_port_list(state: &mut UiState, ports: Vec<serial::PortInfo>) {
 }
 
 fn finish_wifi_scan(state: &mut UiState, result: Result<Vec<String>, String>) {
+    let update_summary = !state.wifi_scan_summary_stale;
     state.wifi_scan_rx = None;
+    state.wifi_scan_summary_stale = false;
     unsafe { KillTimer(state.window, WIFI_SCAN_TIMER) };
     set_text(state.wifi_scan_button, "Refresh list");
 
@@ -330,18 +336,27 @@ fn finish_wifi_scan(state: &mut UiState, result: Result<Vec<String>, String>) {
                 add_combo_item(state.ssid, ssid);
             }
             set_text(state.ssid, &current);
-            set_text(
-                state.summary,
-                &format!(
-                    "Loaded {} visible SSID(s). You can also type a hidden SSID.",
-                    ssids.len()
-                ),
-            );
+            if update_summary {
+                set_text(
+                    state.summary,
+                    &format!(
+                        "Loaded {} visible SSID(s). You can also type a hidden SSID.",
+                        ssids.len()
+                    ),
+                );
+            }
         }
-        Err(error) => set_text(
+        Err(error) if update_summary => set_text(
             state.summary,
             &format!("Wi-Fi list unavailable; type SSID manually ({error})."),
         ),
+        Err(_) => {}
+    }
+}
+
+fn mark_wifi_scan_summary_stale(state: &mut UiState) {
+    if state.wifi_scan_rx.is_some() {
+        state.wifi_scan_summary_stale = true;
     }
 }
 
@@ -357,6 +372,7 @@ fn start_wifi_scan(state: &mut UiState) {
     let (sender, receiver) = mpsc::channel();
     state.wifi_scan_rx = Some(receiver);
     state.wifi_scan_frame = 1;
+    state.wifi_scan_summary_stale = false;
     set_text(state.wifi_scan_button, "Refreshing.");
     set_text(state.summary, "Scanning host Wi-Fi networks…");
     unsafe { UpdateWindow(state.window) };
@@ -664,6 +680,7 @@ fn create_controls(instance: HINSTANCE, window: HWND) -> UiState {
         wifi_scan_button,
         wifi_scan_rx: None,
         wifi_scan_frame: 1,
+        wifi_scan_summary_stale: false,
     };
     match serial::enumerate() {
         Ok(ports) => update_port_list(&mut state, ports),
