@@ -109,13 +109,38 @@ fn add_combo_item(combo: HWND, value: &str) {
 fn selected_port(state: &UiState) -> Result<serial::PortInfo, String> {
     let selected = unsafe { SendMessageW(state.ports, CB_GETCURSEL, 0, 0) };
     if selected < 0 {
-        return Err("select a detected kvmctl board".into());
+        return Err("select a board or USB-UART candidate".into());
     }
     state
         .port_infos
         .get(selected as usize)
         .cloned()
         .ok_or_else(|| "invalid board selection".into())
+}
+
+fn open_board(state: &UiState, board: &serial::PortInfo) -> Result<serial::Port, String> {
+    use windows_sys::Win32::UI::WindowsAndMessaging::{
+        IDYES, MB_DEFBUTTON2, MB_ICONWARNING, MB_YESNO, MessageBoxW,
+    };
+    if !board.recognized {
+        let message = wide(&format!(
+            "{}\n\nThis device has not been identified as a kvmctl board. Confirm this is your flashed board before sending data.",
+            board.label
+        ));
+        let title = wide("Confirm USB-UART device");
+        if unsafe {
+            MessageBoxW(
+                state.window,
+                message.as_ptr(),
+                title.as_ptr(),
+                MB_YESNO | MB_ICONWARNING | MB_DEFBUTTON2,
+            )
+        } != IDYES
+        {
+            return Err("device not confirmed; port was not opened".into());
+        }
+    }
+    serial::Port::open(&board.name)
 }
 
 fn set_led_fields(state: &UiState, status: &Status) {
@@ -165,7 +190,7 @@ fn refresh(state: &mut UiState) {
     let result: Result<String, String> = (|| {
         let board = selected_port(state)?;
         set_text(state.summary, &format!("Reading {}…", board.label));
-        let mut port = serial::Port::open(&board.name)?;
+        let mut port = open_board(state, &board)?;
         let status = port.status()?;
         serial::remember_board(&board, &status.identity_fingerprint);
         set_led_fields(state, &status);
@@ -192,7 +217,7 @@ fn save_wifi(state: &mut UiState) {
         passphrase.0.fill(0);
         set_text(state.summary, "Sending Wi-Fi settings over USB…");
         unsafe { UpdateWindow(state.window) };
-        let mut port = serial::Port::open(&board.name)?;
+        let mut port = open_board(state, &board)?;
         port.mutate(payload.as_slice(), &id, WIFI_SET_COMMAND)?;
         let status = port.status()?;
         serial::remember_board(&board, &status.identity_fingerprint);
@@ -221,7 +246,7 @@ fn save_led(state: &mut UiState) {
         let payload = encode_led_request(&id, enabled, brightness, rgb)?;
         set_text(state.summary, "Saving RGB preferences over USB…");
         unsafe { UpdateWindow(state.window) };
-        let mut port = serial::Port::open(&board.name)?;
+        let mut port = open_board(state, &board)?;
         port.mutate(&payload, &id, LED_SET_COMMAND)?;
         let status = port.status()?;
         serial::remember_board(&board, &status.identity_fingerprint);
@@ -248,25 +273,25 @@ fn update_port_list(state: &mut UiState, ports: Vec<serial::PortInfo>) {
                 .iter()
                 .position(|port| port.instance_id.as_deref() == Some(instance_id.as_str()))
         })
-        .or_else(|| (state.port_infos.len() == 1).then_some(0));
+        .or_else(|| serial::automatic_selection(&state.port_infos));
     if let Some(index) = selected {
         unsafe { SendMessageW(state.ports, CB_SETCURSEL, index, 0) };
     }
     match state.port_infos.as_slice() {
         [] => set_text(
             state.summary,
-            "No supported kvmctl USB-UART board found. Connect board and rescan.",
+            "No USB-UART candidates found. Connect board and rescan.",
         ),
         [port] => set_text(
             state.summary,
             &format!(
-                "Detected {}. Refresh status to identify the board.",
+                "{}. Choose unknown devices explicitly; confirmation is required before communication.",
                 port.label
             ),
         ),
         _ => set_text(
             state.summary,
-            "Multiple compatible boards found. Choose a device by name and USB location.",
+            "Multiple USB-UART candidates found. Choose your board by name and USB location; unknown devices require confirmation.",
         ),
     }
 }

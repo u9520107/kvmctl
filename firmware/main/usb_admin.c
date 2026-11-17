@@ -126,6 +126,57 @@ static bool read_bool(cbor_reader_t *r, bool *out)
     return true;
 }
 
+static bool valid_utf8(const uint8_t *data, size_t len)
+{
+    for (size_t i = 0; i < len;) {
+        uint32_t code = data[i++];
+        if (code < 0x80) continue;
+        unsigned extra = code >= 0xc2 && code <= 0xdf ? 1 :
+                         code >= 0xe0 && code <= 0xef ? 2 :
+                         code >= 0xf0 && code <= 0xf4 ? 3 : 0;
+        if (!extra || extra > len - i) return false;
+        uint32_t minimum = extra == 1 ? 0x80 : extra == 2 ? 0x800 : 0x10000;
+        code &= (1u << (6 - extra)) - 1;
+        for (unsigned j = 0; j < extra; ++j) {
+            uint8_t byte = data[i++];
+            if ((byte & 0xc0) != 0x80) return false;
+            code = (code << 6) | (byte & 0x3f);
+        }
+        if (code < minimum || code > 0x10ffff || (code >= 0xd800 && code <= 0xdfff)) return false;
+    }
+    return true;
+}
+
+/* Validate structure without imposing this version's command payload schema. */
+static bool skip_value(cbor_reader_t *r, unsigned depth)
+{
+    uint8_t major;
+    uint64_t value;
+    /* ponytail: cap nesting at 16 for UART task stack; raise with a measured stack budget. */
+    if (depth > 16 || !read_head(r, &major, &value)) return false;
+    if (major <= 1) return true;
+    if (major == 2 || major == 3) {
+        if (value > r->len - r->pos ||
+            (major == 3 && !valid_utf8(r->data + r->pos, (size_t)value))) return false;
+        r->pos += (size_t)value;
+        return true;
+    }
+    if (major == 4 || major == 5) {
+        uint64_t previous = 0;
+        if (value > r->len - r->pos) return false;
+        for (uint64_t i = 0; i < value; ++i) {
+            if (major == 5) {
+                uint64_t key;
+                if (!read_uint(r, &key) || (i && key <= previous)) return false;
+                previous = key;
+            }
+            if (!skip_value(r, depth + 1)) return false;
+        }
+        return true;
+    }
+    return major == 7 && (value == 20 || value == 21 || value == 22);
+}
+
 typedef enum {
     REQUEST_INVALID,
     REQUEST_UNSUPPORTED_VERSION,
@@ -147,7 +198,7 @@ static request_decode_result_t decode_request(const uint8_t *data, size_t len,
 
     if (request->version_major != ADMIN_VERSION_MAJOR ||
         request->version_minor != ADMIN_VERSION_MINOR) {
-        return r.pos < r.len ? REQUEST_UNSUPPORTED_VERSION : REQUEST_INVALID;
+        return skip_value(&r, 0) && r.pos == r.len ? REQUEST_UNSUPPORTED_VERSION : REQUEST_INVALID;
     }
 
     if (request->command == ADMIN_STATUS) {

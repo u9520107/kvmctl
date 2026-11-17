@@ -470,6 +470,11 @@ mod serial {
         pub name: String,
         pub label: String,
         pub instance_id: Option<String>,
+        pub recognized: bool,
+    }
+
+    pub fn automatic_selection(ports: &[PortInfo]) -> Option<usize> {
+        (ports.len() == 1 && ports[0].recognized).then_some(0)
     }
 
     pub struct Port(HANDLE);
@@ -644,7 +649,7 @@ mod serial {
                 .filter(|value| !value.is_empty());
             let board_name = known_identity
                 .map(|fingerprint| format!("kvmctl {} — {friendly_name}", &fingerprint[..8]))
-                .unwrap_or(friendly_name);
+                .unwrap_or_else(|| format!("Unknown USB-UART device — {friendly_name}"));
             let label = location
                 .map(|location| format!("{board_name} — {location}"))
                 .unwrap_or(board_name);
@@ -652,6 +657,7 @@ mod serial {
                 name,
                 label,
                 instance_id,
+                recognized: known_identity.is_some(),
             });
         }
         unsafe { SetupDiDestroyDeviceInfoList(devices) };
@@ -941,18 +947,18 @@ fn select_port(
             .iter()
             .find(|candidate| candidate.name.eq_ignore_ascii_case(port))
             .cloned()
-            .ok_or_else(|| "port is not a detected compatible kvmctl board".into());
+            .ok_or_else(|| "port is not a detected USB-UART candidate".into());
     }
     if ports.is_empty() {
-        return Err("no compatible kvmctl boards found".into());
+        return Err("no USB-UART candidates found".into());
     }
-    if ports.len() == 1 {
-        return Ok(ports[0].clone());
+    if let Some(index) = serial::automatic_selection(ports) {
+        return Ok(ports[index].clone());
     }
     for (index, port) in ports.iter().enumerate() {
         println!("{}: {}", index + 1, port.label);
     }
-    print!("Select the board: ");
+    print!("Select device (unknown devices require confirmation): ");
     io::stdout().flush().map_err(|e| e.to_string())?;
     let mut line = String::new();
     io::stdin()
@@ -1006,6 +1012,21 @@ fn run() -> Result<(), String> {
         return Err("usage: kvmctl [status [COMx] | wifi [COMx] | led [COMx] on|off <brightness> <RRGGBB> | ports]".into());
     }
     let selected = select_port(&ports, requested_port)?;
+    if !selected.recognized {
+        println!(
+            "{} has not been identified as a kvmctl board.",
+            selected.label
+        );
+        print!("Confirm this is your flashed board before sending data (yes/no): ");
+        io::stdout().flush().map_err(|e| e.to_string())?;
+        let mut answer = String::new();
+        io::stdin()
+            .read_line(&mut answer)
+            .map_err(|e| e.to_string())?;
+        if !answer.trim().eq_ignore_ascii_case("yes") {
+            return Err("device not confirmed; port was not opened".into());
+        }
+    }
     let mut port = serial::Port::open(&selected.name)?;
     match command {
         "status" => {
@@ -1076,6 +1097,8 @@ fn run() -> Result<(), String> {
             let id = random_id()?;
             let payload = encode_led_request(&id, enabled, brightness, rgb)?;
             port.mutate(&payload, &id, LED_SET_COMMAND)?;
+            let status = port.status()?;
+            serial::remember_board(&selected, &status.identity_fingerprint);
             println!(
                 "RGB LED {} at {brightness}% #{:02X}{:02X}{:02X}.",
                 if enabled { "on" } else { "off" },
@@ -1125,6 +1148,25 @@ fn main() {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(windows)]
+    #[test]
+    fn automatic_selection_requires_one_recognized_board() {
+        let port = |recognized| serial::PortInfo {
+            name: "COM6".into(),
+            label: "USB-UART device".into(),
+            instance_id: Some("test-device".into()),
+            recognized,
+        };
+        assert_eq!(serial::automatic_selection(&[]), None);
+        assert_eq!(serial::automatic_selection(&[port(false)]), None);
+        assert_eq!(serial::automatic_selection(&[port(true)]), Some(0));
+        assert_eq!(
+            serial::automatic_selection(&[port(true), port(false)]),
+            None
+        );
+        assert_eq!(serial::automatic_selection(&[port(true), port(true)]), None);
+    }
 
     fn bytes(contents: &str) -> Vec<u8> {
         contents
