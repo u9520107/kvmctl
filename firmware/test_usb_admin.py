@@ -17,14 +17,22 @@ harness = r"""
 #include <stdbool.h>
 #include <stddef.h>
 #include <string.h>
+#define CLIENT_AUTH_SPKI_BYTES 91
+#define CLIENT_AUTH_FINGERPRINT_BYTES 32
 DECODER
-static void check(const uint8_t *payload, size_t len, request_decode_result_t expected, uint8_t major, uint8_t minor)
+static void check_command(const uint8_t *payload, size_t len, uint8_t command,
+                          request_decode_result_t expected, uint8_t major, uint8_t minor)
 {
     uint8_t frame[4096] = {0xa5, 0, major, 1, minor, 2, 0x18, 0x61, 3, 0x50};
+    frame[7] = command;
     frame[26] = 4;
     memcpy(frame + 27, payload, len);
     admin_request_t request = {0};
     assert(decode_request(frame, 27 + len, &request) == expected);
+}
+static void check(const uint8_t *payload, size_t len, request_decode_result_t expected, uint8_t major, uint8_t minor)
+{
+    check_command(payload, len, 0x61, expected, major, minor);
 }
 #define CHECK(expected, ...) do { const uint8_t p[] = {__VA_ARGS__}; \
     check(p, sizeof(p), expected, 2, 0); check(p, sizeof(p), expected, 1, 1); } while (0)
@@ -48,6 +56,14 @@ int main(void)
     CHECK(REQUEST_INVALID, 0xa1, 0x60, 0);
     CHECK(REQUEST_INVALID, 0xc0, 0);
     CHECK(REQUEST_INVALID, 0xf9, 0x3c, 0);
+    uint8_t enroll[95] = {0xa1, 0x00, 0x58, 0x5b};
+    check_command(enroll, sizeof(enroll), 0x62, REQUEST_SUPPORTED, 1, 0);
+    check_command(enroll, sizeof(enroll) - 1, 0x62, REQUEST_INVALID, 1, 0);
+    check_command(empty_map, sizeof(empty_map), 0x63, REQUEST_SUPPORTED, 1, 0);
+    check_command(empty_map, sizeof(empty_map), 0x65, REQUEST_SUPPORTED, 1, 0);
+    uint8_t revoke[36] = {0xa1, 0x00, 0x58, 0x20};
+    check_command(revoke, sizeof(revoke), 0x64, REQUEST_SUPPORTED, 1, 0);
+    check_command(revoke, sizeof(revoke) - 1, 0x64, REQUEST_INVALID, 1, 0);
     CHECK(REQUEST_INVALID, 0x62, 0xc0, 0x80);
     CHECK(REQUEST_INVALID, 0x63, 0xed, 0xa0, 0x80);
     CHECK(REQUEST_INVALID, 0x64, 0xf4, 0x90, 0x80, 0x80);

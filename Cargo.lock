@@ -743,11 +743,16 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "async-trait",
+ "base64 0.22.1",
  "bytes",
  "log",
+ "rcgen",
  "rtc",
+ "rustls",
+ "sha1",
  "webrtc",
  "windows-sys 0.61.2",
+ "x509-parser 0.18.1",
 ]
 
 [[package]]

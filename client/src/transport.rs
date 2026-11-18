@@ -1,14 +1,15 @@
 use anyhow::{Context, Result, bail, ensure};
 use bytes::BytesMut;
 use log::{Level, LevelFilter, Log, Metadata, Record};
+use std::io::Read;
+use std::net::{SocketAddr, TcpStream};
 use std::sync::atomic::{AtomicBool, AtomicU8, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
 use std::time::{Duration, Instant};
 use webrtc::data_channel::{DataChannel, DataChannelEvent, RTCDataChannelInit};
 use webrtc::peer_connection::{
     PeerConnection, PeerConnectionBuilder, PeerConnectionEventHandler, RTCCertificate,
-    RTCConfigurationBuilder, RTCIceConnectionState, RTCIceGatheringState,
-    RTCPeerConnectionState,
+    RTCConfigurationBuilder, RTCIceConnectionState, RTCIceGatheringState, RTCPeerConnectionState,
     RTCSessionDescription,
 };
 use webrtc::runtime::{Runtime, Sender, channel, default_runtime, timeout};
@@ -48,7 +49,8 @@ impl Log for CertificateLog {
             } else {
                 4
             };
-            let _ = RTC_ERROR_CLASS.compare_exchange(0, class, Ordering::Relaxed, Ordering::Relaxed);
+            let _ =
+                RTC_ERROR_CLASS.compare_exchange(0, class, Ordering::Relaxed, Ordering::Relaxed);
             if message.contains("remote certificate does not match any fingerprint") {
                 CERTIFICATE_REJECTED.store(true, Ordering::Release);
             }
@@ -67,11 +69,7 @@ fn install_certificate_log() -> Result<()> {
     Ok(())
 }
 
-struct Handler(
-    Sender<()>,
-    Arc<AtomicBool>,
-    Arc<Mutex<ConnectionStates>>,
-);
+struct Handler(Sender<()>, Arc<AtomicBool>, Arc<Mutex<ConnectionStates>>);
 
 #[async_trait::async_trait]
 impl PeerConnectionEventHandler for Handler {
@@ -93,8 +91,8 @@ impl PeerConnectionEventHandler for Handler {
     }
 }
 
-fn parse_sha256_fingerprint(sdp: &str) -> Result<[u8; 32]> {
-    let mut result = None;
+pub(crate) fn parse_sha256_fingerprint(sdp: &str) -> Result<[u8; 32]> {
+    let mut result: Option<[u8; 32]> = None;
     for line in sdp.lines() {
         if !line.starts_with("a=fingerprint:") {
             continue;
@@ -183,7 +181,10 @@ fn apply_test_fingerprint_fault(sdp: &str, fault: Option<&str>) -> Result<String
             result.push_str(line);
         }
     }
-    ensure!(count == 1, "expected exactly one SDP certificate fingerprint");
+    ensure!(
+        count == 1,
+        "expected exactly one SDP certificate fingerprint"
+    );
     Ok(result)
 }
 
@@ -234,14 +235,20 @@ async fn exchange(
                 }),
             )
             .await?;
-        ensure!(control.label().await? == "control", "invalid control channel label");
+        ensure!(
+            control.label().await? == "control",
+            "invalid control channel label"
+        );
         ensure!(control.ordered().await?, "control channel must be ordered");
         ensure!(
             control.max_retransmits().await?.is_none()
                 && control.max_packet_life_time().await?.is_none(),
             "control channel must be reliable"
         );
-        ensure!(motion.label().await? == "motion", "invalid motion channel label");
+        ensure!(
+            motion.label().await? == "motion",
+            "invalid motion channel label"
+        );
         ensure!(!motion.ordered().await?, "motion channel must be unordered");
         ensure!(
             motion.max_retransmits().await? == Some(0)
@@ -263,7 +270,10 @@ async fn exchange(
         );
         let offer_sdp = apply_test_fingerprint_fault(&offer.sdp, offer_fault.as_deref())?;
         let offer_sdp = override_test_fingerprint(&offer_sdp, offer_fingerprint.as_deref())?;
-        ensure!(offer_sdp.len() <= 3500, "offer exceeds USB signaling frame limit");
+        ensure!(
+            offer_sdp.len() <= 3500,
+            "offer exceeds USB signaling frame limit"
+        );
         let invalidation_sdp = if stage == "initial" && offer_fault.is_none() {
             let mut fingerprint = parse_sha256_fingerprint(&offer_sdp)?;
             fingerprint[0] ^= 1;
@@ -298,8 +308,12 @@ async fn exchange(
             };
             let invalidation: Result<(), String> = match command {
                 true => match port.transport_offer(&invalidation_sdp) {
-                    Err(error) if error == "device rejected SDP offer with code 3" => Ok(()),
-                    Err(error) => Err(format!("session invalidation returned unexpected rejection: {error}")),
+                    Err(error) if error == "device is busy with another transport session" => {
+                        Ok(())
+                    }
+                    Err(error) => Err(format!(
+                        "session invalidation returned unexpected rejection: {error}"
+                    )),
                     Ok(_) => Err("session invalidation unexpectedly started a session".to_owned()),
                 },
                 false => Ok(()),
@@ -337,7 +351,8 @@ async fn exchange(
             })
             .transpose()?
             .unwrap_or(false);
-        pc.set_remote_description(RTCSessionDescription::answer(answer)?).await?;
+        pc.set_remote_description(RTCSessionDescription::answer(answer)?)
+            .await?;
 
         wait_open(
             &*runtime,
@@ -351,8 +366,8 @@ async fn exchange(
         .await?;
         let open_ms = started.elapsed().as_millis();
         eprintln!("M1.2 TRANSPORT OPEN stage={stage} elapsed_ms={open_ms}");
-        echo(&*runtime, &control, "control", 10).await?;
-        echo(&*runtime, &motion, "motion", 10).await?;
+        // Raw USB signaling remains useful for the M1.2 DTLS identity check,
+        // but this unauthenticated path must never authorize app traffic.
         Ok(())
     }
     .await;
@@ -384,7 +399,9 @@ async fn exchange(
     } else {
         "malformed_sdp"
     };
-    eprintln!("M1.2 TRANSPORT INVALIDATION stage={stage} {invalidation}=rejected active_session=closed");
+    eprintln!(
+        "M1.2 TRANSPORT INVALIDATION stage={stage} {invalidation}=rejected active_session=closed"
+    );
     Ok(port)
 }
 
@@ -477,43 +494,6 @@ async fn wait_open(
     Ok(())
 }
 
-async fn echo(
-    runtime: &dyn Runtime,
-    channel: &Arc<dyn DataChannel>,
-    label: &str,
-    count: u32,
-) -> Result<()> {
-    let mut rtts = Vec::with_capacity(count as usize);
-    for sequence in 0..count {
-        let payload = format!("kvmctl-m1.2-{label}:{sequence:06}");
-        let sent = Instant::now();
-        channel.send(BytesMut::from(payload.as_bytes())).await?;
-        loop {
-            match timeout(runtime, Duration::from_secs(5), channel.poll())
-                .await
-                .map_err(|_| anyhow::anyhow!("{label} echo timeout"))?
-            {
-                Some(DataChannelEvent::OnMessage(message)) => {
-                    ensure!(message.data.as_ref() == payload.as_bytes(), "{label} echo mismatch");
-                    rtts.push(sent.elapsed().as_micros());
-                    break;
-                }
-                Some(DataChannelEvent::OnClose) | None => bail!("{label} channel closed"),
-                _ => ensure!(sent.elapsed() < Duration::from_secs(5), "{label} echo timeout"),
-            }
-        }
-    }
-    eprintln!(
-        "M1.2 TRANSPORT CHANNEL label={label} reliable={} ordered={} messages={} rtt_min_us={} rtt_max_us={}",
-        channel.max_retransmits().await?.is_none() && channel.max_packet_life_time().await?.is_none(),
-        channel.ordered().await?,
-        count,
-        rtts.iter().min().unwrap(),
-        rtts.iter().max().unwrap()
-    );
-    Ok(())
-}
-
 pub(crate) fn run_test(port: crate::serial::Port) -> Result<()> {
     install_certificate_log()?;
     CERTIFICATE_REJECTED.store(false, Ordering::Release);
@@ -530,15 +510,850 @@ pub(crate) fn run_test(port: crate::serial::Port) -> Result<()> {
     let runtime = default_runtime().context("no WebRTC runtime")?;
     let mut result: Option<Result<()>> = None;
     runtime.block_on(Box::pin(async {
-        result = Some(async {
-            let port = exchange(runtime.clone(), port, "initial").await?;
-            let _port = exchange(runtime.clone(), port, "reconnect").await?;
-            Ok(())
-        }
-        .await);
+        result = Some(
+            async {
+                let port = exchange(runtime.clone(), port, "initial").await?;
+                let _port = exchange(runtime.clone(), port, "reconnect").await?;
+                Ok(())
+            }
+            .await,
+        );
     }));
     result.context("runtime did not execute")??;
     eprintln!("M1.2 TRANSPORT COMPLETE sessions=2 reconnect=clean");
+    Ok(())
+}
+
+enum MonitorCommand {
+    Snapshot(std::sync::mpsc::Sender<Result<crate::TransportMetrics, String>>),
+    RevokeClient([u8; 32], std::sync::mpsc::Sender<Result<(), String>>),
+    Stop,
+}
+
+struct PortMonitor {
+    device_status: Arc<AtomicU8>,
+    metrics: Arc<Mutex<crate::TransportMetrics>>,
+    usb_admin_ok: Arc<AtomicBool>,
+    stop: std::sync::mpsc::Sender<MonitorCommand>,
+    finished: std::sync::mpsc::Receiver<crate::serial::Port>,
+}
+
+impl PortMonitor {
+    fn start(mut port: crate::serial::Port) -> Self {
+        let device_status = Arc::new(AtomicU8::new(254));
+        let metrics = Arc::new(Mutex::new(crate::TransportMetrics::default()));
+        let usb_admin_ok = Arc::new(AtomicBool::new(true));
+        let (stop, stop_rx) = std::sync::mpsc::channel();
+        let (finished_tx, finished) = std::sync::mpsc::channel();
+        let worker_status = device_status.clone();
+        let worker_metrics = metrics.clone();
+        let worker_admin_ok = usb_admin_ok.clone();
+        std::thread::spawn(move || {
+            let mut next_admin_check = Instant::now();
+            loop {
+                if Instant::now() >= next_admin_check {
+                    if port.status().is_err() {
+                        worker_admin_ok.store(false, Ordering::Release);
+                    }
+                    next_admin_check = Instant::now() + Duration::from_secs(1);
+                }
+                match port.transport_status() {
+                    Ok(snapshot) => {
+                        worker_status.store(snapshot.state, Ordering::Release);
+                        *worker_metrics.lock().unwrap() = snapshot;
+                    }
+                    Err(_) => {
+                        worker_status.store(254, Ordering::Release);
+                        worker_admin_ok.store(false, Ordering::Release);
+                    }
+                }
+                match stop_rx.recv_timeout(Duration::from_millis(200)) {
+                    Ok(MonitorCommand::Stop)
+                    | Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => break,
+                    Ok(MonitorCommand::Snapshot(reply)) => {
+                        let snapshot = port.transport_status();
+                        match &snapshot {
+                            Ok(snapshot) => {
+                                worker_status.store(snapshot.state, Ordering::Release);
+                                *worker_metrics.lock().unwrap() = *snapshot;
+                            }
+                            Err(_) => {
+                                worker_status.store(254, Ordering::Release);
+                                worker_admin_ok.store(false, Ordering::Release);
+                            }
+                        }
+                        let _ = reply.send(snapshot);
+                    }
+                    Ok(MonitorCommand::RevokeClient(fingerprint, reply)) => {
+                        let _ = reply.send(port.revoke_client(&fingerprint));
+                    }
+                    Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {}
+                }
+            }
+            let _ = finished_tx.send(port);
+        });
+        Self {
+            device_status,
+            metrics,
+            usb_admin_ok,
+            stop,
+            finished,
+        }
+    }
+
+    fn snapshot(&self) -> crate::TransportMetrics {
+        *self.metrics.lock().unwrap()
+    }
+
+    fn fresh_snapshot(&self) -> Result<crate::TransportMetrics> {
+        let (reply, receiver) = std::sync::mpsc::channel();
+        self.stop
+            .send(MonitorCommand::Snapshot(reply))
+            .map_err(|_| anyhow::anyhow!("USB transport monitor stopped before metrics refresh"))?;
+        receiver
+            .recv_timeout(Duration::from_secs(5))
+            .map_err(|_| anyhow::anyhow!("USB transport metrics refresh timed out"))?
+            .map_err(anyhow::Error::msg)
+    }
+
+    fn revoke_client(&self, fingerprint: [u8; 32]) -> Result<()> {
+        let (reply, receiver) = std::sync::mpsc::channel();
+        self.stop
+            .send(MonitorCommand::RevokeClient(fingerprint, reply))
+            .map_err(|_| {
+                anyhow::anyhow!("USB transport monitor stopped before client revocation")
+            })?;
+        receiver
+            .recv_timeout(Duration::from_secs(5))
+            .map_err(|_| anyhow::anyhow!("USB client revocation timed out"))?
+            .map_err(anyhow::Error::msg)
+    }
+
+    fn finish(self) -> Result<(crate::serial::Port, crate::TransportMetrics, bool)> {
+        let _ = self.stop.send(MonitorCommand::Stop);
+        let port = self
+            .finished
+            .recv_timeout(Duration::from_secs(10))
+            .map_err(|_| anyhow::anyhow!("USB transport monitor did not stop"))?;
+        Ok((
+            port,
+            self.snapshot(),
+            self.usb_admin_ok.load(Ordering::Acquire),
+        ))
+    }
+}
+
+impl Drop for PortMonitor {
+    fn drop(&mut self) {
+        let _ = self.stop.send(MonitorCommand::Stop);
+    }
+}
+
+enum TranscriptProofCase<'a> {
+    Valid {
+        check_isolation: bool,
+        check_resources: bool,
+        revoke_after_authorization: bool,
+    },
+    Missing,
+    Invalid,
+    Replayed(&'a [u8]),
+}
+
+async fn send_before_authorization_and_reject_echo(
+    runtime: &dyn Runtime,
+    control: &Arc<dyn DataChannel>,
+    motion: &Arc<dyn DataChannel>,
+) -> Result<()> {
+    let payload = b"kvmctl-m1.3-pre-auth-must-not-echo";
+    for channel in [control, motion] {
+        channel
+            .send(BytesMut::from(&payload[..]))
+            .await
+            .context("pre-authorization application payload could not be sent")?;
+    }
+    let deadline = Instant::now() + Duration::from_secs(2);
+    while Instant::now() < deadline {
+        for channel in [control, motion] {
+            match timeout(runtime, Duration::from_millis(200), channel.poll()).await {
+                Ok(Some(DataChannelEvent::OnMessage(message))) => {
+                    bail!(
+                        "ESP32 echoed application payload before authorization: {} bytes",
+                        message.data.len()
+                    );
+                }
+                Ok(Some(DataChannelEvent::OnClose)) => {
+                    bail!("DataChannel closed before the transcript proof was checked")
+                }
+                _ => {}
+            }
+        }
+    }
+    Ok(())
+}
+
+async fn send_after_revocation_and_reject_echo(
+    runtime: &dyn Runtime,
+    control: &Arc<dyn DataChannel>,
+    motion: &Arc<dyn DataChannel>,
+    device_status: &AtomicU8,
+) -> Result<()> {
+    let payload = b"kvmctl-m1.3-revoked-must-not-echo";
+    for channel in [control, motion] {
+        let _ = channel.send(BytesMut::from(&payload[..])).await;
+    }
+    let deadline = Instant::now() + Duration::from_secs(2);
+    while Instant::now() < deadline {
+        ensure!(
+            device_status.load(Ordering::Acquire) == 0,
+            "ESP32 transport became active again after client revocation"
+        );
+        for channel in [control, motion] {
+            if let Ok(Some(DataChannelEvent::OnMessage(message))) =
+                timeout(runtime, Duration::from_millis(200), channel.poll()).await
+            {
+                bail!(
+                    "ESP32 echoed {} application bytes after USB revocation",
+                    message.data.len()
+                );
+            }
+        }
+    }
+    Ok(())
+}
+
+fn expect_busy(result: Result<String, String>) -> Result<()> {
+    match result {
+        Err(error) if error.contains("busy") => Ok(()),
+        Err(error) => bail!("competing SDP returned unexpected rejection: {error}"),
+        Ok(_) => bail!("competing SDP was accepted while another client was active"),
+    }
+}
+
+async fn test_competing_signaling(
+    runtime: &dyn Runtime,
+    control: &Arc<dyn DataChannel>,
+    motion: &Arc<dyn DataChannel>,
+    address: SocketAddr,
+    hostname: &str,
+    status: &crate::Status,
+    credential: &crate::credentials::ClientCredential,
+    offer_sdp: &str,
+) -> Result<()> {
+    let outsider = crate::credentials::ClientCredential::generate().map_err(anyhow::Error::msg)?;
+    match crate::signaling::Session::connect(
+        address,
+        hostname,
+        status.identity_fingerprint,
+        status.tls_spki_hash,
+        &outsider,
+    ) {
+        Err(error) if error == "endpoint rejected signaling: unauthorized" => {}
+        Err(error) => bail!("unauthorized client returned unexpected rejection: {error}"),
+        Ok(mut session) => {
+            session.close();
+            bail!("un-enrolled client passed WSS authentication");
+        }
+    }
+    echo_signaling(runtime, control, "control-after-unauthorized-client", 1).await?;
+    echo_signaling(runtime, motion, "motion-after-unauthorized-client", 1).await?;
+    eprintln!(
+        "M1.3 ISOLATION unauthorized_client=rejected active_session=preserved control_echo=true motion_echo=true"
+    );
+    crate::signaling::Session::expect_invalid_client_proof(
+        address,
+        hostname,
+        status.identity_fingerprint,
+        status.tls_spki_hash,
+        credential,
+    )
+    .map_err(anyhow::Error::msg)?;
+    echo_signaling(runtime, control, "control-after-invalid-client-proof", 1).await?;
+    echo_signaling(runtime, motion, "motion-after-invalid-client-proof", 1).await?;
+    eprintln!(
+        "M1.3 ISOLATION invalid_client_proof=rejected active_session=preserved control_echo=true motion_echo=true"
+    );
+    let mut competitor = crate::signaling::Session::connect(
+        address,
+        hostname,
+        status.identity_fingerprint,
+        status.tls_spki_hash,
+        credential,
+    )
+    .map_err(anyhow::Error::msg)?;
+    expect_busy(
+        competitor
+            .send_offer(credential, offer_sdp)
+            .map(|_| String::new()),
+    )?;
+    competitor.close();
+    echo_signaling(runtime, control, "control-after-competing-offer", 1).await?;
+    echo_signaling(runtime, motion, "motion-after-competing-offer", 1).await?;
+    eprintln!(
+        "M1.3 ISOLATION authenticated_competing_offer=busy active_session=preserved control_echo=true motion_echo=true"
+    );
+    Ok(())
+}
+
+async fn exchange_signaling(
+    runtime: Arc<dyn Runtime>,
+    monitor: &PortMonitor,
+    address: SocketAddr,
+    hostname: &str,
+    status: &crate::Status,
+    credential: &crate::credentials::ClientCredential,
+    proof_case: TranscriptProofCase<'_>,
+) -> Result<Vec<u8>> {
+    let started = Instant::now();
+    let authorized_case = matches!(&proof_case, TranscriptProofCase::Valid { .. });
+    let mut session = crate::signaling::Session::connect(
+        address,
+        hostname,
+        status.identity_fingerprint,
+        status.tls_spki_hash,
+        credential,
+    )
+    .map_err(anyhow::Error::msg)?;
+    let (gather_tx, mut gather_rx) = channel(1);
+    let peer_failed = Arc::new(AtomicBool::new(false));
+    let connection_states = Arc::new(Mutex::new(ConnectionStates::default()));
+    let configuration = RTCConfigurationBuilder::new()
+        .with_ice_servers(vec![])
+        .build();
+    let pc = PeerConnectionBuilder::new()
+        .with_configuration(configuration)
+        .with_handler(Arc::new(Handler(
+            gather_tx,
+            peer_failed.clone(),
+            connection_states.clone(),
+        )))
+        .with_runtime(runtime.clone())
+        .with_udp_addrs(vec!["0.0.0.0:0".to_owned()])
+        .build()
+        .await?;
+    let result = async {
+        let control = pc.create_data_channel("control", None).await?;
+        let motion = pc.create_data_channel(
+            "motion",
+            Some(RTCDataChannelInit { ordered: false, max_retransmits: Some(0), ..Default::default() }),
+        ).await?;
+        ensure!(control.ordered().await? && control.max_retransmits().await?.is_none(),
+                "control channel must be reliable and ordered");
+        ensure!(!motion.ordered().await? && motion.max_retransmits().await? == Some(0),
+                "motion channel must be unordered with zero retransmissions");
+
+        let offer = pc.create_offer(None).await?;
+        pc.set_local_description(offer).await?;
+        timeout(&*runtime, Duration::from_secs(10), gather_rx.recv())
+            .await.map_err(|_| anyhow::anyhow!("ICE gathering timeout"))?;
+        let offer = pc.local_description().await.context("no local SDP")?;
+        let offer_sdp = offer.sdp;
+        let offer_exchange = session.send_offer(credential, &offer_sdp).map_err(anyhow::Error::msg)?;
+        pc.set_remote_description(RTCSessionDescription::answer(offer_exchange.answer.clone())?).await?;
+        let device_status = monitor.device_status.clone();
+        wait_open(
+            &*runtime,
+            &control,
+            &motion,
+            &peer_failed,
+            &device_status,
+            &connection_states,
+            false,
+        ).await?;
+        eprintln!("M1.3 DTLS_OPEN elapsed_ms={} control=ordered-reliable motion=unordered-zero-retransmit",
+                  started.elapsed().as_millis());
+
+        match proof_case {
+            TranscriptProofCase::Valid { check_isolation, check_resources, revoke_after_authorization } => {
+                session.send_transcript_proof(&offer_exchange.client_transcript_proof)
+                    .map_err(anyhow::Error::msg)?;
+                eprintln!("M1.3 AUTHORIZED client_proof=valid endpoint_transcript=verified dtls_identity=verified");
+                if check_isolation {
+                    test_competing_signaling(&*runtime, &control, &motion, address, hostname, status, credential, &offer_sdp).await?;
+                }
+                if check_resources {
+                    run_resource_test(&*runtime, &control, &motion, monitor, address, hostname, status, credential).await?;
+                }
+                if revoke_after_authorization {
+                    echo_signaling(&*runtime, &control, "control-before-active-revoke", 1).await?;
+                    echo_signaling(&*runtime, &motion, "motion-before-active-revoke", 1).await?;
+                    monitor.revoke_client(credential.fingerprint)?;
+                    wait_device_closed(&monitor.device_status).await?;
+                    send_after_revocation_and_reject_echo(
+                        &*runtime,
+                        &control,
+                        &motion,
+                        &monitor.device_status,
+                    )
+                    .await?;
+                    match crate::signaling::Session::connect(
+                        address, hostname, status.identity_fingerprint, status.tls_spki_hash, credential,
+                    ) {
+                        Err(error) if error == "endpoint rejected signaling: unauthorized" => {}
+                        Err(error) => bail!("revoked client got unexpected signaling result: {error}"),
+                        Ok(mut session) => {
+                            session.close();
+                            bail!("revoked client reopened a signaling session");
+                        }
+                    }
+                    eprintln!("M1.3 REVOCATION usb_revoke=active_session_closed reconnect=unauthorized");
+                    return Ok(offer_exchange.client_transcript_proof);
+                }
+                echo_signaling(&*runtime, &control, "control", 10).await?;
+                echo_signaling(&*runtime, &motion, "motion", 10).await?;
+                Ok(offer_exchange.client_transcript_proof)
+            }
+            TranscriptProofCase::Missing => {
+                send_before_authorization_and_reject_echo(&*runtime, &control, &motion).await?;
+                eprintln!("M1.3 PROOF negative=missing accepted_application_bytes=0 echoed=false");
+                Ok(offer_exchange.client_transcript_proof)
+            }
+            TranscriptProofCase::Invalid => {
+                let mut invalid = offer_exchange.client_transcript_proof;
+                *invalid.last_mut().ok_or_else(|| anyhow::anyhow!("empty transcript proof"))? ^= 1;
+                send_before_authorization_and_reject_echo(&*runtime, &control, &motion).await?;
+                session.send_transcript_proof_frame(&invalid).map_err(anyhow::Error::msg)?;
+                let rejection = session.receive_rejection().map_err(anyhow::Error::msg)?;
+                ensure!(rejection.contains("unauthorized"), "invalid proof got unexpected error: {rejection}");
+                eprintln!("M1.3 PROOF negative=invalid accepted_application_bytes=0 echoed=false result=unauthorized");
+                Ok(Vec::new())
+            }
+            TranscriptProofCase::Replayed(replayed) => {
+                send_before_authorization_and_reject_echo(&*runtime, &control, &motion).await?;
+                session.send_transcript_proof_frame(replayed).map_err(anyhow::Error::msg)?;
+                let rejection = session.receive_rejection().map_err(anyhow::Error::msg)?;
+                ensure!(rejection.contains("unauthorized"), "replayed proof got unexpected error: {rejection}");
+                eprintln!("M1.3 PROOF negative=replayed_previous_session accepted_application_bytes=0 echoed=false result=unauthorized");
+                Ok(Vec::new())
+            }
+        }
+    }.await;
+    session.close();
+    drop(session);
+    let _ = timeout(&*runtime, Duration::from_secs(10), pc.close()).await;
+    let cleanup = wait_device_closed(&monitor.device_status).await;
+    let proof = result?;
+    cleanup?;
+    let metrics = monitor.fresh_snapshot()?;
+    // Firmware resets this counter for each offer; subtracting the previous
+    // session's count can hide acceptance in the replay-negative session.
+    let accepted_bytes = metrics.application_bytes_received;
+    if authorized_case {
+        ensure!(
+            accepted_bytes > 0,
+            "authorized M1.3 session did not deliver application test payloads"
+        );
+    } else {
+        ensure!(
+            accepted_bytes == 0,
+            "ESP32 accepted application data before successful authorization"
+        );
+    }
+    Ok(proof)
+}
+
+async fn echo_signaling(
+    runtime: &dyn Runtime,
+    channel: &Arc<dyn DataChannel>,
+    label: &str,
+    count: u32,
+) -> Result<()> {
+    let mut rtts = Vec::with_capacity(count as usize);
+    for sequence in 0..count {
+        let payload = format!("kvmctl-m1.3-{label}:{sequence:06}");
+        let sent = Instant::now();
+        channel.send(BytesMut::from(payload.as_bytes())).await?;
+        loop {
+            match timeout(runtime, Duration::from_secs(5), channel.poll())
+                .await
+                .map_err(|_| anyhow::anyhow!("{label} M1.3 echo timeout"))?
+            {
+                Some(DataChannelEvent::OnMessage(message)) => {
+                    ensure!(
+                        message.data.as_ref() == payload.as_bytes(),
+                        "{label} M1.3 echo mismatch"
+                    );
+                    rtts.push(sent.elapsed().as_micros());
+                    break;
+                }
+                Some(DataChannelEvent::OnClose) | None => bail!("{label} M1.3 channel closed"),
+                _ => ensure!(
+                    sent.elapsed() < Duration::from_secs(5),
+                    "{label} M1.3 echo timeout"
+                ),
+            }
+        }
+    }
+    eprintln!(
+        "M1.3 CHANNEL label={label} reliable={} ordered={} messages={} rtt_min_us={} rtt_max_us={}",
+        channel.max_retransmits().await?.is_none()
+            && channel.max_packet_life_time().await?.is_none(),
+        channel.ordered().await?,
+        count,
+        rtts.iter().min().unwrap(),
+        rtts.iter().max().unwrap()
+    );
+    Ok(())
+}
+
+async fn wait_device_closed(device_status: &AtomicU8) -> Result<()> {
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while Instant::now() < deadline {
+        if device_status.load(Ordering::Acquire) == 0 {
+            return Ok(());
+        }
+        std::thread::sleep(Duration::from_millis(100));
+    }
+    bail!(
+        "ESP32 transport did not return to idle after WSS close (state={})",
+        device_status.load(Ordering::Acquire)
+    );
+}
+
+fn read_until_closed(stream: &mut TcpStream, deadline: Instant, label: &str) -> Result<()> {
+    stream.set_read_timeout(Some(Duration::from_millis(500)))?;
+    let mut byte = [0u8; 64];
+    loop {
+        match stream.read(&mut byte) {
+            Ok(0) => return Ok(()),
+            Ok(_) => {}
+            Err(error)
+                if matches!(
+                    error.kind(),
+                    std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut
+                ) =>
+            {
+                if Instant::now() >= deadline {
+                    bail!("stalled TLS socket `{label}` exceeded its handshake deadline");
+                }
+            }
+            Err(error)
+                if matches!(
+                    error.kind(),
+                    std::io::ErrorKind::ConnectionReset
+                        | std::io::ErrorKind::ConnectionAborted
+                        | std::io::ErrorKind::NotConnected
+                ) =>
+            {
+                return Ok(());
+            }
+            Err(error) => return Err(error.into()),
+        }
+    }
+}
+
+async fn run_resource_test(
+    runtime: &dyn Runtime,
+    control: &Arc<dyn DataChannel>,
+    motion: &Arc<dyn DataChannel>,
+    monitor: &PortMonitor,
+    address: SocketAddr,
+    hostname: &str,
+    status: &crate::Status,
+    credential: &crate::credentials::ClientCredential,
+) -> Result<()> {
+    echo_signaling(runtime, control, "control-before-resource-test", 1).await?;
+    echo_signaling(runtime, motion, "motion-before-resource-test", 1).await?;
+    let mut stalled = TcpStream::connect_timeout(&address, Duration::from_secs(5))?;
+    std::thread::sleep(Duration::from_millis(150));
+
+    let endpoint = status.identity_fingerprint;
+    let tls_pin = status.tls_spki_hash;
+    let address_copy = address;
+    let host_copy = hostname.to_owned();
+    let (probe_tx, probe_rx) = std::sync::mpsc::channel();
+    let cap_probe = std::thread::spawn(move || {
+        let result = match crate::credentials::ClientCredential::generate() {
+            Ok(outsider) => crate::signaling::Session::connect(
+                address_copy,
+                &host_copy,
+                endpoint,
+                tls_pin,
+                &outsider,
+            )
+            .map(|mut session| {
+                session.close();
+            })
+            .map_err(anyhow::Error::msg),
+            Err(error) => Err(anyhow::Error::msg(error)),
+        };
+        let _ = probe_tx.send(result);
+    });
+    match probe_rx.recv_timeout(Duration::from_secs(2)) {
+        Ok(Ok(())) => {
+            bail!(
+                "a third WSS handshake completed while an active session and stalled TLS socket occupied both slots"
+            )
+        }
+        Ok(Err(error)) if error.to_string().contains("unauthorized") => {
+            bail!(
+                "a third WSS handshake reached client authorization while an active session and stalled TLS socket occupied both slots"
+            )
+        }
+        Ok(Err(_)) | Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {}
+        Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
+            bail!("TLS socket-cap probe stopped unexpectedly")
+        }
+    }
+
+    let deadline = Instant::now() + Duration::from_secs(8);
+    read_until_closed(&mut stalled, deadline, "B")?;
+    let probe = probe_rx.recv_timeout(Duration::from_secs(2)).map_err(|_| {
+        anyhow::anyhow!("third TLS/WSS connection did not recover after stalled handshakes expired")
+    })?;
+    ensure!(
+        probe.is_err(),
+        "third WSS probe unexpectedly authenticated without a client credential"
+    );
+    cap_probe
+        .join()
+        .map_err(|_| anyhow::anyhow!("TLS socket-cap probe panicked"))?;
+    eprintln!(
+        "M1.3 RESOURCE active_wss=1 stalled_tls=1 deadline_closed=true concurrent_socket_cap=2 third_completed_while_stalled=false"
+    );
+    echo_signaling(runtime, control, "control-after-stalled-tls", 1).await?;
+    echo_signaling(runtime, motion, "motion-after-stalled-tls", 1).await?;
+
+    let rate_limit_baseline = monitor.fresh_snapshot()?.tls_rate_limited;
+    let mut completed_unauthorized = 0usize;
+    let mut throttled = None;
+    for attempt in 0..8 {
+        let outsider =
+            crate::credentials::ClientCredential::generate().map_err(anyhow::Error::msg)?;
+        match crate::signaling::Session::connect(address, hostname, endpoint, tls_pin, &outsider) {
+            Err(error) if error.contains("unauthorized") => completed_unauthorized += 1,
+            Err(error) => {
+                let rate_limited = monitor.fresh_snapshot()?.tls_rate_limited;
+                let count =
+                    checked_rate_limit_delta(rate_limit_baseline, rate_limited, attempt + 1)
+                        .with_context(|| {
+                            format!(
+                                "WSS flood failed without firmware rate-limit evidence: {error}"
+                            )
+                        })?;
+                throttled = Some((Instant::now(), error, count));
+                break;
+            }
+            Ok(mut session) => {
+                session.close();
+                bail!("un-enrolled resource-flood client authenticated");
+            }
+        }
+        if attempt < 7 {
+            std::thread::sleep(Duration::from_millis(100));
+        }
+    }
+    ensure!(
+        completed_unauthorized > 0,
+        "handshake flood did not complete any baseline WSS authentication attempts"
+    );
+    let (throttled_at, throttle_error, rate_limit_count) = throttled.ok_or_else(|| {
+        anyhow::anyhow!(
+            "eight rapid WSS handshakes were not rate limited; last attempt remained unauthorized"
+        )
+    })?;
+    eprintln!(
+        "M1.3 RESOURCE handshake_flood_attempts={} completed_before_limit={} throttled=true firmware_rate_limit_delta={} diagnostic={}",
+        completed_unauthorized + 1,
+        completed_unauthorized,
+        rate_limit_count,
+        throttle_error
+    );
+    echo_signaling(runtime, control, "control-after-handshake-flood", 1).await?;
+    echo_signaling(runtime, motion, "motion-after-handshake-flood", 1).await?;
+
+    let recovery_deadline = throttled_at + Duration::from_secs(15);
+    let mut recovered_session = None;
+    while Instant::now() < recovery_deadline {
+        match crate::signaling::Session::connect(address, hostname, endpoint, tls_pin, credential) {
+            Ok(session) => {
+                recovered_session = Some(session);
+                break;
+            }
+            Err(_) => std::thread::sleep(Duration::from_secs(1)),
+        }
+    }
+    let mut recovered_session = recovered_session
+        .ok_or_else(|| anyhow::anyhow!("WSS admission did not recover after token refill"))?;
+    recovered_session
+        .probe_oversized_reassembly()
+        .map_err(anyhow::Error::msg)?;
+    recovered_session.close();
+    echo_signaling(runtime, control, "control-after-oversized-wss", 1).await?;
+    echo_signaling(runtime, motion, "motion-after-oversized-wss", 1).await?;
+    eprintln!("M1.3 RESOURCE handshake_recovery=true partial_message_over_limit=rejected");
+    Ok(())
+}
+
+fn checked_rate_limit_delta(before: u32, after: u32, attempts: u32) -> Result<u32> {
+    let delta = after.wrapping_sub(before);
+    ensure!(
+        delta > 0 && delta <= attempts,
+        "firmware TLS rate-limit counter did not advance within the flood attempt count"
+    );
+    Ok(delta)
+}
+
+pub(crate) fn run_signaling_test(
+    port: crate::serial::Port,
+    service: &crate::discovery::Service,
+    status: crate::Status,
+    credential: crate::credentials::ClientCredential,
+    scenario: &str,
+) -> Result<()> {
+    ensure!(
+        matches!(
+            scenario,
+            "success" | "missing" | "invalid" | "replay" | "resources" | "revoke-active"
+        ),
+        "unknown signaling-test scenario"
+    );
+    install_certificate_log()?;
+    let address = crate::discovery::socket_address(service).map_err(anyhow::Error::msg)?;
+    let hostname = service.hostname.clone();
+    let monitor = PortMonitor::start(port);
+    let runtime = default_runtime().context("no WebRTC runtime")?;
+    let mut result: Option<Result<()>> = None;
+    runtime.block_on(Box::pin(async {
+        result = Some(
+            async {
+                match scenario {
+                    "success" => {
+                        let _proof = exchange_signaling(
+                            runtime.clone(),
+                            &monitor,
+                            address,
+                            &hostname,
+                            &status,
+                            &credential,
+                            TranscriptProofCase::Valid {
+                                check_isolation: true,
+                                check_resources: false,
+                                revoke_after_authorization: false,
+                            },
+                        )
+                        .await?;
+                    }
+                    "missing" => {
+                        let _proof = exchange_signaling(
+                            runtime.clone(),
+                            &monitor,
+                            address,
+                            &hostname,
+                            &status,
+                            &credential,
+                            TranscriptProofCase::Missing,
+                        )
+                        .await?;
+                    }
+                    "invalid" => {
+                        let _proof = exchange_signaling(
+                            runtime.clone(),
+                            &monitor,
+                            address,
+                            &hostname,
+                            &status,
+                            &credential,
+                            TranscriptProofCase::Invalid,
+                        )
+                        .await?;
+                    }
+                    "replay" => {
+                        let valid = exchange_signaling(
+                            runtime.clone(),
+                            &monitor,
+                            address,
+                            &hostname,
+                            &status,
+                            &credential,
+                            TranscriptProofCase::Valid {
+                                check_isolation: false,
+                                check_resources: false,
+                                revoke_after_authorization: false,
+                            },
+                        )
+                        .await?;
+                        let _ = exchange_signaling(
+                            runtime.clone(),
+                            &monitor,
+                            address,
+                            &hostname,
+                            &status,
+                            &credential,
+                            TranscriptProofCase::Replayed(&valid),
+                        )
+                        .await?;
+                    }
+                    "resources" => {
+                        let _proof = exchange_signaling(
+                            runtime.clone(),
+                            &monitor,
+                            address,
+                            &hostname,
+                            &status,
+                            &credential,
+                            TranscriptProofCase::Valid {
+                                check_isolation: false,
+                                check_resources: true,
+                                revoke_after_authorization: false,
+                            },
+                        )
+                        .await?;
+                    }
+                    "revoke-active" => {
+                        let _proof = exchange_signaling(
+                            runtime.clone(),
+                            &monitor,
+                            address,
+                            &hostname,
+                            &status,
+                            &credential,
+                            TranscriptProofCase::Valid {
+                                check_isolation: false,
+                                check_resources: false,
+                                revoke_after_authorization: true,
+                            },
+                        )
+                        .await?;
+                    }
+                    _ => unreachable!(),
+                }
+                Ok(())
+            }
+            .await,
+        );
+    }));
+    let result = result.context("runtime did not execute")?;
+    let (port, metrics, usb_admin_ok) = monitor.finish()?;
+    let _ = port;
+    if let Err(error) = result {
+        let diagnostic = &metrics.tls_diagnostic[..metrics.tls_diagnostic_len];
+        if !diagnostic.is_empty() {
+            return Err(anyhow::Error::msg(format!(
+                "{error}; ESP TLS diagnostic: {}",
+                String::from_utf8_lossy(diagnostic)
+            )));
+        }
+        return Err(error);
+    }
+    ensure!(
+        usb_admin_ok,
+        "USB status administration stopped responding during signaling checks"
+    );
+    eprintln!(
+        "M1.3 RESOURCE scenario={scenario} state={} internal_free_start_bytes={} internal_free_min_bytes={} internal_free_after_bytes={} psram_free_start_bytes={} psram_free_min_bytes={} psram_free_after_bytes={} device_application_bytes_received={}",
+        metrics.state,
+        metrics.internal_free_start,
+        metrics.internal_free_min,
+        metrics.internal_free_end,
+        metrics.psram_free_start,
+        metrics.psram_free_min,
+        metrics.psram_free_end,
+        metrics.application_bytes_received,
+    );
+    eprintln!(
+        "M1.3 SIGNALING COMPLETE scenario={scenario} hid_reports=0 physical_input_capture=off"
+    );
     Ok(())
 }
 
@@ -547,11 +1362,24 @@ mod tests {
     use super::*;
 
     #[test]
+    fn rate_limit_evidence_requires_counter_advance_and_handles_wrap() {
+        assert_eq!(checked_rate_limit_delta(7, 8, 1).unwrap(), 1);
+        assert_eq!(checked_rate_limit_delta(u32::MAX, 0, 1).unwrap(), 1);
+        assert!(checked_rate_limit_delta(7, 7, 8).is_err());
+        assert!(checked_rate_limit_delta(7, 0, 8).is_err());
+        assert!(checked_rate_limit_delta(7, 9, 1).is_err());
+    }
+
+    #[test]
     fn fingerprint_parser_fails_closed() {
         let digest = [0xab; 32];
         let line = format!(
             "a=fingerprint:sha-256 {}",
-            digest.iter().map(|byte| format!("{byte:02X}")).collect::<Vec<_>>().join(":")
+            digest
+                .iter()
+                .map(|byte| format!("{byte:02X}"))
+                .collect::<Vec<_>>()
+                .join(":")
         );
         let sdp = format!("v=0\r\n{line}\r\n");
         assert_eq!(parse_sha256_fingerprint(&sdp).unwrap(), digest);
@@ -576,9 +1404,11 @@ mod tests {
         let sdp = "v=0\r\na=fingerprint:sha-256 00:11\r\n";
         let missing = apply_test_fingerprint_fault(sdp, Some("missing")).unwrap();
         assert!(!missing.contains("a=fingerprint:"));
-        assert!(apply_test_fingerprint_fault(sdp, Some("malformed"))
-            .unwrap()
-            .contains("a=fingerprint:sha-256 invalid\r\n"));
+        assert!(
+            apply_test_fingerprint_fault(sdp, Some("malformed"))
+                .unwrap()
+                .contains("a=fingerprint:sha-256 invalid\r\n")
+        );
         assert_eq!(
             apply_test_fingerprint_fault(sdp, Some("duplicate"))
                 .unwrap()

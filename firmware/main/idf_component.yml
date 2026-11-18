@@ -5,5 +5,8 @@ dependencies:
     override_path: "${KVMCTL_PEER_SOURCE}"
   espressif/esp_libsrtp:
     version: "==1.0.0"
+    override_path: "${KVMCTL_LIBSRTP_SOURCE}"
   espressif/led_strip:
     version: "3.0.3"
+  espressif/mdns:
+    version: "==1.14.1"

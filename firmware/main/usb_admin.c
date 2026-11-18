@@ -1,6 +1,7 @@
 #include "usb_admin.h"
 
 #include "device_identity.h"
+#include "client_auth.h"
 #include "driver/uart.h"
 #include "esp_app_desc.h"
 #include "esp_err.h"
@@ -19,6 +20,10 @@
 #define ADMIN_VERSION_MINOR 0
 #define ADMIN_WIFI_SET 0x60
 #define ADMIN_STATUS 0x61
+#define ADMIN_ENROLL 0x62
+#define ADMIN_LIST_CLIENTS 0x63
+#define ADMIN_REVOKE_CLIENT 0x64
+#define ADMIN_REVOKE_ALL 0x65
 #define ADMIN_LED_SET 0x66
 #define ADMIN_TRANSPORT_OFFER 0x67
 #define ADMIN_TRANSPORT_CLOSE 0x68
@@ -42,6 +47,8 @@ typedef struct {
     bool led_enabled;
     uint8_t led_brightness;
     uint8_t led_rgb[3];
+    uint8_t client_spki[CLIENT_AUTH_SPKI_BYTES];
+    uint8_t client_fingerprint[CLIENT_AUTH_FINGERPRINT_BYTES];
     const uint8_t *offer;
     size_t offer_len;
 } admin_request_t;
@@ -216,6 +223,19 @@ static request_decode_result_t decode_request(const uint8_t *data, size_t len,
     if (request->command == ADMIN_STATUS) {
         return read_map(&r, 0) && r.pos == r.len ? REQUEST_SUPPORTED : REQUEST_INVALID;
     }
+    if (request->command == ADMIN_ENROLL) {
+        return read_map(&r, 1) && read_expected_uint(&r, 0) &&
+               read_bytes(&r, request->client_spki, sizeof(request->client_spki)) &&
+               r.pos == r.len ? REQUEST_SUPPORTED : REQUEST_INVALID;
+    }
+    if (request->command == ADMIN_LIST_CLIENTS || request->command == ADMIN_REVOKE_ALL) {
+        return read_map(&r, 0) && r.pos == r.len ? REQUEST_SUPPORTED : REQUEST_INVALID;
+    }
+    if (request->command == ADMIN_REVOKE_CLIENT) {
+        return read_map(&r, 1) && read_expected_uint(&r, 0) &&
+               read_bytes(&r, request->client_fingerprint, sizeof(request->client_fingerprint)) &&
+               r.pos == r.len ? REQUEST_SUPPORTED : REQUEST_INVALID;
+    }
     if (request->command == ADMIN_WIFI_SET) {
         return read_map(&r, 2) && read_expected_uint(&r, 0) &&
                read_bounded_string(&r, 3, request->ssid, sizeof(request->ssid), &request->ssid_len) &&
@@ -312,7 +332,7 @@ static size_t encode_transport_status_response(const admin_request_t *request)
     transport_metrics_t metrics;
     transport_get_metrics(&metrics);
     if (!begin_response(request, 0, true, &pos) ||
-        !put_head(s_response, sizeof(s_response), &pos, 5, 10) ||
+        !put_head(s_response, sizeof(s_response), &pos, 5, 12) ||
         !put_uint(s_response, sizeof(s_response), &pos, 0) || !put_uint(s_response, sizeof(s_response), &pos, metrics.state) ||
         !put_uint(s_response, sizeof(s_response), &pos, 1) || !put_uint(s_response, sizeof(s_response), &pos, metrics.internal_free_start) ||
         !put_uint(s_response, sizeof(s_response), &pos, 2) || !put_uint(s_response, sizeof(s_response), &pos, metrics.internal_free_min) ||
@@ -322,7 +342,9 @@ static size_t encode_transport_status_response(const admin_request_t *request)
         !put_uint(s_response, sizeof(s_response), &pos, 6) || !put_uint(s_response, sizeof(s_response), &pos, metrics.psram_free_end) ||
         !put_uint(s_response, sizeof(s_response), &pos, 7) || !put_uint(s_response, sizeof(s_response), &pos, metrics.channel_opens) ||
         !put_uint(s_response, sizeof(s_response), &pos, 8) || !put_uint(s_response, sizeof(s_response), &pos, metrics.application_bytes_received) ||
-        !put_uint(s_response, sizeof(s_response), &pos, 9) || !put_uint(s_response, sizeof(s_response), &pos, metrics.peer_task_cpu_us)) return 0;
+        !put_uint(s_response, sizeof(s_response), &pos, 9) || !put_uint(s_response, sizeof(s_response), &pos, metrics.peer_task_cpu_us) ||
+        !put_uint(s_response, sizeof(s_response), &pos, 10) || !put_text(s_response, sizeof(s_response), &pos, metrics.tls_diagnostic) ||
+        !put_uint(s_response, sizeof(s_response), &pos, 11) || !put_uint(s_response, sizeof(s_response), &pos, metrics.tls_rate_limited)) return 0;
     return pos;
 }
 
@@ -334,6 +356,33 @@ static size_t encode_text_result(const admin_request_t *request, const uint8_t *
         len > sizeof(s_response) - pos) return 0;
     memcpy(s_response + pos, text, len);
     return pos + len;
+}
+
+static size_t encode_error(const admin_request_t *request, uint64_t code);
+
+static size_t encode_client_fingerprint(const admin_request_t *request, const uint8_t fingerprint[32])
+{
+    size_t pos;
+    if (!begin_response(request, 0, true, &pos) ||
+        !put_bytes(s_response, sizeof(s_response), &pos, fingerprint, 32)) return 0;
+    return pos;
+}
+
+static size_t encode_client_list(const admin_request_t *request)
+{
+    uint8_t fingerprints[CLIENT_AUTH_MAX_CLIENTS][CLIENT_AUTH_FINGERPRINT_BYTES];
+    size_t count = 0, pos;
+    if (client_auth_list(fingerprints, &count) != ESP_OK) return encode_error(request, 6);
+    if (!begin_response(request, 0, true, &pos) ||
+        !put_head(s_response, sizeof(s_response), &pos, 4, count)) return 0;
+    for (size_t i = 0; i < count; ++i) {
+        if (!put_bytes(s_response, sizeof(s_response), &pos, fingerprints[i], sizeof(fingerprints[i]))) {
+            mbedtls_platform_zeroize(fingerprints, sizeof(fingerprints));
+            return 0;
+        }
+    }
+    mbedtls_platform_zeroize(fingerprints, sizeof(fingerprints));
+    return pos;
 }
 
 static size_t encode_error(const admin_request_t *request, uint64_t code)
@@ -368,6 +417,27 @@ static size_t encode_status_response(const admin_request_t *request)
 static size_t dispatch_request(admin_request_t *request)
 {
     if (request->command == ADMIN_STATUS) return encode_status_response(request);
+    if (request->command == ADMIN_ENROLL) {
+        esp_err_t err = client_auth_enroll(request->client_spki, sizeof(request->client_spki),
+                                           request->client_fingerprint);
+        size_t len = err == ESP_OK ? encode_client_fingerprint(request, request->client_fingerprint) : 0;
+        mbedtls_platform_zeroize(request->client_spki, sizeof(request->client_spki));
+        mbedtls_platform_zeroize(request->client_fingerprint, sizeof(request->client_fingerprint));
+        if (len != 0) return len;
+        return encode_error(request, err == ESP_ERR_INVALID_STATE ? 3 :
+                            err == ESP_ERR_NO_MEM ? 5 : err == ESP_ERR_INVALID_ARG ? 1 : 6);
+    }
+    if (request->command == ADMIN_LIST_CLIENTS) return encode_client_list(request);
+    if (request->command == ADMIN_REVOKE_CLIENT) {
+        esp_err_t err = client_auth_revoke(request->client_fingerprint);
+        mbedtls_platform_zeroize(request->client_fingerprint, sizeof(request->client_fingerprint));
+        return err == ESP_OK ? encode_empty_result(request) :
+               encode_error(request, err == ESP_ERR_NOT_FOUND ? 2 : 6);
+    }
+    if (request->command == ADMIN_REVOKE_ALL) {
+        esp_err_t err = client_auth_revoke_all();
+        return err == ESP_OK ? encode_empty_result(request) : encode_error(request, 6);
+    }
     if (request->command == ADMIN_WIFI_SET) {
         esp_err_t err = wifi_setup_provision(request->ssid, request->ssid_len,
                                              request->passphrase, request->passphrase_len);

@@ -265,6 +265,178 @@ A separate Rust peer and USB bridge in `verification/m0/rust-peer` build offline
 
 The [certificate-fixture test design](../verification/m0/peer-fingerprint/certificate-tests.md) specifies unit and integration cases with synthetic certificates A/B, expected matching/mismatching identities, and explicit pass/fail evidence. DTLS fingerprints cover the full certificate; WSS pins cover SPKI and additionally enforce SAN, validity, and handshake signatures. Product DTLS fixture cases are recorded below; WSS certificate validation remains M1.3 work.
 
+### M1.3 implementation progress (2026-11-17; open)
+
+Updated [execution-plan.md](execution-plan.md) and [design.md](design.md) acceptance
+with the review findings. Firmware implements an NVS-backed store for 8 independent
+P-256 client public keys, USB enroll/list/revoke/revoke-all, active-session
+invalidation, signed challenge/transcript proofs, replay/version checks, pinned
+HTTPS/WSS identity, DNS-SD advertisement, competing-offer busy rejection, and an
+application gate that requires client authorization, both transcript proofs, open
+DTLS channels, and peer identity checks. TLS uses a two-socket cap, a 4-token
+ClientHello-stage bucket with one token refilled every 10 seconds, a 5-second TLS
+deadline, a 15-second proof deadline, and 16-KiB message reassembly bound. The
+certificate-selection callback enforces the handshake bucket before certificate
+selection. USB metrics expose bounded TLS diagnostics without printing onto the
+framed administration UART.
+
+The Windows client uses DPAPI-protected independent credentials, persistence/reload,
+pinned TLS SPKI/SAN/validity/self-signature checks, signed signaling, Windows DNS-SD
+browse/resolve, identity matching to USB status, and `signaling-test` scenarios for
+success, missing/invalid/replayed proofs, session isolation, bounded resources, and
+active revocation. Negative proof scenarios send application data before authorization
+and require zero accepted bytes and no echo. Raw USB `transport-test` sends no
+application payloads. `cargo test --workspace --offline --target
+x86_64-pc-windows-msvc` passed all 33 tests; `cargo fmt --all -- --check` passed.
+Coverage includes shared C/Rust vectors, TLS pin/SAN/expiry/signature rejection,
+DPAPI persistence/reload, and DNS-SD identity/address parsing. An independent
+firmware-guard review run passed; a local rerun could not compile because Espressif's
+clang lacks an x86_64 MSVC target and no MSVC C compiler is installed.
+
+ESP-IDF 6.1.1 built ESP32-S3 N16R8 image `firmware/build/kvmctl_firmware.bin` at
+1,245,920 bytes (0x1302e0), leaving 19% of the 0x177000-byte factory app partition
+free. COM6 app-only backup/flash/verify succeeded at factory app offset 0x10000;
+bootloader, partition table, and NVS were not flashed. USB status reports Wi-Fi
+connected, endpoint fingerprint `e299faff8cb8d99166647efa72a1a2354a4b5271c8f3369e70ef584088926fe0`,
+and TLS SPKI hash `de97023d354e8a2bb7daa7d0ebd5fac8625fa5710cc9a6b27256c0e9e55ff56d`.
+USB enrollment and client listing succeeded from two separate temporary DPAPI
+profiles, `%TEMP%\kvmctl-m13-profile` and
+`%TEMP%\kvmctl-m13-client-b-profile`, with independent fingerprints
+`d0a144fed5cf59ec8e809a1bb24600082b4df74d1a9aadb6f524b11069c34929` and
+`02cf5f66a59fe3917d4b816b11376bb6051a6eefbf7157d9326a1712dc3b1129`. Both clients
+were still listed after separate `cargo run` processes. The managed sandbox could not
+write the user's normal `%LOCALAPPDATA%` profile, so this does not verify that profile
+or another Windows account. USB per-client revoke and revoke-all both succeeded;
+after revoke-all, listing returned no clients. The two test clients were then
+re-enrolled and are the current device list.
+
+`cargo run --offline -p kvmctl -- discover COM6` found no `_kvmctl._tcp.local`
+service. Direct IP `192.168.50.137` is reachable over Ethernet with Surfshark
+active, and TCP port 443 accepts connections. The first live TLS attempts exposed
+an ESP-IDF certificate-selection callback contract: it must attach the certificate
+and private key to each handshake. Firmware parses the existing generated
+certificate, wraps the same PSA key, and attaches both in the rate-limit callback.
+The initial TLS 1.2 handshake still failed. A read-only GPT-6.1 review traced that
+failure to the TLS private key's PSA algorithm policy: ESP-IDF enables deterministic
+ECDSA, while the TLS key had been imported for randomized ECDSA. Firmware now
+imports the same persistent TLS key with
+`MBEDTLS_PK_ALG_ECDSA(PSA_ALG_SHA_256)`; endpoint identity signing policy, key bytes,
+certificate, and SPKI pin are unchanged. Startup checks that the TLS key policy is
+compatible with Mbed TLS. A clean ESP-IDF 6.1.1 rebuild was app-only flashed and
+verified on COM6; bootloader, partition table, and NVS were not flashed.
+
+Using a Python TLS 1.2 probe against the flashed board, the full SAN hostname
+`kvmctl-e299faff8cb8d991.local` completed TLS with
+`ECDHE-ECDSA-AES128-GCM-SHA256`; the TLS stack verified the board certificate when
+explicitly trusted as a root. The same certificate was rejected for
+`wrong-host.invalid`. A WSS request to `/v1/ws` with subprotocol `kvmctl.v1` returned
+`101 Switching Protocols`. This validates the board's TLS handshake, certificate
+hostname check, and HTTP Upgrade, but does not exercise the Rust client's SPKI pin
+validation or client authorization/transcript proofs. The probe closed the WSS
+socket after Upgrade; a subsequent direct USB status query on COM6 returned its
+146-byte response. No WebRTC/DTLS session was established, so application gating,
+session isolation with an active peer, and negative proof acceptance remain
+unverified on hardware.
+
+The final rebuilt image SHA-256 is
+`13c5eae7cd79aeaaefd29f18e43e2163aee7101b3613a7c795a86f2cf8f569a5`. Before this
+flash, COM6's full 0x177000-byte app partition was saved as
+`firmware/backups/m1.3-before-final-com6-20261117.bin`, SHA-256
+`8cdc8cdcc167c2414659d64cd73a32bdf479ce2fa33aaab1a06c493753061f3f`. esptool
+verified the written image hash and hard-reset the board. A fresh post-flash
+Python probe accepted `kvmctl-e299faff8cb8d991.local` under TLS 1.2, rejected
+`wrong-host.invalid` (hostname verification error 62), and received
+`HTTP/1.1 101 Switching Protocols` with `kvmctl.v1`. This raw TLS/WSS handshake
+did not exercise the Rust client's pinning or authenticated signaling. USB status
+and WebRTC/DTLS were not checked after this final flash.
+
+### Latest live acceptance run (2026-11-17)
+
+This section supersedes the earlier progress notes above where Rust-client pinning,
+authenticated WSS/DTLS, active revocation, and combined-heap evidence were still
+pending.
+
+The current app-only image is 1,246,128 bytes, SHA-256
+`3af2d2a90af7f9e40aef5cc693dc3c57a8e12b4ce8916e89807e18d8b134b84a`; it leaves
+19% of the 0x177000-byte app partition free. It was flashed and verified on COM6;
+bootloader, partition table, and NVS were not written. The generated config enables
+`CONFIG_HTTPD_WS_POST_HANDSHAKE_CB_SUPPORT`. This callback was required because the
+pinned ESP-IDF HTTP server completes a WebSocket Upgrade without calling the normal
+URI handler; the callback now initializes bounded session buffers before the first
+frame. The Rust client and firmware also use separate endpoint-challenge and
+client-proof signing domains, preventing signature reflection.
+
+Using `cargo run --offline -p kvmctl -- signaling-test ...` against direct board IP
+`192.168.50.137`, the Rust client verified the pinned WSS certificate and completed
+real TLS/WSS, SDP, DTLS, transcript authorization, and DataChannel exchange. The
+device identity remained `e299faff8cb8d99166647efa72a1a2354a4b5271c8f3369e70ef584088926fe0`
+with TLS SPKI pin
+`de97023d354e8a2bb7daa7d0ebd5fac8625fa5710cc9a6b27256c0e9e55ff56d`. Success
+reported `AUTHORIZED client_proof=valid endpoint_transcript=verified
+dtls_identity=verified`. While client A remained active, an unenrolled client was
+rejected, an enrolled client with an invalid challenge proof was rejected, and a
+competing authenticated offer returned `busy`; A continued echoing on both channels
+after each attempt.
+
+The `missing`, `invalid`, and `replay` scenarios each established DTLS, sent
+application payloads before proof, and observed no echo and zero accepted application
+bytes. Invalid and replayed proofs were rejected as unauthorized. The `revoke-active`
+scenario authorized client B, exchanged payloads, revoked B over USB during the live
+session, observed the device return to idle and stop echoing post-revocation payloads,
+then confirmed B's next WSS login was unauthorized. USB `revoke all` returned an
+empty client list; the two independent test clients were then re-enrolled and are
+currently listed. HID output and physical-input capture remained disabled.
+
+The `resources` scenario kept an authorized session alive while a stalled TLS socket
+occupied the second slot, verified the socket cap and handshake deadline, applied a
+rapid unauthorized-handshake flood until the firmware rate limiter advanced, rejected
+an oversized fragmented WSS message, and verified recovery plus continued USB
+administration. Its combined WSS/WebRTC sample measured internal heap free
+167,179/52,039/141,803 bytes (start/minimum/after) and PSRAM free
+8,350,752/7,915,548/8,350,752 bytes. The success run's internal minimum was 56,595
+bytes; PSRAM minimum was 7,915,548 bytes. These establish initial caps for the
+tested bounded scenarios, not sustained-load limits; broader load work remains M1.4.
+
+Windows DNS-SD browse returns no `_kvmctl._tcp.local` services after a five-second
+window, both with all interfaces and with explicit Ethernet interface index 12.
+`Resolve-DnsName` also
+returns no A record. A direct unicast PTR query from host Ethernet `192.168.50.2` to
+the board's `192.168.50.137:5353` did receive and decode the service records:
+`KVMCTL._kvmctl._tcp.local`, SRV `kvmctl-e299faff8cb8d991.local:443`, TXT `v=1`,
+`path=/v1/ws`, the expected endpoint fingerprint, and A `192.168.50.137`. This
+proves the firmware publishes the correct DNS-SD data and answers unicast mDNS.
+
+The Windows DNS Client service has enabled inbound mDNS UDP 5353 rules, but the
+Windows browse still sees no record. The raw multicast probe used a Python process;
+Windows' inbound mDNS rules are scoped to `svchost.exe`/`dnscache`, so that probe is
+not evidence that the firmware failed to answer multicast. The remaining issue is
+multicast discovery delivery/consumption on this network. The user confirms the PC's
+LAN Ethernet is connected to the network serving the board; it uses
+`192.168.50.2/24`, reaches the board, and returns the unicast DNS-SD records. Windows
+browse still sees no record on that Ethernet interface. The PC's separate Wi-Fi
+address `172.16.0.228` is on another subnet and is not needed for this test; a
+source-bound Wi-Fi TCP/443 probe to the board failed. Direct WSS by IP works over
+Ethernet while Surfshark WireGuard is active, but this does not prove the tunneled-VPN
+path. Multicast forwarding or Windows DNS-SD consumption remains unresolved.
+The PC does not need to switch to Wi-Fi: unicast confirms the board's records once its
+IP is known, while automatic DNS-SD service discovery is the remaining multicast-browse
+check across the PC Ethernet and board Wi-Fi network path.
+
+`cargo fmt --all -- --check` and
+`cargo test --workspace --offline --target x86_64-pc-windows-msvc` passed (33 tests).
+The independent firmware guard harness passed in reviewer execution; a local rerun
+could not build because the installed Espressif clang lacks an x86_64 MSVC target and
+no MSVC C compiler is installed. Persistence was exercised in two temporary DPAPI
+profiles across multiple processes, but the normal user profile and another Windows
+account were not tested. A sample boot log still reports the previously documented
+bootloader SHA comparison warning before continuing into the verified firmware.
+
+M1.3 remains open. Windows DNS-SD browse consumption on a verified multicast path,
+client Wi-Fi-interface signaling, normal-profile and cross-user DPAPI behavior, and
+remaining network/hardware checks are outstanding. The firmware advertisement and
+record contents are verified by direct unicast mDNS. M1.2 DTLS certificate enforcement
+remains unchanged. See [execution-plan.md](execution-plan.md) for the acceptance gate.
+
 ### M1.2 transport implementation and patched backend gate (2026-11-16)
 
 The backend remains Espressif `esp_peer` 1.5.3 from `esp-webrtc-solution`

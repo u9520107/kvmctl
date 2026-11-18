@@ -8,6 +8,8 @@
 #include "esp_heap_caps.h"
 #include "esp_log.h"
 #include "esp_peer_default.h"
+#include "client_auth.h"
+#include "mbedtls/platform_util.h"
 #include "wifi_setup.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/event_groups.h"
@@ -35,17 +37,25 @@ static atomic_bool s_active;
 static atomic_bool s_close_requested;
 static atomic_bool s_failed;
 static atomic_bool s_identity_rejected;
+static atomic_bool s_application_authorized;
+static uint8_t s_active_client_fingerprint[32];
+static uint32_t s_generation;
+static portMUX_TYPE s_client_fingerprint_mux = portMUX_INITIALIZER_UNLOCKED;
 static atomic_bool s_heap_monitor;
 static atomic_uint s_open_channels;
 static atomic_uint s_channel_opens;
 static atomic_uint s_application_bytes_received;
 static atomic_uint s_peer_task_cpu_us;
+static atomic_uint s_tls_rate_limited;
 static atomic_uint s_internal_free_start;
 static atomic_uint s_internal_free_min;
 static atomic_uint s_internal_free_end;
 static atomic_uint s_psram_free_start;
 static atomic_uint s_psram_free_min;
 static atomic_uint s_psram_free_end;
+static portMUX_TYPE s_tls_diagnostic_mux = portMUX_INITIALIZER_UNLOCKED;
+static char s_tls_diagnostic[TRANSPORT_DIAGNOSTIC_CAPACITY];
+static uint8_t s_tls_diagnostic_priority;
 static char s_offer[SDP_CAPACITY + 1];
 static uint8_t s_answer[SDP_CAPACITY + 1];
 static size_t s_answer_len;
@@ -63,14 +73,6 @@ static void stop_heap_monitor(void)
     atomic_store(&s_heap_monitor, false);
 }
 
-static void finish_closed_peer(void)
-{
-    if (atomic_load(&s_heap_monitor)) {
-        vTaskDelay(1);
-        stop_heap_monitor();
-    }
-}
-
 static int capture_peer_log(const char *format, va_list args)
 {
     char message[256];
@@ -81,12 +83,55 @@ static int capture_peer_log(const char *format, va_list args)
     if (length > 0 && strstr(message, "PEER_FP_REJECT")) {
         atomic_store(&s_identity_rejected, true);
     }
+    if (length > 0 && !strstr(message, "esp_https_server") &&
+                      (strstr(message, "esp-tls") || strstr(message, "ESP-TLS") ||
+                       strstr(message, "esp_tls") || strstr(message, "https_server") ||
+                       strstr(message, "mbedtls") || strstr(message, "TLS"))) {
+        uint8_t priority = strstr(message, "kvmctl_signal") ? 1 : 0;
+        if (strstr(message, "mbedtls:") && !strstr(message, "esp-tls-mbedtls")) priority = 2;
+        const char *diagnostic = message;
+        const char *reason = strstr(message, "certificate mismatch:");
+        if (!reason) reason = strstr(message, "server has no certificate");
+        if (!reason) reason = strstr(message, "no suitable hash algorithm");
+        if (!reason) reason = strstr(message, "no common elliptic curve");
+        if (reason) {
+            diagnostic = reason;
+            priority = 4;
+        } else if ((reason = strstr(message, "ciphersuite mismatch:")) != NULL) {
+            diagnostic = reason;
+            priority = 3;
+        }
+        size_t copy_len = strnlen(diagnostic, sizeof(s_tls_diagnostic) - 1);
+        while (copy_len && (diagnostic[copy_len - 1] == '\r' || diagnostic[copy_len - 1] == '\n')) {
+            copy_len--;
+        }
+        portENTER_CRITICAL(&s_tls_diagnostic_mux);
+        if (priority >= s_tls_diagnostic_priority) {
+            memcpy(s_tls_diagnostic, diagnostic, copy_len);
+            s_tls_diagnostic[copy_len] = '\0';
+            s_tls_diagnostic_priority = priority;
+        }
+        portEXIT_CRITICAL(&s_tls_diagnostic_mux);
+    }
     return 0;
 }
 
 void transport_silence_logs(void)
 {
     esp_log_set_vprintf(capture_peer_log);
+}
+
+void transport_note_tls_rate_limited(void)
+{
+    atomic_fetch_add(&s_tls_rate_limited, 1);
+}
+
+void transport_clear_tls_diagnostic(void)
+{
+    portENTER_CRITICAL(&s_tls_diagnostic_mux);
+    memset(s_tls_diagnostic, 0, sizeof(s_tls_diagnostic));
+    s_tls_diagnostic_priority = 0;
+    portEXIT_CRITICAL(&s_tls_diagnostic_mux);
 }
 
 static void fail_session(void)
@@ -154,6 +199,10 @@ static int on_channel_close(esp_peer_data_channel_info_t *channel, void *ctx)
 static int on_data(esp_peer_data_frame_t *frame, void *ctx)
 {
     (void)ctx;
+    /* DataChannel open is not application authorization. M1.3 signaling must
+       enable this only after client and transcript proofs plus DTLS identity. */
+    /* Drop pre-authorization data; do not retain, count, or echo it. */
+    if (!atomic_load(&s_application_authorized)) return 0;
     if (!frame || !frame->data) {
         fail_session();
         return -1;
@@ -252,10 +301,16 @@ static void peer_task(void *arg)
     memset(&s_motion, 0, sizeof(s_motion));
     s_answer_len = 0;
     atomic_store(&s_open_channels, 0);
+    portENTER_CRITICAL(&s_client_fingerprint_mux);
+    mbedtls_platform_zeroize(s_active_client_fingerprint, sizeof(s_active_client_fingerprint));
+    portEXIT_CRITICAL(&s_client_fingerprint_mux);
     vTaskDelay(1);
     vTaskGetInfo(task, &task_info, pdFALSE, eInvalid);
     atomic_store(&s_peer_task_cpu_us,
                  (uint32_t)task_info.ulRunTimeCounter - runtime_start);
+    /* A failed peer can finish before its WSS owner disconnects. Release its
+       monitor here so the next transport generation can start independently. */
+    stop_heap_monitor();
     atomic_store(&s_active, false);
     xEventGroupSetBits(s_events, BIT_CLOSED);
     vTaskDelete(NULL);
@@ -283,8 +338,10 @@ esp_err_t transport_init(void)
     return (bits & BIT_CERT_READY) ? ESP_OK : ESP_FAIL;
 }
 
-esp_err_t transport_offer(const uint8_t *offer, size_t offer_len,
-                          uint8_t *answer, size_t answer_capacity, size_t *answer_len)
+static esp_err_t transport_offer_internal(const uint8_t *client_fingerprint,
+                                          const uint8_t *offer, size_t offer_len,
+                                          uint8_t *answer, size_t answer_capacity, size_t *answer_len,
+                                          uint32_t *generation)
 {
     if (!s_events || !offer || !answer || !answer_len || offer_len == 0 ||
         offer_len > SDP_CAPACITY || offer_len < 5 || memcmp(offer, "v=0\r\n", 5) != 0 ||
@@ -294,15 +351,31 @@ esp_err_t transport_offer(const uint8_t *offer, size_t offer_len,
         if ((offer[i] < 0x20 && offer[i] != '\r' && offer[i] != '\n' && offer[i] != '\t') ||
             offer[i] > 0x7e) return ESP_ERR_INVALID_ARG;
     }
-    if (atomic_load(&s_active)) {
-        /* Second SDP invalidates the session. Worker closes after callbacks unwind. */
-        atomic_store(&s_close_requested, true);
-        EventBits_t bits = xEventGroupWaitBits(s_events, BIT_CLOSED, pdFALSE, pdTRUE,
-                                               pdMS_TO_TICKS(5000));
-        if (bits & BIT_CLOSED) finish_closed_peer();
+    bool inactive = false;
+    portENTER_CRITICAL(&s_client_fingerprint_mux);
+    if (!atomic_compare_exchange_strong(&s_active, &inactive, true)) {
+        /* Competing offers receive busy; they never own or close active peer. */
+        portEXIT_CRITICAL(&s_client_fingerprint_mux);
+        return ESP_ERR_INVALID_STATE;
+    }
+    if (++s_generation == 0) ++s_generation;
+    uint32_t accepted_generation = s_generation;
+    mbedtls_platform_zeroize(s_active_client_fingerprint, sizeof(s_active_client_fingerprint));
+    if (client_fingerprint) memcpy(s_active_client_fingerprint, client_fingerprint,
+                                   sizeof(s_active_client_fingerprint));
+    portEXIT_CRITICAL(&s_client_fingerprint_mux);
+    if (client_fingerprint && !client_auth_is_enrolled(client_fingerprint)) {
+        portENTER_CRITICAL(&s_client_fingerprint_mux);
+        mbedtls_platform_zeroize(s_active_client_fingerprint, sizeof(s_active_client_fingerprint));
+        portEXIT_CRITICAL(&s_client_fingerprint_mux);
+        atomic_store(&s_active, false);
         return ESP_ERR_INVALID_STATE;
     }
     if (heap_caps_monitor_local_minimum_free_size_start() != ESP_OK) {
+        portENTER_CRITICAL(&s_client_fingerprint_mux);
+        mbedtls_platform_zeroize(s_active_client_fingerprint, sizeof(s_active_client_fingerprint));
+        portEXIT_CRITICAL(&s_client_fingerprint_mux);
+        atomic_store(&s_active, false);
         return ESP_ERR_INVALID_STATE;
     }
     atomic_store(&s_heap_monitor, true);
@@ -320,13 +393,16 @@ esp_err_t transport_offer(const uint8_t *offer, size_t offer_len,
     atomic_store(&s_application_bytes_received, 0);
     atomic_store(&s_peer_task_cpu_us, 0);
     atomic_store(&s_close_requested, false);
-    atomic_store(&s_active, true);
+    atomic_store(&s_application_authorized, false);
     memcpy(s_offer, offer, offer_len);
     s_offer[offer_len] = 0;
     if (xTaskCreate(peer_task, "webrtc_peer", 24 * 1024, NULL, 5, NULL) != pdPASS) {
-        atomic_store(&s_active, false);
         memset(s_offer, 0, sizeof(s_offer));
         stop_heap_monitor();
+        portENTER_CRITICAL(&s_client_fingerprint_mux);
+        mbedtls_platform_zeroize(s_active_client_fingerprint, sizeof(s_active_client_fingerprint));
+        atomic_store(&s_active, false);
+        portEXIT_CRITICAL(&s_client_fingerprint_mux);
         return ESP_ERR_NO_MEM;
     }
     EventBits_t bits = xEventGroupWaitBits(s_events, BIT_ANSWER | BIT_FAILED,
@@ -335,7 +411,6 @@ esp_err_t transport_offer(const uint8_t *offer, size_t offer_len,
         atomic_store(&s_close_requested, true);
         bits = xEventGroupWaitBits(s_events, BIT_CLOSED, pdFALSE, pdTRUE,
                                    pdMS_TO_TICKS(5000));
-        if (bits & BIT_CLOSED) finish_closed_peer();
         if (atomic_load(&s_identity_rejected)) return ESP_ERR_INVALID_ARG;
         return ESP_ERR_INVALID_RESPONSE;
     }
@@ -343,12 +418,28 @@ esp_err_t transport_offer(const uint8_t *offer, size_t offer_len,
         atomic_store(&s_close_requested, true);
         bits = xEventGroupWaitBits(s_events, BIT_CLOSED, pdFALSE, pdTRUE,
                                    pdMS_TO_TICKS(5000));
-        if (bits & BIT_CLOSED) finish_closed_peer();
         return ESP_ERR_INVALID_SIZE;
     }
     memcpy(answer, s_answer, s_answer_len);
     *answer_len = s_answer_len;
+    if (generation) *generation = accepted_generation;
     return ESP_OK;
+}
+
+esp_err_t transport_offer(const uint8_t *offer, size_t offer_len,
+                          uint8_t *answer, size_t answer_capacity, size_t *answer_len)
+{
+    return transport_offer_internal(NULL, offer, offer_len, answer, answer_capacity, answer_len, NULL);
+}
+
+esp_err_t transport_offer_for_client(const uint8_t fingerprint[32],
+                                     const uint8_t *offer, size_t offer_len,
+                                     uint8_t *answer, size_t answer_capacity, size_t *answer_len,
+                                     uint32_t *generation)
+{
+    if (!fingerprint || !generation || !client_auth_is_enrolled(fingerprint)) return ESP_ERR_INVALID_STATE;
+    return transport_offer_internal(fingerprint, offer, offer_len,
+                                    answer, answer_capacity, answer_len, generation);
 }
 
 esp_err_t transport_close(void)
@@ -357,15 +448,86 @@ esp_err_t transport_close(void)
     atomic_store(&s_close_requested, true);
     EventBits_t bits = xEventGroupWaitBits(s_events, BIT_CLOSED, pdFALSE, pdTRUE,
                                            pdMS_TO_TICKS(5000));
-    if (bits & BIT_CLOSED) finish_closed_peer();
     return (bits & BIT_CLOSED) ? ESP_OK : ESP_ERR_TIMEOUT;
+}
+
+static bool matches_client_generation(const uint8_t fingerprint[32], uint32_t generation)
+{
+    return generation != 0 && generation == s_generation && atomic_load(&s_active) &&
+           memcmp(s_active_client_fingerprint, fingerprint, sizeof(s_active_client_fingerprint)) == 0;
+}
+
+bool transport_client_session_active(const uint8_t fingerprint[32], uint32_t generation)
+{
+    if (!fingerprint) return false;
+    portENTER_CRITICAL(&s_client_fingerprint_mux);
+    bool active = matches_client_generation(fingerprint, generation) &&
+                  !atomic_load(&s_failed) && !atomic_load(&s_identity_rejected) &&
+                  !atomic_load(&s_close_requested);
+    portEXIT_CRITICAL(&s_client_fingerprint_mux);
+    return active;
+}
+
+esp_err_t transport_close_for_client(const uint8_t fingerprint[32], uint32_t generation)
+{
+    if (!fingerprint || !s_events) return ESP_ERR_INVALID_ARG;
+    portENTER_CRITICAL(&s_client_fingerprint_mux);
+    bool matches = matches_client_generation(fingerprint, generation);
+    if (matches) {
+        atomic_store(&s_application_authorized, false);
+        atomic_store(&s_close_requested, true);
+    }
+    portEXIT_CRITICAL(&s_client_fingerprint_mux);
+    if (!matches) return ESP_OK;
+    EventBits_t bits = xEventGroupWaitBits(s_events, BIT_CLOSED, pdFALSE, pdTRUE,
+                                           pdMS_TO_TICKS(5000));
+    return (bits & BIT_CLOSED) ? ESP_OK : ESP_ERR_TIMEOUT;
+}
+
+esp_err_t transport_authorize_client(const uint8_t fingerprint[32], uint32_t generation)
+{
+    if (!fingerprint || !atomic_load(&s_active) || atomic_load(&s_failed) ||
+        atomic_load(&s_identity_rejected) || atomic_load(&s_open_channels) != 2 ||
+        !client_auth_is_enrolled(fingerprint)) {
+        return ESP_ERR_INVALID_STATE;
+    }
+    portENTER_CRITICAL(&s_client_fingerprint_mux);
+    bool matches = matches_client_generation(fingerprint, generation);
+    if (matches) atomic_store(&s_application_authorized, true);
+    portEXIT_CRITICAL(&s_client_fingerprint_mux);
+    if (!matches) return ESP_ERR_INVALID_STATE;
+    if (!client_auth_is_enrolled(fingerprint)) {
+        transport_invalidate_client(fingerprint);
+        return ESP_ERR_INVALID_STATE;
+    }
+    return ESP_OK;
+}
+
+void transport_invalidate_client(const uint8_t fingerprint[32])
+{
+    if (!fingerprint || !atomic_load(&s_active)) return;
+    portENTER_CRITICAL(&s_client_fingerprint_mux);
+    bool matches = memcmp(s_active_client_fingerprint, fingerprint,
+                          sizeof(s_active_client_fingerprint)) == 0;
+    if (matches) {
+        atomic_store(&s_application_authorized, false);
+        atomic_store(&s_close_requested, true);
+    }
+    portEXIT_CRITICAL(&s_client_fingerprint_mux);
+}
+
+void transport_invalidate_all_clients(void)
+{
+    if (!atomic_load(&s_active)) return;
+    atomic_store(&s_application_authorized, false);
+    atomic_store(&s_close_requested, true);
 }
 
 transport_status_t transport_status(void)
 {
     if (atomic_load(&s_identity_rejected)) return TRANSPORT_STATUS_IDENTITY_REJECTED;
-    if (atomic_load(&s_failed)) return TRANSPORT_STATUS_FAILED;
     if (!atomic_load(&s_active)) return TRANSPORT_STATUS_IDLE;
+    if (atomic_load(&s_failed)) return TRANSPORT_STATUS_FAILED;
     return atomic_load(&s_open_channels) == 2 ? TRANSPORT_STATUS_OPEN : TRANSPORT_STATUS_CONNECTING;
 }
 
@@ -391,4 +553,8 @@ void transport_get_metrics(transport_metrics_t *metrics)
     metrics->channel_opens = atomic_load(&s_channel_opens);
     metrics->application_bytes_received = atomic_load(&s_application_bytes_received);
     metrics->peer_task_cpu_us = atomic_load(&s_peer_task_cpu_us);
+    metrics->tls_rate_limited = atomic_load(&s_tls_rate_limited);
+    portENTER_CRITICAL(&s_tls_diagnostic_mux);
+    memcpy(metrics->tls_diagnostic, s_tls_diagnostic, sizeof(metrics->tls_diagnostic));
+    portEXIT_CRITICAL(&s_tls_diagnostic_mux);
 }

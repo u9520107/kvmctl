@@ -3,8 +3,11 @@
 #include "esp_partition.h"
 #include "esp_psram.h"
 #include "esp_flash.h"
+#include "client_auth.h"
 #include "device_identity.h"
 #include "led_control.h"
+#include "signaling_protocol.h"
+#include "signaling.h"
 #include "usb_admin.h"
 #include "transport.h"
 #include "wifi_setup.h"
@@ -66,6 +69,16 @@ void app_main(void)
         ESP_LOGE(TAG, "Device identity initialization failed: %s", esp_err_to_name(err));
         abort();
     }
+    err = signaling_check_shared_vectors();
+    if (err != ESP_OK) {
+        ESP_LOGE(TAG, "M1.3 challenge/transcript vectors do not match: %s", esp_err_to_name(err));
+        abort();
+    }
+    err = client_auth_init();
+    if (err != ESP_OK) {
+        ESP_LOGE(TAG, "Client authorization store initialization failed: %s", esp_err_to_name(err));
+        abort();
+    }
     err = led_control_load_preferences();
     if (err != ESP_OK) {
         ESP_LOGW(TAG, "RGB preferences unavailable; continuing administration: %s", esp_err_to_name(err));
@@ -76,6 +89,10 @@ void app_main(void)
     if (err != ESP_OK) {
         ESP_LOGE(TAG, "WebRTC transport initialization failed: %s", esp_err_to_name(err));
         abort();
+    }
+    err = signaling_init();
+    if (err != ESP_OK) {
+        ESP_LOGE(TAG, "Pinned HTTPS/WSS signaling unavailable: %s", esp_err_to_name(err));
     }
     err = usb_admin_start();
     if (err != ESP_OK) {

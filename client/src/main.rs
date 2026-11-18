@@ -3,13 +3,25 @@
 use std::io::{self, Write};
 
 #[cfg(windows)]
+mod credentials;
+#[cfg(windows)]
+mod discovery;
+#[cfg(windows)]
 mod flash;
+#[cfg(windows)]
+mod protocol;
+#[cfg(windows)]
+mod signaling;
 #[cfg(windows)]
 mod transport;
 
 const MAX_FRAME: usize = 4096;
 const WIFI_SET_COMMAND: u64 = 0x60;
 const STATUS_COMMAND: u64 = 0x61;
+const ENROLL_COMMAND: u64 = 0x62;
+const LIST_CLIENTS_COMMAND: u64 = 0x63;
+const REVOKE_CLIENT_COMMAND: u64 = 0x64;
+const REVOKE_ALL_COMMAND: u64 = 0x65;
 const LED_SET_COMMAND: u64 = 0x66;
 const TRANSPORT_OFFER_COMMAND: u64 = 0x67;
 const TRANSPORT_CLOSE_COMMAND: u64 = 0x68;
@@ -27,7 +39,7 @@ struct Status {
     led_rgb: [u8; 3],
 }
 
-#[derive(Clone, Copy, Default)]
+#[derive(Clone, Copy)]
 struct TransportMetrics {
     state: u8,
     internal_free_start: u32,
@@ -39,6 +51,29 @@ struct TransportMetrics {
     channel_opens: u32,
     application_bytes_received: u32,
     peer_task_cpu_us: u32,
+    tls_diagnostic: [u8; 96],
+    tls_diagnostic_len: usize,
+    tls_rate_limited: u32,
+}
+
+impl Default for TransportMetrics {
+    fn default() -> Self {
+        Self {
+            state: 0,
+            internal_free_start: 0,
+            internal_free_min: 0,
+            internal_free_end: 0,
+            psram_free_start: 0,
+            psram_free_min: 0,
+            psram_free_end: 0,
+            channel_opens: 0,
+            application_bytes_received: 0,
+            peer_task_cpu_us: 0,
+            tls_diagnostic: [0; 96],
+            tls_diagnostic_len: 0,
+            tls_rate_limited: 0,
+        }
+    }
 }
 
 struct Secret(Vec<u8>);
@@ -153,6 +188,29 @@ fn encode_led_request(
     Ok(encode_request(LED_SET_COMMAND, request_id, &payload))
 }
 
+fn encode_enroll_request(request_id: &[u8; 16], spki: &[u8]) -> Result<Vec<u8>, String> {
+    if spki.len() != 91 {
+        return Err("client public key must be P-256 SPKI DER".into());
+    }
+    let mut payload = vec![0xa1, 0x00];
+    put_bytes(&mut payload, spki);
+    Ok(encode_request(ENROLL_COMMAND, request_id, &payload))
+}
+
+fn encode_list_clients_request(request_id: &[u8; 16]) -> Vec<u8> {
+    encode_request(LIST_CLIENTS_COMMAND, request_id, &[0xa0])
+}
+
+fn encode_revoke_client_request(request_id: &[u8; 16], fingerprint: &[u8; 32]) -> Vec<u8> {
+    let mut payload = vec![0xa1, 0x00];
+    put_bytes(&mut payload, fingerprint);
+    encode_request(REVOKE_CLIENT_COMMAND, request_id, &payload)
+}
+
+fn encode_revoke_all_request(request_id: &[u8; 16]) -> Vec<u8> {
+    encode_request(REVOKE_ALL_COMMAND, request_id, &[0xa0])
+}
+
 fn encode_transport_offer_request(request_id: &[u8; 16], sdp: &str) -> Result<Vec<u8>, String> {
     if sdp.is_empty() || sdp.len() > 3500 || !sdp.is_ascii() {
         return Err("SDP is empty, oversized, or non-ASCII".into());
@@ -166,10 +224,7 @@ fn encode_transport_offer_request(request_id: &[u8; 16], sdp: &str) -> Result<Ve
     Ok(request)
 }
 
-fn decode_transport_offer_response(
-    data: &[u8],
-    request_id: &[u8; 16],
-) -> Result<String, String> {
+fn decode_transport_offer_response(data: &[u8], request_id: &[u8; 16]) -> Result<String, String> {
     let mut r = Reader::new(data);
     let (major, map_len) = r.head()?;
     if major != 5 || !(map_len == 5 || map_len == 6) {
@@ -193,6 +248,9 @@ fn decode_transport_offer_response(
         }
         if code == 1 {
             return Err("device rejected malformed SDP or certificate fingerprint identity".into());
+        }
+        if code == 3 {
+            return Err("device is busy with another transport session".into());
         }
         return Err(format!("device rejected SDP offer with code {code}"));
     }
@@ -226,18 +284,31 @@ fn decode_transport_status_response(
     r.expect_uint(4)?;
     let code = r.uint()?;
     if code != 0 {
-        return Err(format!("device rejected transport status request with code {code}"));
+        return Err(format!(
+            "device rejected transport status request with code {code}"
+        ));
     }
     r.expect_uint(5)?;
-    r.expect_map(10)?;
+    r.expect_map(12)?;
     let mut values = [0; 10];
     for (key, value) in values.iter_mut().enumerate() {
         r.expect_uint(key as u64)?;
         *value = r.uint()?;
     }
-    if values[0] > 4 || values[1..].iter().any(|value| *value > u32::MAX as u64) || !r.done() {
+    r.expect_uint(10)?;
+    let diagnostic = r.text()?;
+    r.expect_uint(11)?;
+    let tls_rate_limited = r.uint()?;
+    if values[0] > 4
+        || values[1..].iter().any(|value| *value > u32::MAX as u64)
+        || diagnostic.len() > 96
+        || tls_rate_limited > u32::MAX as u64
+        || !r.done()
+    {
         return Err("invalid transport status response".into());
     }
+    let mut tls_diagnostic = [0; 96];
+    tls_diagnostic[..diagnostic.len()].copy_from_slice(diagnostic.as_bytes());
     Ok(TransportMetrics {
         state: values[0] as u8,
         internal_free_start: values[1] as u32,
@@ -249,6 +320,9 @@ fn decode_transport_status_response(
         channel_opens: values[7] as u32,
         application_bytes_received: values[8] as u32,
         peer_task_cpu_us: values[9] as u32,
+        tls_diagnostic,
+        tls_diagnostic_len: diagnostic.len(),
+        tls_rate_limited: tls_rate_limited as u32,
     })
 }
 
@@ -506,6 +580,90 @@ fn decode_mutation_response(
     }
 }
 
+fn decode_enroll_response(data: &[u8], request_id: &[u8; 16]) -> Result<[u8; 32], String> {
+    let mut r = Reader::new(data);
+    let (major, map_len) = r.head()?;
+    if major != 5 || !(map_len == 5 || map_len == 6) {
+        return Err("invalid client enrollment response".into());
+    }
+    r.expect_uint(0)?;
+    r.expect_uint(1)?;
+    r.expect_uint(1)?;
+    r.expect_uint(0)?;
+    r.expect_uint(2)?;
+    r.expect_uint(ENROLL_COMMAND)?;
+    r.expect_uint(3)?;
+    if r.expect_bytes(16)? != request_id {
+        return Err("response request ID mismatch".into());
+    }
+    r.expect_uint(4)?;
+    let code = r.uint()?;
+    if code != 0 {
+        if map_len != 5 || !r.done() {
+            return Err("invalid enrollment error response".into());
+        }
+        return Err(format!("device rejected enrollment with code {code}"));
+    }
+    if map_len != 6 {
+        return Err("enrollment response omitted client fingerprint".into());
+    }
+    r.expect_uint(5)?;
+    let fingerprint = r.expect_bytes(32)?.try_into().unwrap();
+    if !r.done() {
+        return Err("trailing CBOR data".into());
+    }
+    Ok(fingerprint)
+}
+
+fn decode_client_list_response(
+    data: &[u8],
+    request_id: &[u8; 16],
+) -> Result<Vec<[u8; 32]>, String> {
+    let mut r = Reader::new(data);
+    let (major, map_len) = r.head()?;
+    if major != 5 || !(map_len == 5 || map_len == 6) {
+        return Err("invalid enrolled client list response".into());
+    }
+    r.expect_uint(0)?;
+    r.expect_uint(1)?;
+    r.expect_uint(1)?;
+    r.expect_uint(0)?;
+    r.expect_uint(2)?;
+    r.expect_uint(LIST_CLIENTS_COMMAND)?;
+    r.expect_uint(3)?;
+    if r.expect_bytes(16)? != request_id {
+        return Err("response request ID mismatch".into());
+    }
+    r.expect_uint(4)?;
+    let code = r.uint()?;
+    if code != 0 {
+        if map_len != 5 || !r.done() {
+            return Err("invalid client list error response".into());
+        }
+        return Err(format!("device rejected client list with code {code}"));
+    }
+    if map_len != 6 {
+        return Err("client list response omitted entries".into());
+    }
+    r.expect_uint(5)?;
+    let (major, count) = r.head()?;
+    if major != 4 || count > 8 {
+        return Err("invalid enrolled client list".into());
+    }
+    let mut clients = Vec::with_capacity(count as usize);
+    for _ in 0..count {
+        let fingerprint: [u8; 32] = r.expect_bytes(32)?.try_into().unwrap();
+        if clients.contains(&fingerprint) {
+            return Err("duplicate enrolled client fingerprint".into());
+        }
+        clients.push(fingerprint);
+    }
+    if !r.done() {
+        return Err("trailing CBOR data".into());
+    }
+    Ok(clients)
+}
+
 #[cfg(windows)]
 fn sha256(data: &[u8]) -> Result<[u8; 32], String> {
     use windows_sys::Win32::Security::Cryptography::BCRYPT_SHA256_ALGORITHM;
@@ -525,9 +683,8 @@ fn bcrypt_hash<const N: usize>(
 ) -> Result<[u8; N], String> {
     use windows_sys::Win32::Security::Cryptography::{BCryptHash, BCryptOpenAlgorithmProvider};
     let mut algorithm = std::ptr::null_mut();
-    let open = unsafe {
-        BCryptOpenAlgorithmProvider(&mut algorithm, algorithm_id, std::ptr::null(), 0)
-    };
+    let open =
+        unsafe { BCryptOpenAlgorithmProvider(&mut algorithm, algorithm_id, std::ptr::null(), 0) };
     if open < 0 {
         return Err(format!(
             "BCryptOpenAlgorithmProvider failed: 0x{:08x}",
@@ -940,7 +1097,9 @@ mod serial {
                     Err(error) => return Err(error),
                 }
             }
-            Err(format!("device status unavailable after serial startup retries: {last_error}"))
+            Err(format!(
+                "device status unavailable after serial startup retries: {last_error}"
+            ))
         }
 
         pub fn mutate(
@@ -951,6 +1110,29 @@ mod serial {
         ) -> Result<(), String> {
             let response = self.exchange(payload)?;
             decode_mutation_response(&response, request_id, command)
+        }
+
+        pub fn enroll_client(&mut self, spki: &[u8]) -> Result<[u8; 32], String> {
+            let id = random_id()?;
+            let request = encode_enroll_request(&id, spki)?;
+            decode_enroll_response(&self.exchange(&request)?, &id)
+        }
+
+        pub fn list_clients(&mut self) -> Result<Vec<[u8; 32]>, String> {
+            let id = random_id()?;
+            decode_client_list_response(&self.exchange(&encode_list_clients_request(&id))?, &id)
+        }
+
+        pub fn revoke_client(&mut self, fingerprint: &[u8; 32]) -> Result<(), String> {
+            let id = random_id()?;
+            let response = self.exchange(&encode_revoke_client_request(&id, fingerprint))?;
+            decode_mutation_response(&response, &id, REVOKE_CLIENT_COMMAND)
+        }
+
+        pub fn revoke_all(&mut self) -> Result<(), String> {
+            let id = random_id()?;
+            let response = self.exchange(&encode_revoke_all_request(&id))?;
+            decode_mutation_response(&response, &id, REVOKE_ALL_COMMAND)
         }
 
         pub(crate) fn transport_offer(&mut self, sdp: &str) -> Result<String, String> {
@@ -969,7 +1151,8 @@ mod serial {
 
         pub(crate) fn transport_status(&mut self) -> Result<TransportMetrics, String> {
             let id = random_id()?;
-            let response = self.exchange(&encode_request(TRANSPORT_STATUS_COMMAND, &id, &[0xa0]))?;
+            let response =
+                self.exchange(&encode_request(TRANSPORT_STATUS_COMMAND, &id, &[0xa0]))?;
             decode_transport_status_response(&response, &id)
         }
 
@@ -1285,7 +1468,7 @@ fn run() -> Result<(), String> {
     let command = args.first().map(String::as_str).unwrap_or("status");
     if command == "--help" || command == "-h" {
         println!(
-            "kvmctl [status [COMx] | wifi [COMx] | led [COMx] on|off <brightness> <RRGGBB> | transport-test [COMx] | flash [COMx] <firmware.bin> <backup.bin> | ports]; no arguments opens the control window"
+            "kvmctl [status [COMx] | wifi [COMx] | enroll [COMx] | clients [COMx] | revoke [COMx] <fingerprint|all> | discover [COMx] | signaling-test [COMx] [success|missing|invalid|replay|resources] [IPv4] | led [COMx] on|off <brightness> <RRGGBB> | transport-test [COMx] | flash [COMx] <firmware.bin> <backup.bin> | ports]; no arguments opens the control window"
         );
         return Ok(());
     }
@@ -1306,20 +1489,134 @@ fn run() -> Result<(), String> {
             args.get(1).map(String::as_str),
             args.get(2..).unwrap_or(&[]),
         ),
+        "revoke" if args.get(1).is_some_and(|arg| arg.starts_with("COM")) => (
+            args.get(1).map(String::as_str),
+            args.get(2..).unwrap_or(&[]),
+        ),
+        "signaling-test" if args.get(1).is_some_and(|arg| arg.starts_with("COM")) => (
+            args.get(1).map(String::as_str),
+            args.get(2..).unwrap_or(&[]),
+        ),
+        "signaling-test" => (None, args.get(1..).unwrap_or(&[])),
         "flash" => (None, args.get(1..).unwrap_or(&[])),
+        "revoke" => (None, args.get(1..).unwrap_or(&[])),
         _ => (
             args.get(1).map(String::as_str),
             args.get(2..).unwrap_or(&[]),
         ),
     };
-    if !matches!(command, "status" | "wifi" | "led" | "transport-test" | "flash") {
+    if !matches!(
+        command,
+        "status"
+            | "wifi"
+            | "enroll"
+            | "clients"
+            | "revoke"
+            | "discover"
+            | "signaling-test"
+            | "led"
+            | "transport-test"
+            | "flash"
+    ) {
         return Err("unknown command; use --help".into());
     }
     if command == "flash" && params.len() != 2 {
         return Err("usage: kvmctl flash [COMx] <firmware.bin> <backup.bin>".into());
     }
-    if matches!(command, "status" | "wifi" | "transport-test") && !params.is_empty() {
-        return Err("usage: kvmctl [status [COMx] | wifi [COMx] | led [COMx] on|off <brightness> <RRGGBB> | transport-test [COMx] | ports]".into());
+    if matches!(
+        command,
+        "status" | "wifi" | "enroll" | "clients" | "discover" | "transport-test"
+    ) && !params.is_empty()
+    {
+        return Err("this command takes only an optional COM port".into());
+    }
+    if command == "signaling-test"
+        && (params.len() > 2
+            || params.first().is_some_and(|scenario| {
+                !matches!(
+                    scenario.as_str(),
+                    "success" | "missing" | "invalid" | "replay" | "resources" | "revoke-active"
+                )
+            })
+            || params
+                .get(1)
+                .is_some_and(|address| address.parse::<std::net::Ipv4Addr>().is_err()))
+    {
+        return Err(
+            "usage: kvmctl signaling-test [COMx] [success|missing|invalid|replay|resources|revoke-active] [IPv4]"
+                .into(),
+        );
+    }
+    if command == "revoke" && params.len() != 1 {
+        return Err("usage: kvmctl revoke [COMx] <fingerprint|all>".into());
+    }
+    if command == "discover" {
+        let endpoint_fingerprint = if let Some(requested_port) = requested_port {
+            let selected = select_port(&ports, Some(requested_port))?;
+            if !selected.recognized {
+                println!(
+                    "{} has not been identified as a kvmctl board.",
+                    selected.label
+                );
+                print!("Confirm this is your flashed board before reading status (yes/no): ");
+                io::stdout().flush().map_err(|error| error.to_string())?;
+                let mut answer = String::new();
+                io::stdin()
+                    .read_line(&mut answer)
+                    .map_err(|error| error.to_string())?;
+                if !answer.trim().eq_ignore_ascii_case("yes") {
+                    return Err("device not confirmed; port was not opened".into());
+                }
+            }
+            let mut port = serial::Port::open(&selected.name)?;
+            let status = port.status()?;
+            serial::remember_board(&selected, &status.identity_fingerprint);
+            Some(status.identity_fingerprint)
+        } else {
+            None
+        };
+        let services = discovery::browse()?;
+        if services.is_empty() {
+            println!(
+                "Windows DNS-SD found no _kvmctl._tcp.local services within 5 seconds. Check that the PC and board share a LAN that passes multicast DNS (UDP 5353); USB administration remains available."
+            );
+            return Ok(());
+        }
+        for service in services {
+            let identity = endpoint_fingerprint
+                .as_ref()
+                .map(|fingerprint| {
+                    if discovery::matches_endpoint(&service, fingerprint) {
+                        "matches USB identity"
+                    } else {
+                        "does not match USB identity"
+                    }
+                })
+                .unwrap_or("unverified; TXT data is advisory");
+            let address = service
+                .ipv4
+                .map(|ip| ip.to_string())
+                .unwrap_or_else(|| "host lookup".into());
+            println!(
+                "service={:?} host={} address={} port={} fp={} path={} identity={}",
+                service.instance,
+                service.hostname,
+                address,
+                service.port,
+                service
+                    .properties
+                    .get("fp")
+                    .map(String::as_str)
+                    .unwrap_or("missing"),
+                service
+                    .properties
+                    .get("path")
+                    .map(String::as_str)
+                    .unwrap_or("missing"),
+                identity,
+            );
+        }
+        return Ok(());
     }
     let selected = select_port(&ports, requested_port)?;
     if !selected.recognized {
@@ -1345,6 +1642,66 @@ fn run() -> Result<(), String> {
         );
     }
     let mut port = serial::Port::open(&selected.name)?;
+    if command == "signaling-test" {
+        let status = port.status()?;
+        serial::remember_board(&selected, &status.identity_fingerprint);
+        if status.wifi_state != 2 {
+            return Err(format!(
+                "Wi-Fi is {}; connect the board before running signaling-test",
+                wifi_name(status.wifi_state)
+            ));
+        }
+        let credential = credentials::ClientCredential::load_existing().map_err(|error| {
+            format!(
+                "{error}; run `cargo run --offline -p kvmctl -- enroll {}` first",
+                selected.name
+            )
+        })?;
+        let enrolled = port.list_clients()?;
+        if !enrolled.contains(&credential.fingerprint) {
+            return Err(format!(
+                "this Windows client is not enrolled; run `cargo run --offline -p kvmctl -- enroll {}` first",
+                selected.name
+            ));
+        }
+        let scenario = params.first().map(String::as_str).unwrap_or("success");
+        let service = if let Some(address) = params.get(1) {
+            let ip = address
+                .parse::<std::net::Ipv4Addr>()
+                .map_err(|_| "invalid IPv4 address".to_owned())?;
+            let hostname = discovery::endpoint_hostname(&status.identity_fingerprint);
+            println!(
+                "DNS-SD unavailable; trying direct IPv4 {ip} with pinned certificate name {hostname}."
+            );
+            discovery::Service {
+                instance: "direct-IP diagnostic".into(),
+                hostname,
+                port: 443,
+                ipv4: Some(ip),
+                properties: std::collections::BTreeMap::new(),
+            }
+        } else {
+            let services = discovery::browse()?;
+            let mut matches = services.into_iter().filter(|service| {
+                discovery::matches_endpoint(service, &status.identity_fingerprint)
+            });
+            let service = matches.next().ok_or_else(|| {
+                format!(
+                    "no DNS-SD service matches COM identity {}; run `cargo run --offline -p kvmctl -- discover {}` for diagnostics or pass a known board IPv4 address",
+                    hex(&status.identity_fingerprint), selected.name
+                )
+            })?;
+            if matches.next().is_some() {
+                return Err("multiple DNS-SD services claim this USB identity; refusing ambiguous discovery".into());
+            }
+            service
+        };
+        println!(
+            "Running M1.3 signaling scenario `{scenario}`. HID output and physical-input capture remain disabled."
+        );
+        return transport::run_signaling_test(port, &service, status, credential, scenario)
+            .map_err(|error| error.to_string());
+    }
     if command == "transport-test" {
         let status = port.status()?;
         serial::remember_board(&selected, &status.identity_fingerprint);
@@ -1410,6 +1767,42 @@ fn run() -> Result<(), String> {
             );
             Ok(())
         }
+        "enroll" => {
+            let credential = credentials::ClientCredential::load_or_create()?;
+            let existing = port.list_clients()?;
+            if existing.contains(&credential.fingerprint) {
+                println!("This Windows user is already enrolled on the selected board.");
+                return Ok(());
+            }
+            let enrolled = port.enroll_client(&credential.spki)?;
+            if enrolled != credential.fingerprint {
+                return Err("device returned a different client fingerprint".into());
+            }
+            println!("Enrolled client {}.", hex(&enrolled));
+            Ok(())
+        }
+        "clients" => {
+            let clients = port.list_clients()?;
+            if clients.is_empty() {
+                println!("No clients enrolled.");
+            } else {
+                for fingerprint in clients {
+                    println!("{}", hex(&fingerprint));
+                }
+            }
+            Ok(())
+        }
+        "revoke" if params[0].eq_ignore_ascii_case("all") => {
+            port.revoke_all()?;
+            println!("All enrolled clients revoked.");
+            Ok(())
+        }
+        "revoke" => {
+            let fingerprint = parse_fingerprint(&params[0])?;
+            port.revoke_client(&fingerprint)?;
+            println!("Revoked client {}.", hex(&fingerprint));
+            Ok(())
+        }
         "led" => {
             if params.len() != 3 {
                 return Err("usage: kvmctl led [COMx] on|off <brightness 0..100> <RRGGBB>".into());
@@ -1460,6 +1853,19 @@ fn hex(bytes: &[u8]) -> String {
         out.push(DIGITS[(byte & 15) as usize] as char);
     }
     out
+}
+
+#[cfg(windows)]
+fn parse_fingerprint(value: &str) -> Result<[u8; 32], String> {
+    if value.len() != 64 || !value.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+        return Err("client fingerprint must be 64 hexadecimal digits".into());
+    }
+    let mut fingerprint = [0u8; 32];
+    for (index, byte) in fingerprint.iter_mut().enumerate() {
+        *byte = u8::from_str_radix(&value[index * 2..index * 2 + 2], 16)
+            .map_err(|_| "invalid client fingerprint")?;
+    }
+    Ok(fingerprint)
 }
 
 #[cfg(not(windows))]
@@ -1537,6 +1943,56 @@ mod tests {
     }
 
     #[test]
+    fn client_admin_requests_and_responses_are_bound_to_command_and_request() {
+        let id = [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15];
+        let spki = [0x5a; 91];
+        let enroll = encode_enroll_request(&id, &spki).unwrap();
+        assert!(
+            enroll.ends_with(
+                &[0xa1, 0x00, 0x58, 0x5b]
+                    .into_iter()
+                    .chain(spki)
+                    .collect::<Vec<_>>()
+            )
+        );
+        assert!(encode_enroll_request(&id, &[0; 90]).is_err());
+        assert_eq!(encode_list_clients_request(&id).last(), Some(&0xa0));
+        assert!(encode_revoke_all_request(&id).ends_with(&[0x04, 0xa0]));
+
+        let fingerprint = [0xab; 32];
+        let mut response = vec![0xa6];
+        for (key, value) in [(0, 1), (1, 0), (2, ENROLL_COMMAND)] {
+            put_uint(&mut response, key);
+            put_uint(&mut response, value);
+        }
+        put_uint(&mut response, 3);
+        put_bytes(&mut response, &id);
+        put_uint(&mut response, 4);
+        put_uint(&mut response, 0);
+        put_uint(&mut response, 5);
+        put_bytes(&mut response, &fingerprint);
+        assert_eq!(decode_enroll_response(&response, &id).unwrap(), fingerprint);
+
+        let mut listed = vec![0xa6];
+        for (key, value) in [(0, 1), (1, 0), (2, LIST_CLIENTS_COMMAND)] {
+            put_uint(&mut listed, key);
+            put_uint(&mut listed, value);
+        }
+        put_uint(&mut listed, 3);
+        put_bytes(&mut listed, &id);
+        put_uint(&mut listed, 4);
+        put_uint(&mut listed, 0);
+        put_uint(&mut listed, 5);
+        put_head(&mut listed, 4, 1);
+        put_bytes(&mut listed, &fingerprint);
+        assert_eq!(
+            decode_client_list_response(&listed, &id).unwrap(),
+            [fingerprint]
+        );
+        assert!(decode_client_list_response(&listed, &[1; 16]).is_err());
+    }
+
+    #[test]
     fn mutation_response_checks_identity_and_command() {
         let id = [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15];
         let response = [
@@ -1561,7 +2017,7 @@ mod tests {
         put_uint(&mut rejected, 3);
         assert_eq!(
             decode_transport_offer_response(&rejected, &id).unwrap_err(),
-            "device rejected SDP offer with code 3"
+            "device is busy with another transport session"
         );
 
         let mut accepted = vec![0xa6];
@@ -1575,7 +2031,10 @@ mod tests {
         put_uint(&mut accepted, 0);
         put_uint(&mut accepted, 5);
         put_text(&mut accepted, b"v=0\r\n");
-        assert_eq!(decode_transport_offer_response(&accepted, &id).unwrap(), "v=0\r\n");
+        assert_eq!(
+            decode_transport_offer_response(&accepted, &id).unwrap(),
+            "v=0\r\n"
+        );
     }
 
     #[test]
@@ -1591,7 +2050,7 @@ mod tests {
         put_uint(&mut response, 4);
         put_uint(&mut response, 0);
         put_uint(&mut response, 5);
-        put_head(&mut response, 5, 10);
+        put_head(&mut response, 5, 12);
         for (key, value) in [
             (0, 3),
             (1, 50_000),
@@ -1607,6 +2066,10 @@ mod tests {
             put_uint(&mut response, key);
             put_uint(&mut response, value);
         }
+        put_uint(&mut response, 10);
+        put_text(&mut response, b"ESP-TLS: handshake_failure");
+        put_uint(&mut response, 11);
+        put_uint(&mut response, 17);
         let metrics = decode_transport_status_response(&response, &id).unwrap();
         assert_eq!(metrics.state, 3);
         assert_eq!(metrics.internal_free_min, 40_000);
@@ -1614,6 +2077,11 @@ mod tests {
         assert_eq!(metrics.channel_opens, 0);
         assert_eq!(metrics.application_bytes_received, 0);
         assert_eq!(metrics.peer_task_cpu_us, 321);
+        assert_eq!(metrics.tls_rate_limited, 17);
+        assert_eq!(
+            &metrics.tls_diagnostic[..metrics.tls_diagnostic_len],
+            b"ESP-TLS: handshake_failure"
+        );
     }
 
     #[test]
