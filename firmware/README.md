@@ -3,8 +3,47 @@
 First product firmware increment clears the onboard addressable RGB LED at the
 start of `app_main`; it has no startup animation and defaults to off.
 
-Build the current firmware with ESP-IDF 6.1.1 and the pinned peer source
-described below:
+## WSL build
+
+Install native ESP-IDF 6.1.1 for `esp32s3` using the
+[Espressif Linux setup guide](https://docs.espressif.com/projects/esp-idf/en/v6.1.1/esp32s3/get-started/linux-setup.html).
+For the Git-based setup, run the following once in WSL:
+
+```sh
+mkdir -p ~/esp
+git clone --branch v6.1.1 --depth 1 --recurse-submodules --shallow-submodules \
+    https://github.com/espressif/esp-idf.git ~/esp/esp-idf-v6.1.1
+~/esp/esp-idf-v6.1.1/install.sh esp32s3
+git clone --branch v1.3.0 --depth 1 \
+    https://github.com/espressif/esp-webrtc-solution.git ~/esp/esp-webrtc-v1.3.0
+```
+
+Install CMake and Ninja through Ubuntu or run
+`python3 ~/esp/esp-idf-v6.1.1/tools/idf_tools.py install cmake ninja`.
+Extract the [esp_libsrtp 1.0.0 registry archive](https://components.espressif.com/components/espressif/esp_libsrtp/versions/1.0.0/readme)
+into `~/esp/espressif__esp_libsrtp` so that directory contains the component’s
+`CMakeLists.txt`. An existing copy of the same component also works.
+
+From the repository root in WSL:
+
+```sh
+source ~/esp/esp-idf-v6.1.1/export.sh
+export KVMCTL_LIBSRTP_SOURCE="$HOME/esp/espressif__esp_libsrtp"
+bash firmware/build-transport.sh "$HOME/esp/esp-webrtc-v1.3.0"
+```
+
+The script exports the committed peer source, applies the fingerprint patch,
+and builds `firmware/build-wsl/kvmctl_firmware.bin`. The first build can fetch
+pinned components from the ESP Component Registry. Append `menuconfig` to the
+script invocation to edit the WSL build configuration. For Windows flashing,
+copy the resulting app image to a Windows-accessible path and use that path
+with the `kvmctl flash` command below.
+
+## Windows build
+
+From `firmware/` in Windows PowerShell, build with ESP-IDF 6.1.1 and the pinned
+peer source described below. The build script loads the ESP-IDF PowerShell
+profile from `C:\Espressif\tools\Microsoft.v6.1.1.PowerShell_profile.ps1`.
 
 ```powershell
 powershell.exe -NoProfile -ExecutionPolicy Bypass -File .\build-transport.ps1
@@ -32,12 +71,17 @@ The transport build requires ESP-IDF 6.1.1 and the pinned Espressif
 `3971094e2e7c2ab7cb4de59e4eae710e1902d2b4`. The script exports that source to a
 content-addressed temporary component tree and applies
 `verification/m0/peer-fingerprint/esp-peer-fingerprint.patch`; it verifies the
-upstream revision before building. By default, it expects the checkout at
+upstream revision and checks that the peer implementation matches it before
+building. By default, it expects the checkout at
 `$env:TEMP\esp-peer-v1.3.0`. If it is elsewhere, pass the checkout path:
 
 ```powershell
 powershell.exe -NoProfile -ExecutionPolicy Bypass -File .\build-transport.ps1 -WebrtcSource C:\path\to\esp-webrtc-solution
 ```
+
+The Windows script also expects `esp_libsrtp` 1.0.0 under
+`components/esp_peer/examples/peer_demo/managed_components/espressif__esp_libsrtp`
+inside the peer checkout.
 
 The build does not flash the board. For an on-board ESP32-to-Windows test after
 the firmware is installed and Wi-Fi is configured, run this from the workspace
@@ -119,33 +163,17 @@ connection failure is inconclusive.
 `test_signaling_guards.py` runs selected production C functions on the host. It
 uses Python's standard library to compile and load a temporary shared library;
 the harness stubs ESP-IDF services and injects persistence failures. It checks
-revocation retry and transport/session guards, not ESP-IDF compatibility or real
-NVS behavior. It does not build or flash firmware.
+two-peer transport isolation, signaling deadlines, and revocation retry.
+ESP-IDF compatibility and real NVS behavior require on-device checks.
 
 ### WSL or Linux (recommended if available)
 
-On Ubuntu, install Python 3, Clang, and the system linker:
-
-```sh
-sudo apt update
-sudo apt install python3 clang binutils
-```
-
-From the repository root in WSL/Linux, run:
+Install Python 3, Clang, and the system linker as described in the
+[WSL prerequisites](../README.md#wsl-development). From the repository root, run:
 
 ```sh
 python3 firmware/test_signaling_guards.py
 ```
-
-For this Windows checkout, start WSL at the workspace from PowerShell:
-
-```powershell
-wsl --cd "/mnt/c/Users/$($env:USERNAME)/workspace/kvmctl"
-```
-
-Then run the two Linux commands above. Change the path if the workspace moved. See the
-[Microsoft WSL setup guide](https://learn.microsoft.com/en-us/windows/wsl/setup/environment)
-and [Ubuntu Clang setup](https://ubuntu.com/developers/docs/howto/clang-setup/).
 
 ### Native Windows (alternative)
 
