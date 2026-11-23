@@ -44,7 +44,8 @@ void lease_init(lease_state_t *lease);
 lease_result_t lease_request(lease_state_t *lease, const uint8_t *requester,
                              const uint8_t *request_id, uint64_t now_ms);
 lease_result_t lease_takeover_response(lease_state_t *lease, const uint8_t *owner,
-                                       const uint8_t *request_id, bool accepted);
+                                       uint32_t epoch, const uint8_t *request_id,
+                                       bool accepted);
 lease_result_t lease_heartbeat(lease_state_t *lease, const uint8_t *owner,
                                uint32_t epoch, uint64_t now_ms);
 lease_result_t lease_release(lease_state_t *lease, const uint8_t *owner,

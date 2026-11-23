@@ -102,8 +102,22 @@ static uint8_t s_tls_diagnostic_priority;
 /* Endpoint-global lease: one owner, one pending requester. */
 static lease_state_t s_lease;
 static portMUX_TYPE s_lease_mux = portMUX_INITIALIZER_UNLOCKED;
+static portMUX_TYPE s_response_mux[MAX_TRANSPORT_PEERS] = {
+    portMUX_INITIALIZER_UNLOCKED, portMUX_INITIALIZER_UNLOCKED,
+};
 
 static bool queue_response(transport_peer_t *slot, const kvmctl_hid_event_t *event);
+static void queue_state_locked(transport_peer_t *slot);
+static void queue_state_to_peers_locked(void);
+
+static int peer_index(const transport_peer_t *slot)
+{
+    if (!slot) return -1;
+    for (size_t i = 0; i < MAX_TRANSPORT_PEERS; ++i) {
+        if (slot == &s_peers[i]) return (int)i;
+    }
+    return -1;
+}
 
 static const uint8_t *lease_slot_identity(int slot)
 {
@@ -121,32 +135,30 @@ static void lease_tick_locked(uint64_t now_ms)
 {
     lease_result_t result = lease_tick(&s_lease, now_ms);
     if (result == LEASE_EXPIRED || result == LEASE_TAKEOVER_GRANTED) {
-        for (size_t i = 0; i < MAX_TRANSPORT_PEERS; ++i) {
-            if (atomic_load(&s_peers[i].active) && atomic_load(&s_peers[i].application_authorized) && s_peers[i].session_id_seen) {
-                kvmctl_hid_event_t state = {0};
-                state.type = KVMCTL_HID_LEASE_STATE;
-                memcpy(state.session_id, s_peers[i].session_id, sizeof(state.session_id));
-                state.lease_epoch = s_lease.epoch;
-                state.owner_present = s_lease.active;
-                if (state.owner_present) memcpy(state.owner, s_lease.owner, sizeof(state.owner));
-                state.state = s_lease.pending ? 2 : s_lease.active ? 1 : 0;
-                (void)queue_response(&s_peers[i], &state);
-            }
-        }
+        queue_state_to_peers_locked();
     }
 }
 
 static bool queue_response(transport_peer_t *slot, const kvmctl_hid_event_t *event)
 {
-    if (!slot || !event || !slot->control.open || !atomic_load(&slot->application_authorized) || slot->responses.count >= RESPONSE_QUEUE_DEPTH) return false;
-    uint8_t index = (uint8_t)((slot->responses.head + slot->responses.count) % RESPONSE_QUEUE_DEPTH);
-    kvmctl_hid_event_t copy = *event;
-    copy.sequence = slot->response_sequence++;
-    size_t length = kvmctl_hid_encode(&copy, slot->responses.data[index], CONTROL_CAPACITY);
-    if (!length) return false;
-    slot->responses.size[index] = (uint16_t)length;
-    ++slot->responses.count;
-    return true;
+    int peer = peer_index(slot);
+    if (peer < 0 || !event) return false;
+    bool queued = false;
+    portENTER_CRITICAL(&s_response_mux[peer]);
+    if (slot->control.open && atomic_load(&slot->application_authorized) &&
+        slot->responses.count < RESPONSE_QUEUE_DEPTH) {
+        uint8_t index = (uint8_t)((slot->responses.head + slot->responses.count) % RESPONSE_QUEUE_DEPTH);
+        kvmctl_hid_event_t copy = *event;
+        copy.sequence = slot->response_sequence++;
+        size_t length = kvmctl_hid_encode(&copy, slot->responses.data[index], CONTROL_CAPACITY);
+        if (length) {
+            slot->responses.size[index] = (uint16_t)length;
+            ++slot->responses.count;
+            queued = true;
+        }
+    }
+    portEXIT_CRITICAL(&s_response_mux[peer]);
+    return queued;
 }
 
 static void queue_state_locked(transport_peer_t *slot)
@@ -160,6 +172,38 @@ static void queue_state_locked(transport_peer_t *slot)
     if (state.owner_present) memcpy(state.owner, s_lease.owner, sizeof(state.owner));
     state.state = s_lease.pending ? 2 : s_lease.active ? 1 : 0;
     (void)queue_response(slot, &state);
+}
+
+static void queue_state_to_peers_locked(void)
+{
+    for (size_t i = 0; i < MAX_TRANSPORT_PEERS; ++i) {
+        if (atomic_load(&s_peers[i].active) &&
+            atomic_load(&s_peers[i].application_authorized) &&
+            s_peers[i].session_id_seen) {
+            queue_state_locked(&s_peers[i]);
+        }
+    }
+}
+
+static void queue_takeover_response_locked(const uint8_t *requester,
+                                           const uint8_t *request_id,
+                                           bool accepted)
+{
+    if (!requester || !request_id) return;
+    for (size_t i = 0; i < MAX_TRANSPORT_PEERS; ++i) {
+        if (!atomic_load(&s_peers[i].active) ||
+            !atomic_load(&s_peers[i].application_authorized) ||
+            !s_peers[i].session_id_seen ||
+            memcmp(s_peers[i].client_fingerprint, requester, LEASE_ID_SIZE) != 0) continue;
+        kvmctl_hid_event_t response = {0};
+        response.type = KVMCTL_HID_TAKEOVER_RESPONSE;
+        memcpy(response.session_id, s_peers[i].session_id, sizeof(response.session_id));
+        response.lease_epoch = s_lease.epoch;
+        memcpy(response.request_id, request_id, sizeof(response.request_id));
+        response.accepted = accepted;
+        (void)queue_response(&s_peers[i], &response);
+        return;
+    }
 }
 
 static void queue_error_locked(transport_peer_t *slot, const kvmctl_hid_event_t *event, const char *code)
@@ -184,7 +228,7 @@ static void queue_notice_locked(transport_peer_t *slot, const kvmctl_hid_event_t
         memcpy(notice.session_id, s_peers[i].session_id, sizeof(notice.session_id));
         notice.lease_epoch = s_lease.epoch;
         memcpy(notice.request_id, request->request_id, sizeof(notice.request_id));
-        memcpy(notice.requester, lease_slot_identity((int)(slot - s_peers)), sizeof(notice.requester));
+        memcpy(notice.requester, lease_slot_identity(peer_index(slot)), sizeof(notice.requester));
         notice.response_window_ms = LEASE_TAKEOVER_WINDOW_MS;
         (void)queue_response(&s_peers[i], &notice);
     }
@@ -229,18 +273,26 @@ static int accept_scripted_event(int slot, const kvmctl_hid_event_t *event)
         break;
     case KVMCTL_HID_TAKEOVER_RESPONSE: {
         bool had_pending = s_lease.pending;
+        uint8_t requester[LEASE_ID_SIZE] = {0};
+        if (had_pending) memcpy(requester, s_lease.pending_requester, sizeof(requester));
         lease_result = lease_takeover_response(&s_lease, lease_slot_identity(slot),
-                                               event->request_id, event->accepted);
+                                               event->lease_epoch, event->request_id,
+                                               event->accepted);
         result = event->accepted ? lease_result == LEASE_TAKEOVER_ACCEPTED
                                  : had_pending && lease_result == LEASE_REJECTED && !s_lease.pending;
-        if (result) { for (size_t i = 0; i < MAX_TRANSPORT_PEERS; ++i) queue_state_locked(&s_peers[i]); }
+        if (result && event->accepted) {
+            queue_takeover_response_locked(requester, event->request_id, true);
+        } else if (result) {
+            queue_takeover_response_locked(requester, event->request_id, false);
+            queue_state_to_peers_locked();
+        }
         else { queue_error_locked(&s_peers[slot], event, "unauthorized"); result = 2; }
         if (event->accepted) result = 2;
         break;
     }
     case KVMCTL_HID_LEASE_RELEASE:
         lease_result = lease_release(&s_lease, lease_slot_identity(slot), event->lease_epoch, now);
-        if (lease_result == LEASE_TAKEOVER_GRANTED || lease_result == LEASE_RELEASED) { for (size_t i = 0; i < MAX_TRANSPORT_PEERS; ++i) queue_state_locked(&s_peers[i]); result = 2; }
+        if (lease_result == LEASE_TAKEOVER_GRANTED || lease_result == LEASE_RELEASED) { queue_state_to_peers_locked(); result = 2; }
         else { queue_error_locked(&s_peers[slot], event, s_lease.active ? "stale_epoch" : "lease_expired"); result = 2; }
         break;
     case KVMCTL_HID_KEYBOARD_STATE:
@@ -429,27 +481,49 @@ static bool send_echo(esp_peer_handle_t peer, echo_channel_t *channel)
 
 static bool send_response(esp_peer_handle_t peer, transport_peer_t *slot)
 {
-    if (!slot->responses.count) return true;
-    uint8_t index = slot->responses.head;
-    esp_peer_data_frame_t frame = {.stream_id = slot->control.stream, .data = slot->responses.data[index], .size = slot->responses.size[index]};
+    int peer_index_value = peer_index(slot);
+    if (peer_index_value < 0) return false;
+    uint8_t data[CONTROL_CAPACITY];
+    uint16_t size = 0;
+    uint8_t index = 0;
+    portENTER_CRITICAL(&s_response_mux[peer_index_value]);
+    if (slot->responses.count) {
+        index = slot->responses.head;
+        size = slot->responses.size[index];
+        memcpy(data, slot->responses.data[index], size);
+    }
+    portEXIT_CRITICAL(&s_response_mux[peer_index_value]);
+    if (!size) return true;
+
+    esp_peer_data_frame_t frame = {.stream_id = slot->control.stream, .data = data, .size = size};
     int ret = esp_peer_send_data(peer, &frame);
     if (ret == ESP_PEER_ERR_WOULD_BLOCK) return true;
     if (ret != ESP_PEER_ERR_NONE) return false;
-    slot->responses.head = (uint8_t)((index + 1) % RESPONSE_QUEUE_DEPTH);
-    --slot->responses.count;
+
+    portENTER_CRITICAL(&s_response_mux[peer_index_value]);
+    if (slot->responses.count && slot->responses.head == index &&
+        slot->responses.size[index] == size) {
+        slot->responses.head = (uint8_t)((index + 1) % RESPONSE_QUEUE_DEPTH);
+        --slot->responses.count;
+    }
+    portEXIT_CRITICAL(&s_response_mux[peer_index_value]);
     return true;
 }
 
 static void peer_cleanup(transport_peer_t *slot)
 {
     portENTER_CRITICAL(&s_lease_mux);
+    lease_result_t revoke_result = LEASE_NOOP;
     if (s_lease.active && memcmp(s_lease.owner, slot->client_fingerprint, LEASE_ID_SIZE) == 0) {
-        (void)lease_revoke(&s_lease, slot->client_fingerprint,
-                           (uint64_t)esp_timer_get_time() / 1000ULL);
+        revoke_result = lease_revoke(&s_lease, slot->client_fingerprint,
+                                     (uint64_t)esp_timer_get_time() / 1000ULL);
     } else if (s_lease.pending &&
                memcmp(s_lease.pending_requester, slot->client_fingerprint, LEASE_ID_SIZE) == 0) {
-        (void)lease_revoke(&s_lease, slot->client_fingerprint,
-                           (uint64_t)esp_timer_get_time() / 1000ULL);
+        revoke_result = lease_revoke(&s_lease, slot->client_fingerprint,
+                                     (uint64_t)esp_timer_get_time() / 1000ULL);
+    }
+    if (revoke_result == LEASE_TAKEOVER_GRANTED || revoke_result == LEASE_REVOKED) {
+        queue_state_to_peers_locked();
     }
     portEXIT_CRITICAL(&s_lease_mux);
     atomic_fetch_sub(&s_open_channels, slot->open_channels);
@@ -457,7 +531,12 @@ static void peer_cleanup(transport_peer_t *slot)
     memset(slot->answer, 0, sizeof(slot->answer));
     memset(&slot->control, 0, sizeof(slot->control));
     memset(&slot->motion, 0, sizeof(slot->motion));
-    memset(&slot->responses, 0, sizeof(slot->responses));
+    int response_peer = peer_index(slot);
+    if (response_peer >= 0) {
+        portENTER_CRITICAL(&s_response_mux[response_peer]);
+        memset(&slot->responses, 0, sizeof(slot->responses));
+        portEXIT_CRITICAL(&s_response_mux[response_peer]);
+    }
     slot->answer_len = 0;
     slot->open_channels = 0;
     mbedtls_platform_zeroize(slot->client_fingerprint, sizeof(slot->client_fingerprint));
@@ -556,6 +635,7 @@ static transport_peer_t *find_slot(const uint8_t *fingerprint, uint32_t generati
 }
 
 static esp_err_t transport_offer_internal(const uint8_t *client_fingerprint,
+                                          const uint8_t *session_id,
                                           const uint8_t *offer, size_t offer_len,
                                           uint8_t *answer, size_t answer_capacity,
                                           size_t *answer_len, uint32_t *generation)
@@ -568,6 +648,11 @@ static esp_err_t transport_offer_internal(const uint8_t *client_fingerprint,
         if ((offer[i] < 0x20 && offer[i] != '\r' && offer[i] != '\n' && offer[i] != '\t') || offer[i] > 0x7e) return ESP_ERR_INVALID_ARG;
     }
     if (client_fingerprint && !client_auth_is_enrolled(client_fingerprint)) return ESP_ERR_INVALID_STATE;
+    if (session_id) {
+        uint8_t any_session_byte = 0;
+        for (size_t i = 0; i < 16; ++i) any_session_byte |= session_id[i];
+        if (any_session_byte == 0) return ESP_ERR_INVALID_ARG;
+    }
     transport_peer_t *slot = NULL;
     portENTER_CRITICAL(&s_peer_mux);
     if (client_fingerprint) {
@@ -631,13 +716,22 @@ static esp_err_t transport_offer_internal(const uint8_t *client_fingerprint,
     slot->open_channels = 0;
     slot->control_sequence = 0;
     slot->motion_sequence = 0;
-    slot->response_sequence = 0;
     slot->motion_sequence_seen = false;
     slot->session_id_seen = false;
     memset(slot->session_id, 0, sizeof(slot->session_id));
+    if (session_id) {
+        memcpy(slot->session_id, session_id, sizeof(slot->session_id));
+        slot->session_id_seen = true;
+    }
     memset(&slot->control, 0, sizeof(slot->control));
     memset(&slot->motion, 0, sizeof(slot->motion));
-    memset(&slot->responses, 0, sizeof(slot->responses));
+    int response_peer = peer_index(slot);
+    if (response_peer >= 0) {
+        portENTER_CRITICAL(&s_response_mux[response_peer]);
+        slot->response_sequence = 0;
+        memset(&slot->responses, 0, sizeof(slot->responses));
+        portEXIT_CRITICAL(&s_response_mux[response_peer]);
+    }
     memcpy(slot->offer, offer, offer_len);
     slot->offer[offer_len] = 0;
     if (xTaskCreate(peer_task, "webrtc_peer", 24 * 1024, slot, 5, NULL) != pdPASS) {
@@ -658,11 +752,12 @@ static esp_err_t transport_offer_internal(const uint8_t *client_fingerprint,
 }
 
 esp_err_t transport_offer(const uint8_t *offer, size_t offer_len, uint8_t *answer, size_t answer_capacity, size_t *answer_len)
-{ return transport_offer_internal(NULL, offer, offer_len, answer, answer_capacity, answer_len, NULL); }
+{ return transport_offer_internal(NULL, NULL, offer, offer_len, answer, answer_capacity, answer_len, NULL); }
 
-esp_err_t transport_offer_for_client(const uint8_t fingerprint[32], const uint8_t *offer, size_t offer_len,
+esp_err_t transport_offer_for_client(const uint8_t fingerprint[32], const uint8_t session_id[16],
+                                     const uint8_t *offer, size_t offer_len,
                                      uint8_t *answer, size_t answer_capacity, size_t *answer_len, uint32_t *generation)
-{ return fingerprint && generation && client_auth_is_enrolled(fingerprint) ? transport_offer_internal(fingerprint, offer, offer_len, answer, answer_capacity, answer_len, generation) : ESP_ERR_INVALID_STATE; }
+{ return fingerprint && session_id && generation && client_auth_is_enrolled(fingerprint) ? transport_offer_internal(fingerprint, session_id, offer, offer_len, answer, answer_capacity, answer_len, generation) : ESP_ERR_INVALID_STATE; }
 
 esp_err_t transport_close(void)
 {
@@ -777,9 +872,11 @@ void transport_get_metrics(transport_metrics_t *metrics)
     metrics->scripted_reorders = atomic_load(&s_scripted_reorders);
     metrics->response_queue_depth = 0;
     for (size_t i = 0; i < MAX_TRANSPORT_PEERS; ++i) {
+        portENTER_CRITICAL(&s_response_mux[i]);
         if (s_peers[i].responses.count > metrics->response_queue_depth) {
             metrics->response_queue_depth = s_peers[i].responses.count;
         }
+        portEXIT_CRITICAL(&s_response_mux[i]);
     }
     portENTER_CRITICAL(&s_lease_mux);
     metrics->lease_epoch = s_lease.epoch;

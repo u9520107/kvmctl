@@ -59,7 +59,7 @@ static bool signed16(reader_t *r, int16_t *out)
         *out = (int16_t)value;
         return true;
     }
-    if (major != 1 || !head(r, 1, &value) || value > 32766) return false;
+    if (major != 1 || !head(r, 1, &value) || value > 32767) return false;
     *out = (int16_t)(-1 - (int32_t)value);
     return true;
 }
@@ -206,7 +206,8 @@ size_t kvmctl_hid_encode(const kvmctl_hid_event_t *event, uint8_t *data,
                          size_t capacity)
 {
     if (!event || !data || capacity == 0 ||
-        (event->type != KVMCTL_HID_LEASE_STATE &&
+        (event->type != KVMCTL_HID_TAKEOVER_RESPONSE &&
+         event->type != KVMCTL_HID_LEASE_STATE &&
          event->type != KVMCTL_HID_TAKEOVER_NOTICE &&
          event->type != KVMCTL_HID_ERROR)) return 0;
     uint8_t any_session_byte = 0;
@@ -235,7 +236,12 @@ size_t kvmctl_hid_encode(const kvmctl_hid_event_t *event, uint8_t *data,
     write_uint(&w, 4); write_uint(&w, event->lease_epoch);
     write_uint(&w, 5); write_uint(&w, event->sequence);
     write_uint(&w, 6);
-    if (event->type == KVMCTL_HID_LEASE_STATE) {
+    if (event->type == KVMCTL_HID_TAKEOVER_RESPONSE) {
+        write_head(&w, 5, 2); write_uint(&w, 0);
+        write_bytes(&w, event->request_id, sizeof(event->request_id));
+        write_uint(&w, 1); if (w.ok && w.pos < w.len) w.data[w.pos++] = event->accepted ? 0xf5 : 0xf4;
+        else w.ok = false;
+    } else if (event->type == KVMCTL_HID_LEASE_STATE) {
         write_head(&w, 5, 2); write_uint(&w, 0);
         if (event->owner_present) write_bytes(&w, event->owner, sizeof(event->owner));
         else if (w.ok && w.pos < w.len) w.data[w.pos++] = 0xf6;
@@ -289,6 +295,12 @@ bool kvmctl_hid_check_vectors(void)
     response.state = 0;
     uint8_t encoded[KVMCTL_HID_MAX_CONTROL];
     size_t encoded_length = kvmctl_hid_encode(&response, encoded, sizeof(encoded));
+    if (encoded_length == 0 || !kvmctl_hid_decode(encoded, encoded_length, false, &event) ||
+        event.type != KVMCTL_HID_LEASE_STATE || event.owner_present || event.state != 0) return false;
+    response.type = KVMCTL_HID_TAKEOVER_RESPONSE;
+    response.request_id[0] = 1;
+    response.accepted = true;
+    encoded_length = kvmctl_hid_encode(&response, encoded, sizeof(encoded));
     return encoded_length != 0 && kvmctl_hid_decode(encoded, encoded_length, false, &event) &&
-           event.type == KVMCTL_HID_LEASE_STATE && !event.owner_present && event.state == 0;
+           event.type == KVMCTL_HID_TAKEOVER_RESPONSE && event.request_id[0] == 1 && event.accepted;
 }

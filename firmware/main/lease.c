@@ -101,9 +101,11 @@ lease_result_t lease_request(lease_state_t *lease, const uint8_t *requester,
 }
 
 lease_result_t lease_takeover_response(lease_state_t *lease, const uint8_t *owner,
-                                       const uint8_t *request_id, bool accepted)
+                                       uint32_t epoch, const uint8_t *request_id,
+                                       bool accepted)
 {
     if (lease == NULL || !lease->active || !lease->pending ||
+        lease->epoch != epoch ||
         !same_identity(lease->owner, owner) ||
         !same_request(lease->pending_request_id, request_id)) {
         return LEASE_REJECTED;
@@ -225,12 +227,18 @@ bool lease_check_vectors(void)
         lease_heartbeat(&lease, owner_a, epoch, 1000) != LEASE_HEARTBEAT_ACCEPTED ||
         lease_request(&lease, owner_b, request_b, 1000) != LEASE_TAKEOVER_PENDING ||
         lease_request(&lease, owner_c, request_c, 1000) != LEASE_BUSY ||
-        lease_takeover_response(&lease, owner_a, request_b, false) != LEASE_REJECTED ||
+        lease_takeover_response(&lease, owner_a, epoch, request_b, false) != LEASE_REJECTED ||
         lease.pending || !check_owner(&lease, owner_a, epoch)) return false;
 
     if (lease_request(&lease, owner_b, request_b, 1000) != LEASE_TAKEOVER_PENDING ||
-        lease_takeover_response(&lease, owner_a, request_b, true) != LEASE_TAKEOVER_ACCEPTED ||
-        lease_heartbeat(&lease, owner_a, epoch, 9000) != LEASE_HEARTBEAT_ACCEPTED ||
+        lease_takeover_response(&lease, owner_a, epoch + 1, request_b, true) != LEASE_REJECTED ||
+        !lease.pending ||
+        lease_takeover_response(&lease, owner_a, epoch, request_b, true) != LEASE_TAKEOVER_ACCEPTED ||
+        lease_heartbeat(&lease, owner_a, epoch, 2000) != LEASE_HEARTBEAT_ACCEPTED ||
+        lease_heartbeat(&lease, owner_a, epoch, 4000) != LEASE_HEARTBEAT_ACCEPTED ||
+        lease_heartbeat(&lease, owner_a, epoch, 6000) != LEASE_HEARTBEAT_ACCEPTED ||
+        lease_heartbeat(&lease, owner_a, epoch, 8000) != LEASE_HEARTBEAT_ACCEPTED ||
+        lease_heartbeat(&lease, owner_a, epoch, 10000) != LEASE_HEARTBEAT_ACCEPTED ||
         lease_tick(&lease, 10999) != LEASE_NOOP ||
         lease_tick(&lease, 11000) != LEASE_TAKEOVER_GRANTED ||
         lease.active == false || !same_identity(lease.owner, owner_b) ||

@@ -872,6 +872,7 @@ async fn exchange_signaling(
                 if scripted {
                     scripted_transport_zero_hid(
                         &*runtime,
+                        monitor,
                         &control,
                         &motion,
                         session.session_id(),
@@ -1013,6 +1014,10 @@ enum EndpointResponse {
         owner: Option<[u8; 32]>,
         state: u8,
     },
+    TakeoverResponse {
+        request_id: [u8; 16],
+        accepted: bool,
+    },
     TakeoverNotice {
         request_id: [u8; 16],
         requester: [u8; 32],
@@ -1064,6 +1069,13 @@ impl ResponseCursor {
             crate::hid_protocol::Event::LeaseState { owner, state } => {
                 EndpointResponse::LeaseState { owner, state }
             }
+            crate::hid_protocol::Event::TakeoverResponse {
+                request_id,
+                accepted,
+            } => EndpointResponse::TakeoverResponse {
+                request_id,
+                accepted,
+            },
             crate::hid_protocol::Event::TakeoverNotice {
                 request_id,
                 requester,
@@ -1113,8 +1125,47 @@ async fn send_hid_event(
     Ok(())
 }
 
+fn wait_for_scripted_telemetry(
+    monitor: &PortMonitor,
+    baseline: &crate::TransportMetrics,
+    expected_events: u32,
+    expected_sequence: u64,
+) -> Result<()> {
+    let target = baseline
+        .scripted_events
+        .checked_add(expected_events)
+        .context("scripted telemetry event count overflowed")?;
+    let deadline = Instant::now() + Duration::from_secs(5);
+    loop {
+        let metrics = monitor.fresh_snapshot()?;
+        ensure!(
+            metrics.scripted_rejections == baseline.scripted_rejections,
+            "scripted event was rejected before telemetry barrier"
+        );
+        ensure!(
+            metrics.scripted_drops == baseline.scripted_drops
+                && metrics.scripted_reorders == baseline.scripted_reorders,
+            "scripted event was dropped or reordered before telemetry barrier"
+        );
+        if metrics.scripted_events >= target && metrics.last_event_sequence == expected_sequence {
+            return Ok(());
+        }
+        if Instant::now() >= deadline {
+            bail!(
+                "scripted telemetry barrier timed out: events={} target={} last_sequence={} expected_sequence={}",
+                metrics.scripted_events,
+                target,
+                metrics.last_event_sequence,
+                expected_sequence
+            );
+        }
+        std::thread::sleep(Duration::from_millis(25));
+    }
+}
+
 async fn scripted_transport_zero_hid(
     runtime: &dyn Runtime,
+    monitor: &PortMonitor,
     control: &Arc<dyn DataChannel>,
     motion: &Arc<dyn DataChannel>,
     session_id: [u8; 16],
@@ -1144,6 +1195,9 @@ async fn scripted_transport_zero_hid(
         },
     )
     .context("lease request response")?;
+    let telemetry_baseline = monitor
+        .fresh_snapshot()
+        .context("scripted telemetry baseline")?;
 
     send_hid_event(
         control,
@@ -1186,11 +1240,15 @@ async fn scripted_transport_zero_hid(
         ),
     )
     .await?;
+    wait_for_scripted_telemetry(monitor, &telemetry_baseline, 4, 4)
+        .context("control telemetry barrier")?;
     send_hid_event(
         motion,
         event(hid_protocol::MOTION, 1, 0, Event::Motion { dx: 12, dy: -4 }),
     )
     .await?;
+    wait_for_scripted_telemetry(monitor, &telemetry_baseline, 5, 0)
+        .context("motion telemetry barrier")?;
     send_hid_event(
         control,
         event(hid_protocol::LEASE_RELEASE, 1, 5, Event::LeaseRelease),
@@ -1694,6 +1752,26 @@ mod tests {
             EndpointResponse::LeaseState {
                 owner: Some([8; 32]),
                 state: 1,
+            }
+        );
+
+        let takeover_response = crate::hid_protocol::Envelope {
+            message_type: crate::hid_protocol::TAKEOVER_RESPONSE,
+            session_id,
+            lease_epoch: 1,
+            sequence: 1,
+            event: crate::hid_protocol::Event::TakeoverResponse {
+                request_id: [3; 16],
+                accepted: true,
+            },
+        };
+        assert_eq!(
+            cursor
+                .decode(&crate::hid_protocol::encode(&takeover_response), 1)
+                .unwrap(),
+            EndpointResponse::TakeoverResponse {
+                request_id: [3; 16],
+                accepted: true,
             }
         );
 

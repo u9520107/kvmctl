@@ -538,7 +538,8 @@ static esp_err_t process_message(httpd_req_t *req, signaling_session_t *s, size_
         if (psa_hash_compute(PSA_ALG_SHA_256, offer, offer_len, s->transcript.offer_hash,
                              sizeof(s->transcript.offer_hash), &hash_len) != PSA_SUCCESS ||
             hash_len != sizeof(s->transcript.offer_hash)) return ESP_FAIL;
-        esp_err_t err = transport_offer_for_client(s->challenge.client_fingerprint, offer, offer_len,
+        esp_err_t err = transport_offer_for_client(s->challenge.client_fingerprint,
+                                                    s->challenge.session_id, offer, offer_len,
                                                     s->answer, MAX_SDP_BYTES, &s->answer_len,
                                                     &s->transport_generation);
         if (err == ESP_ERR_INVALID_STATE) { send_error(req, s, "busy"); return ESP_FAIL; }
@@ -584,7 +585,7 @@ static esp_err_t process_message(httpd_req_t *req, signaling_session_t *s, size_
             send_error(req, s, "unauthorized"); return ESP_FAIL;
         }
         mbedtls_platform_zeroize(signature, sizeof(signature));
-        if (!s->transport_bound || transport_status() != TRANSPORT_STATUS_OPEN ||
+        if (!s->transport_bound ||
             transport_authorize_client(s->challenge.client_fingerprint, s->transport_generation) != ESP_OK) {
             send_error(req, s, "identity_failed"); return ESP_FAIL;
         }

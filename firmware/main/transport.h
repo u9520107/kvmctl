@@ -44,6 +44,7 @@ esp_err_t transport_init(void);
 esp_err_t transport_offer(const uint8_t *offer, size_t offer_len,
                           uint8_t *answer, size_t answer_capacity, size_t *answer_len);
 esp_err_t transport_offer_for_client(const uint8_t fingerprint[32],
+                                     const uint8_t session_id[16],
                                      const uint8_t *offer, size_t offer_len,
                                      uint8_t *answer, size_t answer_capacity, size_t *answer_len,
                                      uint32_t *generation);
