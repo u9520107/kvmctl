@@ -411,6 +411,10 @@ pub struct Session {
 }
 
 impl Session {
+    pub fn session_id(&self) -> [u8; 16] {
+        self.session_id
+    }
+
     pub fn connect(
         address: SocketAddr,
         certificate_hostname: &str,

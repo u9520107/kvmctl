@@ -318,6 +318,7 @@ ESP32-S3 USB-OTG and USB-Serial-JTAG share one internal PHY and cannot operate s
 ### Test telemetry contract
 
 Scripted transport mode uses the same USB-enrolled identity, pinned WSS, signed transcript, WebRTC DataChannels, CBOR parser, and event decoder as live control, but the firmware must not emit USB HID. Include event sequence, endpoint monotonic timestamp, receive queue depth, drop/reorder counts, normalized key/button state, and lease epoch. HID bench mode adds a host Raw Input observer filtered to the selected endpoint's current USB device identity, not a fixed sample serial. Report board-local processing and same-host send-to-HID receipt separately. Report one-way timing only after defining clock mapping and uncertainty; otherwise report RTT and local durations. Implement this telemetry with M1.4; live physical-input capture stays disabled until M2's live-input gates pass.
+The USB transport-status result is the bounded telemetry snapshot for scripted mode: last event sequence, board timestamp, lease epoch, response queue depth, event/rejection/drop/reorder counters, and normalized held key/button flags. Older status responses may omit these optional fields; clients treat omitted telemetry as zero.
 
 ## Design details still to resolve
 

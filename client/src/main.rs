@@ -9,6 +9,8 @@ mod discovery;
 #[cfg(windows)]
 mod flash;
 #[cfg(windows)]
+mod hid_protocol;
+#[cfg(windows)]
 mod protocol;
 #[cfg(windows)]
 mod signaling;
@@ -54,6 +56,16 @@ struct TransportMetrics {
     tls_diagnostic: [u8; 96],
     tls_diagnostic_len: usize,
     tls_rate_limited: u32,
+    board_timestamp_ms: u64,
+    lease_epoch: u32,
+    last_event_sequence: u64,
+    response_queue_depth: u32,
+    scripted_events: u32,
+    scripted_rejections: u32,
+    scripted_drops: u32,
+    scripted_reorders: u32,
+    normalized_keys: u32,
+    normalized_buttons: u32,
 }
 
 impl Default for TransportMetrics {
@@ -72,6 +84,16 @@ impl Default for TransportMetrics {
             tls_diagnostic: [0; 96],
             tls_diagnostic_len: 0,
             tls_rate_limited: 0,
+            board_timestamp_ms: 0,
+            lease_epoch: 0,
+            last_event_sequence: 0,
+            response_queue_depth: 0,
+            scripted_events: 0,
+            scripted_rejections: 0,
+            scripted_drops: 0,
+            scripted_reorders: 0,
+            normalized_keys: 0,
+            normalized_buttons: 0,
         }
     }
 }
@@ -289,7 +311,10 @@ fn decode_transport_status_response(
         ));
     }
     r.expect_uint(5)?;
-    r.expect_map(12)?;
+    let (result_major, result_fields) = r.head()?;
+    if result_major != 5 || (result_fields != 12 && result_fields != 22) {
+        return Err("invalid transport telemetry field count".into());
+    }
     let mut values = [0; 10];
     for (key, value) in values.iter_mut().enumerate() {
         r.expect_uint(key as u64)?;
@@ -299,10 +324,19 @@ fn decode_transport_status_response(
     let diagnostic = r.text()?;
     r.expect_uint(11)?;
     let tls_rate_limited = r.uint()?;
+    let mut telemetry = [0u64; 10];
+    if result_fields == 22 {
+        for (index, value) in telemetry.iter_mut().enumerate() {
+            r.expect_uint((index + 12) as u64)?;
+            *value = r.uint()?;
+        }
+    }
     if values[0] > 4
         || values[1..].iter().any(|value| *value > u32::MAX as u64)
         || diagnostic.len() > 96
         || tls_rate_limited > u32::MAX as u64
+        || telemetry[1] > u32::MAX as u64
+        || telemetry[3..].iter().any(|value| *value > u32::MAX as u64)
         || !r.done()
     {
         return Err("invalid transport status response".into());
@@ -323,6 +357,16 @@ fn decode_transport_status_response(
         tls_diagnostic,
         tls_diagnostic_len: diagnostic.len(),
         tls_rate_limited: tls_rate_limited as u32,
+        board_timestamp_ms: telemetry[0],
+        lease_epoch: telemetry[1] as u32,
+        last_event_sequence: telemetry[2],
+        response_queue_depth: telemetry[3] as u32,
+        scripted_events: telemetry[4] as u32,
+        scripted_rejections: telemetry[5] as u32,
+        scripted_drops: telemetry[6] as u32,
+        scripted_reorders: telemetry[7] as u32,
+        normalized_keys: telemetry[8] as u32,
+        normalized_buttons: telemetry[9] as u32,
     })
 }
 
@@ -1549,7 +1593,7 @@ fn run() -> Result<(), String> {
     let command = args.first().map(String::as_str).unwrap_or("status");
     if command == "--help" || command == "-h" {
         println!(
-            "kvmctl [status [COMx] | wifi [COMx] | enroll [COMx] | clients [COMx] | revoke [COMx] <fingerprint|all> | discover [COMx] | signaling-test [COMx] [scenario [IPv4] | IPv4] | led [COMx] on|off <brightness> <RRGGBB> | transport-test [COMx] | flash [COMx] <firmware.bin> <backup.bin> | ports]; no arguments opens the control window"
+            "kvmctl [status [COMx] | wifi [COMx] | enroll [COMx] | clients [COMx] | revoke [COMx] <fingerprint|all> | discover [COMx] | signaling-test [COMx] [scenario [IPv4] | IPv4] | led [COMx] on|off <brightness> <RRGGBB> | transport-test [COMx] | flash [COMx] <firmware.bin> <backup.bin> | ports]; scenario scripted sends opt-in events with zero HID output"
         );
         return Ok(());
     }
@@ -1623,6 +1667,7 @@ fn run() -> Result<(), String> {
                             | "replay"
                             | "resources"
                             | "revoke-active"
+                            | "scripted"
                     )
             })
             || params
@@ -2169,7 +2214,7 @@ mod tests {
         put_uint(&mut response, 4);
         put_uint(&mut response, 0);
         put_uint(&mut response, 5);
-        put_head(&mut response, 5, 12);
+        put_head(&mut response, 5, 22);
         for (key, value) in [
             (0, 3),
             (1, 50_000),
@@ -2189,6 +2234,21 @@ mod tests {
         put_text(&mut response, b"ESP-TLS: handshake_failure");
         put_uint(&mut response, 11);
         put_uint(&mut response, 17);
+        for (key, value) in [
+            (12, 123_456_u64),
+            (13, 9),
+            (14, 8),
+            (15, 2),
+            (16, 7),
+            (17, 1),
+            (18, 2),
+            (19, 3),
+            (20, 1),
+            (21, 0),
+        ] {
+            put_uint(&mut response, key);
+            put_uint(&mut response, value);
+        }
         let metrics = decode_transport_status_response(&response, &id).unwrap();
         assert_eq!(metrics.state, 3);
         assert_eq!(metrics.internal_free_min, 40_000);
@@ -2197,6 +2257,12 @@ mod tests {
         assert_eq!(metrics.application_bytes_received, 0);
         assert_eq!(metrics.peer_task_cpu_us, 321);
         assert_eq!(metrics.tls_rate_limited, 17);
+        assert_eq!(metrics.board_timestamp_ms, 123_456);
+        assert_eq!(metrics.lease_epoch, 9);
+        assert_eq!(metrics.last_event_sequence, 8);
+        assert_eq!(metrics.response_queue_depth, 2);
+        assert_eq!(metrics.scripted_drops, 2);
+        assert_eq!(metrics.normalized_keys, 1);
         assert_eq!(
             &metrics.tls_diagnostic[..metrics.tls_diagnostic_len],
             b"ESP-TLS: handshake_failure"

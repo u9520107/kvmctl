@@ -10,6 +10,8 @@
 #include "signaling.h"
 #include "usb_admin.h"
 #include "transport.h"
+#include "hid_protocol.h"
+#include "lease.h"
 #include "wifi_setup.h"
 #include <stdbool.h>
 #include <stdint.h>
@@ -72,6 +74,14 @@ void app_main(void)
     err = signaling_check_shared_vectors();
     if (err != ESP_OK) {
         ESP_LOGE(TAG, "M1.3 challenge/transcript vectors do not match: %s", esp_err_to_name(err));
+        abort();
+    }
+    if (!kvmctl_hid_check_vectors()) {
+        ESP_LOGE(TAG, "M1.4 HID envelope vector check failed");
+        abort();
+    }
+    if (!lease_check_vectors()) {
+        ESP_LOGE(TAG, "M1.4 lease vector check failed");
         abort();
     }
     err = client_auth_init();

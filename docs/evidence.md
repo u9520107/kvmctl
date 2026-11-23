@@ -745,3 +745,55 @@ Closed 2026-11-16 after the user's report that the refreshed list omits a hotspo
 ### Wi-Fi refresh button animation
 
 The refresh request now runs on a worker thread while the Win32 message loop remains active. The button cycles through `Refreshing.`, `Refreshing..`, and `Refreshing...` until the host scan completes, then returns to `Refresh list`. This follow-up passed `cargo check --workspace --tests --offline --target x86_64-pc-windows-msvc`; interactive animation has not been run in this session. User can launch it with `cargo run --offline -p kvmctl`.
+
+### M1.4 zero-HID slice started (2026-11-23)
+
+The first M1.4 code slice keeps pinned WSS, signed transcript, and DTLS identity
+gates unchanged. `client/src/hid_protocol.rs` encodes and strictly decodes the
+protocol 1.0 DataChannel envelope and lease/event payloads without a new
+dependency. It rejects non-shortest integers, wrong map sizes, unknown or
+out-of-order keys, unsupported types, invalid booleans, unsorted keyboard keys,
+invalid button masks, stale epochs, and size limits. The Rust lease model covers
+one owner, one pending takeover, explicit rejection, a 10-second window, 1-second
+heartbeat, 3-second expiry, release, revoke, and restart cleanup. Shared heartbeat
+Shared heartbeat vector is checked by firmware startup through `hid_protocol.c`; the
+pure-C lease state machine is also startup-checked through `lease.c`.
+
+Authenticated firmware `on_data()` sends CBOR-looking DataChannel messages through
+the strict C decoder and bounded sequence checks. Raw transport-test payloads still
+echo for observability; scripted CBOR events receive lease responses and emit zero
+HID reports. Physical-input capture remains disabled. Opt-in `signaling-test scripted`
+sends key, modifier, button, wheel, and relative-motion events through the secure
+path and validates endpoint lease state. It does not enable HID output.
+
+The follow-up response slice adds canonical firmware encoding and bounded per-peer
+response queues for `lease_state`, `takeover_notice`, and stable lease errors. The
+Rust client now consumes endpoint responses with exact session, direction sequence,
+and lease-epoch checks; CBOR input events are no longer echoed by the scripted path.
+USB transport status exposes board timestamp, last event sequence, lease epoch,
+response queue depth, scripted event/rejection/drop/reorder counts, and normalized
+held key/button state.
+
+The host lease vector now includes two enrolled-identity roles and covers explicit
+rejection, competing requests, explicit rejection, early release, owner expiry,
+10-second takeover timeout, reconnect, revoke, restart, stale epochs, and held-state
+cleanup. This is a deterministic model/script check; live two-client hardware
+exercise remains open.
+
+Host verification: `cargo test --workspace --offline
+--target x86_64-pc-windows-msvc` passed 41 tests; `cargo fmt --all -- --check` and
+`git diff --check` passed. Earlier M1.4 baseline changes compiled with the recorded
+ESP32-S3 command and strict host `clang` checks passed for `hid_protocol.c` and
+`lease.c`; the current telemetry/response edits have not been rerun through those
+checks because this host has no `clang`. The pinned product build script remains blocked
+because the temporary `esp_peer` source differs from the recorded revision;
+reconfiguration of the cached build also needs the unavailable component registry.
+The C guard harness still could not run through its Python entry point because that
+environment cannot invoke a compatible target compiler.
+
+M1.4 blockers still pending: compile/flash the exact product image on one ESP32-S3;
+run the live two-client/two-enrolled-identity takeover flow;
+verify HID reports with Windows Raw Input filtered to the selected board identity;
+and record build size, CPU, internal heap, PSRAM, setup/reconnect, queue/drop/reorder,
+transport RTT, board-local, and send-to-HID timings. PC Ethernet and pinned known-IP
+remain acceptance setup. Cross-user DPAPI and Surfshark-on DNS-SD stay deferred to M2.

@@ -27,6 +27,16 @@ typedef struct {
     uint32_t application_bytes_received;
     uint32_t peer_task_cpu_us;
     uint32_t tls_rate_limited;
+    uint64_t board_timestamp_ms;
+    uint32_t lease_epoch;
+    uint64_t last_event_sequence;
+    uint32_t response_queue_depth;
+    uint32_t scripted_events;
+    uint32_t scripted_rejections;
+    uint32_t scripted_drops;
+    uint32_t scripted_reorders;
+    uint32_t normalized_keys;
+    uint32_t normalized_buttons;
     char tls_diagnostic[TRANSPORT_DIAGNOSTIC_CAPACITY];
 } transport_metrics_t;
 

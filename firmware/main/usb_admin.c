@@ -332,7 +332,7 @@ static size_t encode_transport_status_response(const admin_request_t *request)
     transport_metrics_t metrics;
     transport_get_metrics(&metrics);
     if (!begin_response(request, 0, true, &pos) ||
-        !put_head(s_response, sizeof(s_response), &pos, 5, 12) ||
+        !put_head(s_response, sizeof(s_response), &pos, 5, 22) ||
         !put_uint(s_response, sizeof(s_response), &pos, 0) || !put_uint(s_response, sizeof(s_response), &pos, metrics.state) ||
         !put_uint(s_response, sizeof(s_response), &pos, 1) || !put_uint(s_response, sizeof(s_response), &pos, metrics.internal_free_start) ||
         !put_uint(s_response, sizeof(s_response), &pos, 2) || !put_uint(s_response, sizeof(s_response), &pos, metrics.internal_free_min) ||
@@ -344,7 +344,17 @@ static size_t encode_transport_status_response(const admin_request_t *request)
         !put_uint(s_response, sizeof(s_response), &pos, 8) || !put_uint(s_response, sizeof(s_response), &pos, metrics.application_bytes_received) ||
         !put_uint(s_response, sizeof(s_response), &pos, 9) || !put_uint(s_response, sizeof(s_response), &pos, metrics.peer_task_cpu_us) ||
         !put_uint(s_response, sizeof(s_response), &pos, 10) || !put_text(s_response, sizeof(s_response), &pos, metrics.tls_diagnostic) ||
-        !put_uint(s_response, sizeof(s_response), &pos, 11) || !put_uint(s_response, sizeof(s_response), &pos, metrics.tls_rate_limited)) return 0;
+        !put_uint(s_response, sizeof(s_response), &pos, 11) || !put_uint(s_response, sizeof(s_response), &pos, metrics.tls_rate_limited) ||
+        !put_uint(s_response, sizeof(s_response), &pos, 12) || !put_uint(s_response, sizeof(s_response), &pos, metrics.board_timestamp_ms) ||
+        !put_uint(s_response, sizeof(s_response), &pos, 13) || !put_uint(s_response, sizeof(s_response), &pos, metrics.lease_epoch) ||
+        !put_uint(s_response, sizeof(s_response), &pos, 14) || !put_uint(s_response, sizeof(s_response), &pos, metrics.last_event_sequence) ||
+        !put_uint(s_response, sizeof(s_response), &pos, 15) || !put_uint(s_response, sizeof(s_response), &pos, metrics.response_queue_depth) ||
+        !put_uint(s_response, sizeof(s_response), &pos, 16) || !put_uint(s_response, sizeof(s_response), &pos, metrics.scripted_events) ||
+        !put_uint(s_response, sizeof(s_response), &pos, 17) || !put_uint(s_response, sizeof(s_response), &pos, metrics.scripted_rejections) ||
+        !put_uint(s_response, sizeof(s_response), &pos, 18) || !put_uint(s_response, sizeof(s_response), &pos, metrics.scripted_drops) ||
+        !put_uint(s_response, sizeof(s_response), &pos, 19) || !put_uint(s_response, sizeof(s_response), &pos, metrics.scripted_reorders) ||
+        !put_uint(s_response, sizeof(s_response), &pos, 20) || !put_uint(s_response, sizeof(s_response), &pos, metrics.normalized_keys) ||
+        !put_uint(s_response, sizeof(s_response), &pos, 21) || !put_uint(s_response, sizeof(s_response), &pos, metrics.normalized_buttons)) return 0;
     return pos;
 }
 

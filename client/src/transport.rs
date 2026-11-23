@@ -651,6 +651,7 @@ impl Drop for PortMonitor {
 
 enum TranscriptProofCase<'a> {
     Valid {
+        scripted: bool,
         check_isolation: bool,
         check_resources: bool,
         revoke_after_authorization: bool,
@@ -864,10 +865,20 @@ async fn exchange_signaling(
                   started.elapsed().as_millis());
 
         match proof_case {
-            TranscriptProofCase::Valid { check_isolation, check_resources, revoke_after_authorization } => {
+            TranscriptProofCase::Valid { scripted, check_isolation, check_resources, revoke_after_authorization } => {
                 session.send_transcript_proof(&offer_exchange.client_transcript_proof)
                     .map_err(anyhow::Error::msg)?;
                 eprintln!("M1.3 AUTHORIZED client_proof=valid endpoint_transcript=verified dtls_identity=verified");
+                if scripted {
+                    scripted_transport_zero_hid(
+                        &*runtime,
+                        &control,
+                        &motion,
+                        session.session_id(),
+                        credential.fingerprint,
+                    )
+                    .await?;
+                }
                 if check_isolation {
                     test_competing_signaling(&*runtime, &control, &motion, address, hostname, status, credential, &offer_sdp).await?;
                 }
@@ -992,6 +1003,209 @@ async fn echo_signaling(
         count,
         rtts.iter().min().unwrap(),
         rtts.iter().max().unwrap()
+    );
+    Ok(())
+}
+
+#[derive(Debug, PartialEq, Eq)]
+enum EndpointResponse {
+    LeaseState {
+        owner: Option<[u8; 32]>,
+        state: u8,
+    },
+    TakeoverNotice {
+        request_id: [u8; 16],
+        requester: [u8; 32],
+        response_window_ms: u64,
+    },
+    Error {
+        code: String,
+    },
+}
+
+struct ResponseCursor {
+    session_id: [u8; 16],
+    next_sequence: u64,
+}
+
+impl ResponseCursor {
+    fn new(session_id: [u8; 16]) -> Self {
+        Self {
+            session_id,
+            next_sequence: 0,
+        }
+    }
+
+    fn decode(&mut self, data: &[u8], expected_epoch: u32) -> Result<EndpointResponse> {
+        let envelope = crate::hid_protocol::decode(data)
+            .map_err(|error| anyhow::anyhow!("strict event decode failed: {error:?}"))?;
+        ensure!(
+            envelope.session_id == self.session_id,
+            "endpoint response session ID mismatch"
+        );
+        ensure!(
+            envelope.sequence == self.next_sequence,
+            "endpoint response sequence mismatch: expected {}, received {}",
+            self.next_sequence,
+            envelope.sequence
+        );
+        if !matches!(&envelope.event, crate::hid_protocol::Event::Error { .. }) {
+            ensure!(
+                envelope.lease_epoch == expected_epoch,
+                "endpoint response lease epoch mismatch: expected {expected_epoch}, received {}",
+                envelope.lease_epoch
+            );
+        }
+        self.next_sequence = self
+            .next_sequence
+            .checked_add(1)
+            .context("endpoint response sequence exhausted")?;
+        Ok(match envelope.event {
+            crate::hid_protocol::Event::LeaseState { owner, state } => {
+                EndpointResponse::LeaseState { owner, state }
+            }
+            crate::hid_protocol::Event::TakeoverNotice {
+                request_id,
+                requester,
+                response_window_ms,
+            } => EndpointResponse::TakeoverNotice {
+                request_id,
+                requester,
+                response_window_ms,
+            },
+            crate::hid_protocol::Event::Error { code } => EndpointResponse::Error { code },
+            _ => bail!("unexpected endpoint response event"),
+        })
+    }
+}
+
+fn require_response(response: EndpointResponse, expected: EndpointResponse) -> Result<()> {
+    match response {
+        EndpointResponse::Error { code } => bail!("endpoint HID error: {code}"),
+        response => ensure!(response == expected, "unexpected endpoint response"),
+    }
+    Ok(())
+}
+
+async fn receive_endpoint_response(
+    runtime: &dyn Runtime,
+    control: &Arc<dyn DataChannel>,
+    cursor: &mut ResponseCursor,
+    expected_epoch: u32,
+) -> Result<EndpointResponse> {
+    loop {
+        match timeout(runtime, Duration::from_secs(5), control.poll()).await? {
+            Some(DataChannelEvent::OnMessage(message)) => {
+                return cursor.decode(&message.data, expected_epoch);
+            }
+            Some(DataChannelEvent::OnClose) | None => bail!("scripted control channel closed"),
+            _ => {}
+        }
+    }
+}
+
+async fn send_hid_event(
+    channel: &Arc<dyn DataChannel>,
+    event: crate::hid_protocol::Envelope,
+) -> Result<()> {
+    let encoded = crate::hid_protocol::encode(&event);
+    channel.send(BytesMut::from(encoded.as_slice())).await?;
+    Ok(())
+}
+
+async fn scripted_transport_zero_hid(
+    runtime: &dyn Runtime,
+    control: &Arc<dyn DataChannel>,
+    motion: &Arc<dyn DataChannel>,
+    session_id: [u8; 16],
+    client_fingerprint: [u8; 32],
+) -> Result<()> {
+    use crate::hid_protocol::{self, Envelope, Event};
+
+    let event = |message_type, lease_epoch, sequence, event| Envelope {
+        message_type,
+        session_id,
+        lease_epoch,
+        sequence,
+        event,
+    };
+    let mut responses = ResponseCursor::new(session_id);
+
+    send_hid_event(
+        control,
+        event(hid_protocol::LEASE_REQUEST, 0, 0, Event::LeaseRequest),
+    )
+    .await?;
+    require_response(
+        receive_endpoint_response(runtime, control, &mut responses, 1).await?,
+        EndpointResponse::LeaseState {
+            owner: Some(client_fingerprint),
+            state: 1,
+        },
+    )
+    .context("lease request response")?;
+
+    send_hid_event(
+        control,
+        event(hid_protocol::HEARTBEAT, 1, 1, Event::Heartbeat),
+    )
+    .await?;
+    send_hid_event(
+        control,
+        event(
+            hid_protocol::KEYBOARD_STATE,
+            1,
+            2,
+            Event::KeyboardState {
+                modifiers: 2,
+                keys: vec![(7, 4)],
+            },
+        ),
+    )
+    .await?;
+    send_hid_event(
+        control,
+        event(
+            hid_protocol::MOUSE_BUTTONS,
+            1,
+            3,
+            Event::MouseButtons { mask: 1 },
+        ),
+    )
+    .await?;
+    send_hid_event(
+        control,
+        event(
+            hid_protocol::WHEEL,
+            1,
+            4,
+            Event::Wheel {
+                vertical: 1,
+                horizontal: -1,
+            },
+        ),
+    )
+    .await?;
+    send_hid_event(
+        motion,
+        event(hid_protocol::MOTION, 1, 0, Event::Motion { dx: 12, dy: -4 }),
+    )
+    .await?;
+    send_hid_event(
+        control,
+        event(hid_protocol::LEASE_RELEASE, 1, 5, Event::LeaseRelease),
+    )
+    .await?;
+    require_response(
+        receive_endpoint_response(runtime, control, &mut responses, 2).await?,
+        EndpointResponse::LeaseState {
+            owner: None,
+            state: 0,
+        },
+    )
+    .context("lease release response")?;
+    eprintln!(
+        "M1.4 SCRIPTED secure_path=true key=true modifier=true button=true wheel=true motion=true hid_reports=0 physical_input_capture=off"
     );
     Ok(())
 }
@@ -1204,7 +1418,13 @@ pub(crate) fn run_signaling_test(
     ensure!(
         matches!(
             scenario,
-            "success" | "missing" | "invalid" | "replay" | "resources" | "revoke-active"
+            "success"
+                | "missing"
+                | "invalid"
+                | "replay"
+                | "resources"
+                | "revoke-active"
+                | "scripted"
         ),
         "unknown signaling-test scenario"
     );
@@ -1218,6 +1438,23 @@ pub(crate) fn run_signaling_test(
         result = Some(
             async {
                 match scenario {
+                    "scripted" => {
+                        let _proof = exchange_signaling(
+                            runtime.clone(),
+                            &monitor,
+                            address,
+                            &hostname,
+                            &status,
+                            &credential,
+                            TranscriptProofCase::Valid {
+                                scripted: true,
+                                check_isolation: false,
+                                check_resources: false,
+                                revoke_after_authorization: false,
+                            },
+                        )
+                        .await?;
+                    }
                     "success" => {
                         let _proof = exchange_signaling(
                             runtime.clone(),
@@ -1227,6 +1464,7 @@ pub(crate) fn run_signaling_test(
                             &status,
                             &credential,
                             TranscriptProofCase::Valid {
+                                scripted: false,
                                 check_isolation: true,
                                 check_resources: false,
                                 revoke_after_authorization: false,
@@ -1267,6 +1505,7 @@ pub(crate) fn run_signaling_test(
                             &status,
                             &credential,
                             TranscriptProofCase::Valid {
+                                scripted: false,
                                 check_isolation: false,
                                 check_resources: false,
                                 revoke_after_authorization: false,
@@ -1293,6 +1532,7 @@ pub(crate) fn run_signaling_test(
                             &status,
                             &credential,
                             TranscriptProofCase::Valid {
+                                scripted: false,
                                 check_isolation: false,
                                 check_resources: true,
                                 revoke_after_authorization: false,
@@ -1309,6 +1549,7 @@ pub(crate) fn run_signaling_test(
                             &status,
                             &credential,
                             TranscriptProofCase::Valid {
+                                scripted: false,
                                 check_isolation: false,
                                 check_resources: false,
                                 revoke_after_authorization: true,
@@ -1350,6 +1591,19 @@ pub(crate) fn run_signaling_test(
         metrics.psram_free_min,
         metrics.psram_free_end,
         metrics.application_bytes_received,
+    );
+    eprintln!(
+        "M1.4 TELEMETRY board_timestamp_ms={} lease_epoch={} last_event_sequence={} response_queue_depth={} scripted_events={} scripted_rejections={} scripted_drops={} scripted_reorders={} normalized_keys={} normalized_buttons={}",
+        metrics.board_timestamp_ms,
+        metrics.lease_epoch,
+        metrics.last_event_sequence,
+        metrics.response_queue_depth,
+        metrics.scripted_events,
+        metrics.scripted_rejections,
+        metrics.scripted_drops,
+        metrics.scripted_reorders,
+        metrics.normalized_keys,
+        metrics.normalized_buttons,
     );
     eprintln!(
         "M1.3 SIGNALING COMPLETE scenario={scenario} hid_reports=0 physical_input_capture=off"
@@ -1417,5 +1671,99 @@ mod tests {
             2
         );
         assert!(apply_test_fingerprint_fault(sdp, Some("unknown")).is_err());
+    }
+
+    #[test]
+    fn endpoint_responses_require_exact_session_sequence_and_epoch() {
+        let session_id = [7; 16];
+        let state = crate::hid_protocol::Envelope {
+            message_type: crate::hid_protocol::LEASE_STATE,
+            session_id,
+            lease_epoch: 1,
+            sequence: 0,
+            event: crate::hid_protocol::Event::LeaseState {
+                owner: Some([8; 32]),
+                state: 1,
+            },
+        };
+        let mut cursor = ResponseCursor::new(session_id);
+        assert_eq!(
+            cursor
+                .decode(&crate::hid_protocol::encode(&state), 1)
+                .unwrap(),
+            EndpointResponse::LeaseState {
+                owner: Some([8; 32]),
+                state: 1,
+            }
+        );
+
+        for (session_id, sequence, epoch) in
+            [([9; 16], 0, 1), (session_id, 1, 1), (session_id, 0, 2)]
+        {
+            let mut invalid = state.clone();
+            invalid.session_id = session_id;
+            invalid.sequence = sequence;
+            invalid.lease_epoch = epoch;
+            assert!(
+                ResponseCursor::new(state.session_id)
+                    .decode(&crate::hid_protocol::encode(&invalid), 1)
+                    .is_err()
+            );
+        }
+    }
+
+    #[test]
+    fn endpoint_notice_and_error_are_decoded_without_echo_assumption() {
+        let session_id = [7; 16];
+        let notice = crate::hid_protocol::Envelope {
+            message_type: crate::hid_protocol::TAKEOVER_NOTICE,
+            session_id,
+            lease_epoch: 4,
+            sequence: 0,
+            event: crate::hid_protocol::Event::TakeoverNotice {
+                request_id: [1; 16],
+                requester: [2; 32],
+                response_window_ms: 10_000,
+            },
+        };
+        assert_eq!(
+            ResponseCursor::new(session_id)
+                .decode(&crate::hid_protocol::encode(&notice), 4)
+                .unwrap(),
+            EndpointResponse::TakeoverNotice {
+                request_id: [1; 16],
+                requester: [2; 32],
+                response_window_ms: 10_000,
+            }
+        );
+
+        let error = crate::hid_protocol::Envelope {
+            message_type: crate::hid_protocol::ERROR,
+            session_id,
+            lease_epoch: 0,
+            sequence: 0,
+            event: crate::hid_protocol::Event::Error {
+                code: "busy".to_owned(),
+            },
+        };
+        let response = ResponseCursor::new(session_id)
+            .decode(&crate::hid_protocol::encode(&error), 0)
+            .unwrap();
+        assert_eq!(
+            response,
+            EndpointResponse::Error {
+                code: "busy".to_owned()
+            }
+        );
+        assert!(
+            require_response(
+                response,
+                EndpointResponse::LeaseState {
+                    owner: None,
+                    state: 0
+                }
+            )
+            .is_err()
+        );
     }
 }
