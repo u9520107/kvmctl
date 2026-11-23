@@ -1200,7 +1200,7 @@ pub(crate) fn run_signaling_test(
     status: crate::Status,
     credential: crate::credentials::ClientCredential,
     scenario: &str,
-) -> Result<()> {
+) -> Result<SocketAddr> {
     ensure!(
         matches!(
             scenario,
@@ -1354,7 +1354,7 @@ pub(crate) fn run_signaling_test(
     eprintln!(
         "M1.3 SIGNALING COMPLETE scenario={scenario} hid_reports=0 physical_input_capture=off"
     );
-    Ok(())
+    Ok(address)
 }
 
 #[cfg(test)]

@@ -904,12 +904,20 @@ mod serial {
             .collect()
     }
 
-    fn save_board(info: &PortInfo, fingerprint: &[u8; 32], last_ipv4: Option<std::net::Ipv4Addr>) {
+    fn save_board(
+        info: &PortInfo,
+        fingerprint: &[u8; 32],
+        last_ipv4: Option<std::net::Ipv4Addr>,
+    ) -> Result<(), String> {
         let (Some(path), Some(instance_id)) = (board_map_path(), info.instance_id.as_ref()) else {
-            return;
+            return Err(
+                "cannot save board map: LOCALAPPDATA or device instance ID unavailable".into(),
+            );
         };
         if instance_id.chars().any(char::is_control) {
-            return;
+            return Err(
+                "cannot save board map: device instance ID contains control characters".into(),
+            );
         }
         let mut identities = load_board_identities();
         let fingerprint = super::hex(fingerprint);
@@ -934,17 +942,22 @@ mod serial {
             })
             .collect::<String>();
         if let Some(parent) = path.parent() {
-            let _ = fs::create_dir_all(parent);
+            fs::create_dir_all(parent)
+                .map_err(|error| format!("cannot create board-map directory: {error}"))?;
         }
-        let _ = fs::write(path, contents);
+        fs::write(path, contents).map_err(|error| format!("cannot write board map: {error}"))
     }
 
     pub fn remember_board(info: &PortInfo, fingerprint: &[u8; 32]) {
-        save_board(info, fingerprint, None);
+        let _ = save_board(info, fingerprint, None);
     }
 
-    pub fn remember_board_ip(info: &PortInfo, fingerprint: &[u8; 32], address: std::net::Ipv4Addr) {
-        save_board(info, fingerprint, Some(address));
+    pub fn remember_board_ip(
+        info: &PortInfo,
+        fingerprint: &[u8; 32],
+        address: std::net::Ipv4Addr,
+    ) -> Result<(), String> {
+        save_board(info, fingerprint, Some(address))
     }
 
     pub fn last_known_ipv4(info: &PortInfo, fingerprint: &[u8; 32]) -> Option<std::net::Ipv4Addr> {
@@ -1797,15 +1810,16 @@ fn run() -> Result<(), String> {
             "Running M1.3 signaling scenario `{scenario}`. HID output and physical-input capture remain disabled."
         );
         let endpoint_fingerprint = status.identity_fingerprint;
-        let result = transport::run_signaling_test(port, &service, status, credential, scenario)
-            .map_err(|error| error.to_string());
-        if result.is_ok() {
-            if let Some(address) = service.ipv4 {
-                serial::remember_board_ip(&selected, &endpoint_fingerprint, address);
-                println!("Remembered last-known IPv4 {address}.");
-            }
+        let address = transport::run_signaling_test(port, &service, status, credential, scenario)
+            .map_err(|error| error.to_string())?;
+        if let std::net::SocketAddr::V4(address) = address {
+            let address = *address.ip();
+            serial::remember_board_ip(&selected, &endpoint_fingerprint, address).map_err(
+                |error| format!("signaling succeeded, but board-map persistence failed: {error}"),
+            )?;
+            println!("Remembered last-known IPv4 {address}.");
         }
-        return result;
+        return Ok(());
     }
     if command == "transport-test" {
         let status = port.status()?;
