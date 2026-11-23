@@ -867,7 +867,12 @@ mod serial {
             .map(|root| root.join("kvmctl").join("boards.tsv"))
     }
 
-    fn load_board_identities() -> BTreeMap<String, String> {
+    struct KnownBoard {
+        fingerprint: String,
+        last_ipv4: Option<std::net::Ipv4Addr>,
+    }
+
+    fn load_board_identities() -> BTreeMap<String, KnownBoard> {
         let Some(path) = board_map_path() else {
             return BTreeMap::new();
         };
@@ -877,15 +882,29 @@ mod serial {
         contents
             .lines()
             .filter_map(|line| {
-                let (instance_id, fingerprint) = line.split_once('\t')?;
+                let mut fields = line.split('\t');
+                let instance_id = fields.next()?;
+                let fingerprint = fields.next()?;
+                let last_ipv4 = fields.next().and_then(|address| address.parse().ok());
+                if fields.next().is_some() {
+                    return None;
+                }
                 (fingerprint.len() == 64
                     && fingerprint.bytes().all(|byte| byte.is_ascii_hexdigit()))
-                .then(|| (instance_id.to_owned(), fingerprint.to_owned()))
+                .then(|| {
+                    (
+                        instance_id.to_owned(),
+                        KnownBoard {
+                            fingerprint: fingerprint.to_owned(),
+                            last_ipv4,
+                        },
+                    )
+                })
             })
             .collect()
     }
 
-    pub fn remember_board(info: &PortInfo, fingerprint: &[u8; 32]) {
+    fn save_board(info: &PortInfo, fingerprint: &[u8; 32], last_ipv4: Option<std::net::Ipv4Addr>) {
         let (Some(path), Some(instance_id)) = (board_map_path(), info.instance_id.as_ref()) else {
             return;
         };
@@ -893,15 +912,53 @@ mod serial {
             return;
         }
         let mut identities = load_board_identities();
-        identities.insert(instance_id.clone(), super::hex(fingerprint));
+        let fingerprint = super::hex(fingerprint);
+        let board = identities
+            .entry(instance_id.clone())
+            .or_insert_with(|| KnownBoard {
+                fingerprint: fingerprint.clone(),
+                last_ipv4: None,
+            });
+        if !board.fingerprint.eq_ignore_ascii_case(&fingerprint) {
+            board.last_ipv4 = None;
+        }
+        board.fingerprint = fingerprint;
+        if last_ipv4.is_some() {
+            board.last_ipv4 = last_ipv4;
+        }
         let contents = identities
             .iter()
-            .map(|(id, fingerprint)| format!("{id}\t{fingerprint}\n"))
+            .map(|(id, board)| match board.last_ipv4 {
+                Some(address) => format!("{id}\t{}\t{address}\n", board.fingerprint),
+                None => format!("{id}\t{}\n", board.fingerprint),
+            })
             .collect::<String>();
         if let Some(parent) = path.parent() {
             let _ = fs::create_dir_all(parent);
         }
         let _ = fs::write(path, contents);
+    }
+
+    pub fn remember_board(info: &PortInfo, fingerprint: &[u8; 32]) {
+        save_board(info, fingerprint, None);
+    }
+
+    pub fn remember_board_ip(info: &PortInfo, fingerprint: &[u8; 32], address: std::net::Ipv4Addr) {
+        save_board(info, fingerprint, Some(address));
+    }
+
+    pub fn last_known_ipv4(info: &PortInfo, fingerprint: &[u8; 32]) -> Option<std::net::Ipv4Addr> {
+        let instance_id = info.instance_id.as_ref()?;
+        if instance_id.chars().any(char::is_control) {
+            return None;
+        }
+        let identities = load_board_identities();
+        let board = identities.get(instance_id)?;
+        board
+            .fingerprint
+            .eq_ignore_ascii_case(&super::hex(fingerprint))
+            .then_some(board.last_ipv4)
+            .flatten()
     }
 
     pub fn enumerate() -> Result<Vec<PortInfo>, String> {
@@ -949,11 +1006,11 @@ mod serial {
             let known_identity = instance_id
                 .as_ref()
                 .and_then(|id| known_identities.get(id))
-                .filter(|fingerprint| fingerprint.len() >= 8);
+                .filter(|board| board.fingerprint.len() >= 8);
             let location = property_text(devices, &info, SPDRP_LOCATION_INFORMATION)
                 .filter(|value| !value.is_empty());
             let board_name = known_identity
-                .map(|fingerprint| format!("kvmctl {} — {friendly_name}", &fingerprint[..8]))
+                .map(|board| format!("kvmctl {} — {friendly_name}", &board.fingerprint[..8]))
                 .unwrap_or_else(|| format!("Unknown USB-UART device — {friendly_name}"));
             let label = location
                 .map(|location| format!("{board_name} — {location}"))
@@ -1460,6 +1517,17 @@ fn select_port(
 }
 
 #[cfg(windows)]
+fn service_at_ipv4(address: std::net::Ipv4Addr, fingerprint: &[u8; 32]) -> discovery::Service {
+    discovery::Service {
+        instance: format!("direct IPv4 {address}"),
+        hostname: discovery::endpoint_hostname(fingerprint),
+        port: 443,
+        ipv4: Some(address),
+        properties: std::collections::BTreeMap::new(),
+    }
+}
+
+#[cfg(windows)]
 fn run() -> Result<(), String> {
     let args: Vec<String> = std::env::args().skip(1).collect();
     if args.is_empty() {
@@ -1468,7 +1536,7 @@ fn run() -> Result<(), String> {
     let command = args.first().map(String::as_str).unwrap_or("status");
     if command == "--help" || command == "-h" {
         println!(
-            "kvmctl [status [COMx] | wifi [COMx] | enroll [COMx] | clients [COMx] | revoke [COMx] <fingerprint|all> | discover [COMx] | signaling-test [COMx] [success|missing|invalid|replay|resources] [IPv4] | led [COMx] on|off <brightness> <RRGGBB> | transport-test [COMx] | flash [COMx] <firmware.bin> <backup.bin> | ports]; no arguments opens the control window"
+            "kvmctl [status [COMx] | wifi [COMx] | enroll [COMx] | clients [COMx] | revoke [COMx] <fingerprint|all> | discover [COMx] | signaling-test [COMx] [scenario [IPv4] | IPv4] | led [COMx] on|off <brightness> <RRGGBB> | transport-test [COMx] | flash [COMx] <firmware.bin> <backup.bin> | ports]; no arguments opens the control window"
         );
         return Ok(());
     }
@@ -1532,20 +1600,23 @@ fn run() -> Result<(), String> {
     }
     if command == "signaling-test"
         && (params.len() > 2
-            || params.first().is_some_and(|scenario| {
-                !matches!(
-                    scenario.as_str(),
-                    "success" | "missing" | "invalid" | "replay" | "resources" | "revoke-active"
-                )
+            || params.first().is_some_and(|value| {
+                !(params.len() == 1 && value.parse::<std::net::Ipv4Addr>().is_ok())
+                    && !matches!(
+                        value.as_str(),
+                        "success"
+                            | "missing"
+                            | "invalid"
+                            | "replay"
+                            | "resources"
+                            | "revoke-active"
+                    )
             })
             || params
                 .get(1)
                 .is_some_and(|address| address.parse::<std::net::Ipv4Addr>().is_err()))
     {
-        return Err(
-            "usage: kvmctl signaling-test [COMx] [success|missing|invalid|replay|resources|revoke-active] [IPv4]"
-                .into(),
-        );
+        return Err("usage: kvmctl signaling-test [COMx] [scenario [IPv4] | IPv4]".into());
     }
     if command == "revoke" && params.len() != 1 {
         return Err("usage: kvmctl revoke [COMx] <fingerprint|all>".into());
@@ -1664,43 +1735,77 @@ fn run() -> Result<(), String> {
                 selected.name
             ));
         }
-        let scenario = params.first().map(String::as_str).unwrap_or("success");
-        let service = if let Some(address) = params.get(1) {
+        let direct_only = params.len() == 1 && params[0].parse::<std::net::Ipv4Addr>().is_ok();
+        let scenario = if direct_only {
+            "success"
+        } else {
+            params.first().map(String::as_str).unwrap_or("success")
+        };
+        let manual_address = if direct_only {
+            params.first().map(String::as_str)
+        } else {
+            params.get(1).map(String::as_str)
+        };
+        let service = if let Some(address) = manual_address {
             let ip = address
                 .parse::<std::net::Ipv4Addr>()
                 .map_err(|_| "invalid IPv4 address".to_owned())?;
             let hostname = discovery::endpoint_hostname(&status.identity_fingerprint);
-            println!(
-                "DNS-SD unavailable; trying direct IPv4 {ip} with pinned certificate name {hostname}."
-            );
-            discovery::Service {
-                instance: "direct-IP diagnostic".into(),
-                hostname,
-                port: 443,
-                ipv4: Some(ip),
-                properties: std::collections::BTreeMap::new(),
-            }
+            println!("Using manual IPv4 {ip} with pinned certificate name {hostname}.");
+            service_at_ipv4(ip, &status.identity_fingerprint)
         } else {
-            let services = discovery::browse()?;
+            let (services, browse_error) = match discovery::browse() {
+                Ok(services) => (services, None),
+                Err(error) => {
+                    eprintln!("DNS-SD browse failed: {error}");
+                    (Vec::new(), Some(error))
+                }
+            };
             let mut matches = services.into_iter().filter(|service| {
                 discovery::matches_endpoint(service, &status.identity_fingerprint)
             });
-            let service = matches.next().ok_or_else(|| {
-                format!(
-                    "no DNS-SD service matches COM identity {}; run `cargo run --offline -p kvmctl -- discover {}` for diagnostics or pass a known board IPv4 address",
-                    hex(&status.identity_fingerprint), selected.name
-                )
-            })?;
-            if matches.next().is_some() {
-                return Err("multiple DNS-SD services claim this USB identity; refusing ambiguous discovery".into());
+            if let Some(service) = matches.next() {
+                if matches.next().is_some() {
+                    return Err("multiple DNS-SD services claim this USB identity; refusing ambiguous discovery".into());
+                }
+                service
+            } else if let Some(ip) =
+                serial::last_known_ipv4(&selected, &status.identity_fingerprint)
+            {
+                print!("DNS-SD did not find this board. Try last-known IPv4 {ip}? (yes/no): ");
+                io::stdout().flush().map_err(|error| error.to_string())?;
+                let mut answer = String::new();
+                io::stdin()
+                    .read_line(&mut answer)
+                    .map_err(|error| error.to_string())?;
+                if !answer.trim().eq_ignore_ascii_case("yes") {
+                    return Err("last-known IPv4 fallback declined".into());
+                }
+                service_at_ipv4(ip, &status.identity_fingerprint)
+            } else {
+                let detail = browse_error
+                    .map(|error| format!(" ({error})"))
+                    .unwrap_or_default();
+                return Err(format!(
+                    "no DNS-SD service matches COM identity {}{detail}; run `cargo run --offline -p kvmctl -- discover {}` for diagnostics or pass an IPv4 address",
+                    hex(&status.identity_fingerprint),
+                    selected.name
+                ));
             }
-            service
         };
         println!(
             "Running M1.3 signaling scenario `{scenario}`. HID output and physical-input capture remain disabled."
         );
-        return transport::run_signaling_test(port, &service, status, credential, scenario)
+        let endpoint_fingerprint = status.identity_fingerprint;
+        let result = transport::run_signaling_test(port, &service, status, credential, scenario)
             .map_err(|error| error.to_string());
+        if result.is_ok() {
+            if let Some(address) = service.ipv4 {
+                serial::remember_board_ip(&selected, &endpoint_fingerprint, address);
+                println!("Remembered last-known IPv4 {address}.");
+            }
+        }
+        return result;
     }
     if command == "transport-test" {
         let status = port.status()?;

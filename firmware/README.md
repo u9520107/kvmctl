@@ -113,3 +113,97 @@ are never installed on hardware. `KVMCTL_TEST_OFFER_FINGERPRINT_FAULT` and
 environment variables after each run. Each negative run must be preceded by
 its valid matching baseline; timeout, missing valid baseline, or a generic
 connection failure is inconclusive.
+
+## Host-side firmware guard test
+
+`test_signaling_guards.py` runs selected production C functions on the host. It
+uses Python's standard library to compile and load a temporary shared library;
+the harness stubs ESP-IDF services and injects persistence failures. It checks
+revocation retry and transport/session guards, not ESP-IDF compatibility or real
+NVS behavior. It does not build or flash firmware.
+
+### WSL or Linux (recommended if available)
+
+On Ubuntu, install Python 3, Clang, and the system linker:
+
+```sh
+sudo apt update
+sudo apt install python3 clang binutils
+```
+
+From the repository root in WSL/Linux, run:
+
+```sh
+python3 firmware/test_signaling_guards.py
+```
+
+For this Windows checkout, start WSL at the workspace from PowerShell:
+
+```powershell
+wsl --cd "/mnt/c/Users/$($env:USERNAME)/workspace/kvmctl"
+```
+
+Then run the two Linux commands above. Change the path if the workspace moved. See the
+[Microsoft WSL setup guide](https://learn.microsoft.com/en-us/windows/wsl/setup/environment)
+and [Ubuntu Clang setup](https://ubuntu.com/developers/docs/howto/clang-setup/).
+
+### Native Windows (alternative)
+
+Install Python 3 and either LLVM (Clang plus LLD) or the Visual Studio C++ Build
+Tools. For LLVM, use the [official releases](https://github.com/llvm/llvm-project/releases)
+and ensure `clang.exe` and `ld.lld.exe` are in the same `bin` directory. For
+MSVC, run from a Visual Studio Developer PowerShell so `cl.exe` and `link.exe`
+are available together.
+
+```powershell
+# LLVM
+python .\firmware\test_signaling_guards.py --clang "C:\Program Files\LLVM\bin\clang.exe"
+
+# Or MSVC, from Developer PowerShell
+$cl = (Get-Command cl.exe).Source
+python .\firmware\test_signaling_guards.py --msvc $cl
+```
+
+Python is available from the [official Windows downloads](https://www.python.org/downloads/windows/).
+No Python packages are required. The temporary `.so` or `.dll` is removed when
+the script exits.
+
+## On-device revoke-persistence retry check
+
+The optional test build injects exactly one failed per-client revoke save before
+calling NVS. The retry uses the real NVS read/write/commit path. Enable it only
+for this check; normal builds leave it disabled. This does not simulate a flash
+hardware fault.
+
+From the workspace root in PowerShell, build the test image:
+
+```powershell
+$env:KVMCTL_TEST_REVOKE_PERSIST_FAIL_ONCE = '1'
+try {
+    powershell.exe -NoProfile -ExecutionPolicy Bypass -File .\firmware\build-transport.ps1
+    if ($LASTEXITCODE -ne 0) { throw 'Test firmware build failed.' }
+} finally {
+    Remove-Item Env:KVMCTL_TEST_REVOKE_PERSIST_FAIL_ONCE -ErrorAction SilentlyContinue
+}
+```
+
+Use `kvmctl flash` to write the app image only and create a fresh backup path.
+It preserves NVS. Then get the target fingerprint with `clients COM6` and run:
+
+```powershell
+cargo run --offline -p kvmctl -- revoke COM6 YOUR_CLIENT_FINGERPRINT
+cargo run --offline -p kvmctl -- clients COM6
+cargo run --offline -p kvmctl -- revoke COM6 YOUR_CLIENT_FINGERPRINT
+cargo run --offline -p kvmctl -- clients COM6
+```
+
+Replace `YOUR_CLIENT_FINGERPRINT` with the selected client's full fingerprint.
+The first revoke must return an error and remove that client from the live list;
+the second must succeed and leave it absent. Do not reboot between those calls:
+the retry-pending marker is in RAM until the retry saves the updated list.
+
+With the retry successful, rebuild without the environment variable and flash
+that normal image app-only, using another fresh backup path. The flash resets the
+board. Check `clients COM6` again; the revoked fingerprint must remain absent.
+Re-enroll it afterward only if restoring that client's access is desired. Do not
+erase or fill NVS to manufacture a storage failure.

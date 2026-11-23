@@ -33,6 +33,7 @@ guards += "\n" + "\n".join(function(client_auth, name) for name in (
     "client_auth_revoke", "client_auth_revoke_all"
 ))
 harness = r"""
+#include <stddef.h>
 typedef unsigned char uint8_t;
 typedef unsigned int uint32_t;
 typedef unsigned long long uint64_t;
@@ -41,7 +42,6 @@ typedef int esp_err_t;
 typedef _Bool bool;
 #define true 1
 #define false 0
-#define NULL ((void *)0)
 #define ESP_OK 0
 #define ESP_ERR_INVALID_ARG 1
 #define ESP_ERR_INVALID_STATE 2
@@ -71,25 +71,26 @@ static void *s_events = (void *)1;
 static bool enrolled = true;
 static unsigned int waits;
 static bool s_ready = true;
+static bool s_revoke_persistence_pending;
 static int s_lock;
 static struct { unsigned int count; uint8_t spki[CLIENT_AUTH_MAX_CLIENTS][CLIENT_AUTH_SPKI_BYTES]; } s_store;
 static esp_err_t persist_error = ESP_FAIL;
 static unsigned int persist_calls, transport_invalidations, signaling_invalidations;
 typedef struct { unsigned int phase; uint64_t phase_deadline_us, message_deadline_us; } signaling_session_t;
-int memcmp(const void *a, const void *b, unsigned long long len) {
+int memcmp(const void *a, const void *b, size_t len) {
     const uint8_t *left = a, *right = b;
-    for (unsigned long long i = 0; i < len; ++i) if (left[i] != right[i]) return left[i] - right[i];
+    for (size_t i = 0; i < len; ++i) if (left[i] != right[i]) return left[i] - right[i];
     return 0;
 }
-void *memset(void *out, int value, unsigned long long len) {
+void *memset(void *out, int value, size_t len) {
     uint8_t *bytes = out;
-    for (unsigned long long i = 0; i < len; ++i) bytes[i] = (uint8_t)value;
+    for (size_t i = 0; i < len; ++i) bytes[i] = (uint8_t)value;
     return out;
 }
-void *memmove(void *out, const void *in, unsigned long long len) {
+void *memmove(void *out, const void *in, size_t len) {
     uint8_t *to = out;
     const uint8_t *from = in;
-    if (to < from) for (unsigned long long i = 0; i < len; ++i) to[i] = from[i];
+    if (to < from) for (size_t i = 0; i < len; ++i) to[i] = from[i];
     else while (len) { --len; to[len] = from[len]; }
     return out;
 }
@@ -160,13 +161,22 @@ int run_checks(void) {
     CHECK(s_store.count == 1 && s_store.spki[0][0] == 2 && s_store.spki[1][0] == 0);
     CHECK(!s_application_authorized && s_close_requested);
     CHECK(transport_invalidations == 1 && signaling_invalidations == 1 && persist_calls == 1);
-    CHECK(client_auth_revoke(client_a) == ESP_ERR_NOT_FOUND && persist_calls == 1);
+    CHECK(s_revoke_persistence_pending);
+    CHECK(client_auth_revoke(client_a) == ESP_FAIL && persist_calls == 2);
+    persist_error = ESP_OK;
+    CHECK(client_auth_revoke(client_a) == ESP_OK && persist_calls == 3);
+    CHECK(!s_revoke_persistence_pending);
+    persist_error = ESP_FAIL;
     s_application_authorized = true; s_close_requested = false;
     CHECK(client_auth_revoke_all() == ESP_FAIL && s_store.count == 0 && s_store.spki[0][0] == 0);
     CHECK(!s_application_authorized && s_close_requested);
-    CHECK(transport_invalidations == 2 && signaling_invalidations == 2 && persist_calls == 2);
-    persist_error = ESP_OK; s_store.count = 1; s_store.spki[0][0] = 1;
-    CHECK(client_auth_revoke(client_a) == ESP_OK && s_store.count == 0);
+    CHECK(transport_invalidations == 2 && signaling_invalidations == 2 && persist_calls == 4);
+    CHECK(s_revoke_persistence_pending);
+    persist_error = ESP_OK;
+    CHECK(client_auth_revoke(client_a) == ESP_OK && persist_calls == 5);
+    CHECK(!s_revoke_persistence_pending);
+    s_store.count = 1; s_store.spki[0][0] = 1;
+    CHECK(client_auth_revoke(client_a) == ESP_OK && s_store.count == 0 && persist_calls == 6);
     return 0;
 }
 """.replace("GUARDS", guards)

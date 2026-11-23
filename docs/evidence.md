@@ -422,6 +422,25 @@ The PC does not need to switch to Wi-Fi: unicast confirms the board's records on
 IP is known, while automatic DNS-SD service discovery is the remaining multicast-browse
 check across the PC Ethernet and board Wi-Fi network path.
 
+A packet-path capture during one Windows DNS-SD browse (2026-11-17) recorded three
+`_kvmctl._tcp.local` PTR queries from `10.14.0.2:5353` to `224.0.0.251:5353` on the
+WireGuard Tunnel interface (index 44). No matching query appeared on the PC's Ethernet
+interface (index 12), and no decoded `_kvmctl._tcp.local` answer from the board appeared
+in captured NIC traffic. PktMon text conversion reported three formatting errors; all
+three target queries decoded. This places the observed failure before Ethernet
+multicast egress; it does not establish why Windows DNS-SD selected the tunnel or how
+the board/network handles a query sent over Ethernet. No firewall, VPN, or router
+settings changed.
+
+With Surfshark disabled, the user ran `cargo run --offline -p kvmctl -- discover COM6`
+against current source (2026-11-17). It returned
+`KVMCTL._kvmctl._tcp.local`, hostname `kvmctl-e299faff8cb8d991.local`, address
+`192.168.50.137`, port 443, the expected fingerprint, and `identity=matches USB`.
+This verifies discovery, identity matching, and IPv4 parsing in one VPN-off run. The
+earlier pre-fix executable had printed the reversed address `137.50.168.192`. No fresh
+packet capture could be started because PktMon returned `Access is denied`, so interface
+egress in the successful run is unknown. Surfshark-on discovery remains unverified.
+
 `cargo fmt --all -- --check` and
 `cargo test --workspace --offline --target x86_64-pc-windows-msvc` passed (33 tests).
 The independent firmware guard harness passed in reviewer execution; a local rerun
@@ -431,11 +450,93 @@ profiles across multiple processes, but the normal user profile and another Wind
 account were not tested. A sample boot log still reports the previously documented
 bootloader SHA comparison warning before continuing into the verified firmware.
 
-M1.3 remains open. Windows DNS-SD browse consumption on a verified multicast path,
-client Wi-Fi-interface signaling, normal-profile and cross-user DPAPI behavior, and
-remaining network/hardware checks are outstanding. The firmware advertisement and
-record contents are verified by direct unicast mDNS. M1.2 DTLS certificate enforcement
-remains unchanged. See [execution-plan.md](execution-plan.md) for the acceptance gate.
+The M1.3 signaling CLI now accepts a bare IPv4 or scenario plus IPv4 to bypass DNS-SD.
+After a successful pinned session, it stores that address beside the selected USB
+board identity. If DNS-SD returns no matching service, it prompts before trying the
+saved address. The address remains a route hint; saved and manual routes use the same
+USB-derived hostname, SPKI pin, and transcript checks. This is the M1.3 signaling CLI,
+not the later M1.4 control-session UI.
+
+M1.3 remains open. Cross-user DPAPI behavior is unverified and deferred by the user
+because no second Windows account is available; do not count it as passed. The host-side
+guard harness and on-device fail-once revoke-persistence retry/reboot check passed.
+Normal-profile credential loading, manual IPv4 signaling, a pinned session routed
+through DNS-SD, and saved-IP fallback with Surfshark on have passed; details follow.
+Surfshark-on DNS-SD still returns no
+service, but the user deferred VPN-specific DNS-SD work because saved-IP fallback is
+sufficient for current hotel-network use. A prior capture showed browse queries on
+WireGuard and none on Ethernet, but the cause is unproven. The successful Surfshark-off
+browse had no packet capture. PC Ethernet is the acceptance path; testing the PC's
+Wi-Fi interface is optional. The firmware advertisement and record contents are
+verified by direct unicast mDNS. M1.2 DTLS certificate enforcement remains unchanged.
+See [execution-plan.md](execution-plan.md) for the acceptance gate.
+
+### Manual IPv4 signaling and normal-profile credential (2026-11-17)
+
+In the normal Windows profile, `enroll COM6` created client credential
+`64df35de642ae1a5e123912b3ba3101abfead24e655ae8efc5ca1826e1d7edd5`. A separate
+`cargo run --offline -p kvmctl -- signaling-test COM6 192.168.50.137` process loaded
+that credential and completed the manual-IPv4 pinned session. The client used USB-derived
+TLS name `kvmctl-e299faff8cb8d991.local`; it reported valid client proof, verified
+endpoint transcript and DTLS identity, rejected unauthorized and invalid-proof clients,
+and rejected a competing authenticated offer as busy while the active session kept
+echoing on both channels. Ten control and ten motion messages echoed in the success
+scenario. The run reported zero HID reports and physical-input capture off, then saved
+`192.168.50.137` as the board's last-known address. This verifies normal-profile
+credential loading across separate command processes and the manual IPv4 path. The
+saved-IP prompt was verified in a later Surfshark-on run below.
+
+### Pinned signaling session through DNS-SD (2026-11-17)
+
+The user ran `cargo run --offline -p kvmctl -- signaling-test COM6` with no manual IP.
+The session completed DTLS, client proof, endpoint transcript, DTLS identity, session
+isolation, and 10-message control and motion echo checks. It reported zero HID reports,
+physical-input capture off, and remembered `192.168.50.137`. No saved-IP prompt appeared.
+By the CLI control flow, the no-argument run can reach this success only after DNS-SD
+returns a service matching the USB identity; therefore this verifies a complete pinned
+DNS-SD signaling session. Surfshark was disabled for the prior successful browse; this
+run did not include a packet capture, so its multicast egress interface was not
+observed. This supersedes the earlier statement above that a DNS-SD-routed session was
+still unverified.
+
+### Surfshark-on saved-IP fallback (2026-11-17)
+
+With Surfshark enabled, the user ran `cargo run --offline -p kvmctl -- signaling-test
+COM6`. DNS-SD did not find the board; the user accepted the prompt to try saved IPv4
+`192.168.50.137`. The pinned session then completed DTLS, client proof, endpoint
+transcript, DTLS identity, session isolation, and 10-message control and motion echo
+checks. It reported zero HID reports and physical-input capture off. This verifies the
+saved-IP prompt and secure fallback under the Surfshark-on condition. Together with the
+successful Surfshark-off DNS-SD session and prior capture, the results implicate VPN
+multicast routing, but do not prove its root cause or exact packet path in this run.
+
+### Host-side signaling guard test (2026-11-17)
+
+The user ran `python3 firmware/test_signaling_guards.py` from WSL. It passed:
+`stale transport generations cannot close/authorize current peer; deadlines expire;
+failed revoke persistence stays blocked and returns error`. The harness compiles
+selected production C functions into a temporary shared library with mocked platform
+services and injected persistence errors. It verifies the immediate in-memory denial
+and retry control flow, but does not exercise ESP-IDF or real NVS storage/reboot
+behavior. That on-device failure path remains unverified.
+
+### On-device revoke-persistence retry (2026-11-18)
+
+Built a temporary app image with `KVMCTL_TEST_REVOKE_PERSIST_FAIL_ONCE=1`, which
+returns one persistence error before the first per-client revoke reaches NVS. The
+test image was flashed to COM6 after a verified app-only backup; NVS, bootloader, and
+partition table were untouched. Revoking normal-profile client
+`64df35de642ae1a5e123912b3ba3101abfead24e655ae8efc5ca1826e1d7edd5` returned device
+error 6, while the subsequent client list omitted it from RAM. Retrying the same
+fingerprint succeeded. The normal firmware image was then app-only flashed and
+verified, resetting the board without erasing NVS; after reboot, the client list still
+omitted the revoked fingerprint and contained the other two clients. This confirms the
+pending revoke is durably retryable after immediate in-memory removal. It simulates a
+persistence error before NVS access; it does not simulate a physical NVS flash-write
+failure. The host shell could not re-enroll the Windows client because it runs under a
+sandbox account whose DPAPI context cannot decrypt the user's `%LOCALAPPDATA%` credential.
+The user re-enrolled from their Windows session. A subsequent read-only `clients COM6`
+query listed the restored fingerprint alongside the other two enrolled clients.
 
 ### M1.2 transport implementation and patched backend gate (2026-11-16)
 

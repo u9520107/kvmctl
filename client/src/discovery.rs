@@ -147,7 +147,7 @@ unsafe extern "system" fn resolve_callback(
     let ipv4 = if raw.ip4Address.is_null() {
         None
     } else {
-        Some(ipv4_from_dns_host_order(unsafe { *raw.ip4Address }))
+        Some(ipv4_from_dns_api_value(unsafe { *raw.ip4Address }))
     };
     let _ = sender.send(Ok(Service {
         instance: instance_name,
@@ -205,8 +205,8 @@ fn browse_instances() -> Result<Vec<String>, String> {
     Ok(instances.into_iter().collect())
 }
 
-fn ipv4_from_dns_host_order(value: u32) -> Ipv4Addr {
-    Ipv4Addr::from(value.to_be_bytes())
+fn ipv4_from_dns_api_value(value: u32) -> Ipv4Addr {
+    Ipv4Addr::from(value.to_ne_bytes())
 }
 
 fn resolve(instance_name: &str) -> Result<Service, String> {
@@ -373,9 +373,9 @@ mod tests {
     }
 
     #[test]
-    fn dns_service_ipv4_uses_windows_host_order() {
+    fn dns_service_ipv4_uses_api_byte_order() {
         assert_eq!(
-            ipv4_from_dns_host_order(0xc0a8_322a),
+            ipv4_from_dns_api_value(u32::from_ne_bytes([192, 168, 50, 42])),
             Ipv4Addr::new(192, 168, 50, 42)
         );
     }

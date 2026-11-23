@@ -29,6 +29,7 @@ static const uint8_t s_spki_prefix[] = {
 };
 
 static client_store_t s_store;
+static bool s_revoke_persistence_pending;
 static bool s_ready;
 static SemaphoreHandle_t s_lock;
 
@@ -148,6 +149,8 @@ esp_err_t client_auth_enroll(const uint8_t *spki, size_t spki_len, uint8_t finge
     if (err != ESP_OK) {
         --s_store.count;
         memset(s_store.spki[s_store.count], 0, CLIENT_AUTH_SPKI_BYTES);
+    } else {
+        s_revoke_persistence_pending = false;
     }
 done:
     xSemaphoreGive(s_lock);
@@ -262,8 +265,13 @@ esp_err_t client_auth_revoke(const uint8_t fingerprint[32])
         }
     }
     if (index == s_store.count) {
+        esp_err_t result = ESP_ERR_NOT_FOUND;
+        if (s_revoke_persistence_pending) {
+            result = persist();
+            if (result == ESP_OK) s_revoke_persistence_pending = false;
+        }
         xSemaphoreGive(s_lock);
-        return ESP_ERR_NOT_FOUND;
+        return result;
     }
     if (index + 1 < s_store.count) {
         memmove(s_store.spki[index], s_store.spki[index + 1],
@@ -273,7 +281,18 @@ esp_err_t client_auth_revoke(const uint8_t fingerprint[32])
     memset(s_store.spki[s_store.count], 0, CLIENT_AUTH_SPKI_BYTES);
     transport_invalidate_client(fingerprint);
     signaling_invalidate_client(fingerprint);
-    esp_err_t result = persist();
+    esp_err_t result;
+#ifdef KVMCTL_TEST_REVOKE_PERSIST_FAIL_ONCE
+    static bool test_revoke_persist_failure_injected;
+    if (!test_revoke_persist_failure_injected) {
+        test_revoke_persist_failure_injected = true;
+        result = ESP_FAIL;
+    } else
+#endif
+    {
+        result = persist();
+    }
+    s_revoke_persistence_pending = result != ESP_OK;
     xSemaphoreGive(s_lock);
     return result;
 }
@@ -287,6 +306,7 @@ esp_err_t client_auth_revoke_all(void)
     transport_invalidate_all_clients();
     signaling_invalidate_all_clients();
     esp_err_t result = persist();
+    s_revoke_persistence_pending = result != ESP_OK;
     xSemaphoreGive(s_lock);
     return result;
 }
