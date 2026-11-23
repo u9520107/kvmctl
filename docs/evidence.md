@@ -457,18 +457,18 @@ saved address. The address remains a route hint; saved and manual routes use the
 USB-derived hostname, SPKI pin, and transcript checks. This is the M1.3 signaling CLI,
 not the later M1.4 control-session UI.
 
-M1.3 remains open. Cross-user DPAPI behavior is unverified and deferred by the user
-because no second Windows account is available; do not count it as passed. The host-side
-guard harness and on-device fail-once revoke-persistence retry/reboot check passed.
+M1.3 current-scope acceptance closed on 2026-11-23. Cross-user DPAPI behavior is
+deferred to M2 because no second Windows account is available. The host-side guard
+harness and on-device fail-once revoke-persistence retry/reboot check passed.
 Normal-profile credential loading, manual IPv4 signaling, a pinned session routed
 through DNS-SD, and saved-IP fallback with Surfshark on have passed; details follow.
-Surfshark-on DNS-SD still returns no
-service, but the user deferred VPN-specific DNS-SD work because saved-IP fallback is
-sufficient for current hotel-network use. A prior capture showed browse queries on
-WireGuard and none on Ethernet, but the cause is unproven. The successful Surfshark-off
-browse had no packet capture. PC Ethernet is the acceptance path; testing the PC's
-Wi-Fi interface is optional. The firmware advertisement and record contents are
-verified by direct unicast mDNS. M1.2 DTLS certificate enforcement remains unchanged.
+Surfshark-on DNS-SD still returns no service, but VPN-specific automatic discovery is
+deferred to M2 because physical re-enrollment plus known-IP routing is sufficient for
+current use. A prior capture showed browse queries on WireGuard and none on Ethernet,
+but the cause is unproven. The successful Surfshark-off browse had no packet capture.
+PC Ethernet is the acceptance path; testing the PC's Wi-Fi interface is optional. The
+firmware advertisement and record contents are verified by direct unicast mDNS. M1.2
+DTLS certificate enforcement remains unchanged.
 See [execution-plan.md](execution-plan.md) for the acceptance gate.
 
 ### Manual IPv4 signaling and normal-profile credential (2026-11-17)
@@ -485,6 +485,17 @@ scenario. The run reported zero HID reports and physical-input capture off, then
 `192.168.50.137` as the board's last-known address. This verifies normal-profile
 credential loading across separate command processes and the manual IPv4 path. The
 saved-IP prompt was verified in a later Surfshark-on run below.
+
+### Manual IPv4 signaling after persistence-error fix (2026-11-23)
+
+With the real Windows profile and Board 2 on `COM6`, the user ran
+`cargo run --offline -p kvmctl -- signaling-test COM6 192.168.50.137`.
+The pinned session completed DTLS, valid client proof, endpoint transcript and DTLS
+identity checks, unauthorized-client rejection, invalid-client-proof rejection,
+competing-offer busy rejection, and active-session preservation. Control and motion
+each echoed ten messages. The run reported resource minima, zero HID reports, and
+physical-input capture off, then saved `192.168.50.137` successfully. This confirms
+the current persistence-error handling on the accepted known-IP path.
 
 ### Pinned signaling session through DNS-SD (2026-11-17)
 

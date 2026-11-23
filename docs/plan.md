@@ -10,7 +10,7 @@ Keep design decisions in the design document, status in the execution plan, and 
 
 ## Current position
 
-M0 is closed as bootstrap and initial feasibility. M1 implementation is active; M1.1 closed on 2026-11-16 after user QA confirmed board selection/confirmation, hidden-SSID provisioning, LED operation, and removal of an unavailable SSID from the refreshed host list. M1.2 closed on 2026-11-17; M1.3 authorization and authenticated signaling remain active gates. Portable bridge-marker provisioning and full UI redesign are deferred. See the [execution plan](execution-plan.md#milestones) and [test evidence](evidence.md).
+M0 is closed as bootstrap and initial feasibility. M1 implementation is active; M1.1 closed on 2026-11-16 after user QA confirmed board selection/confirmation, hidden-SSID provisioning, LED operation, and removal of an unavailable SSID from the refreshed host list. M1.2 closed on 2026-11-17; M1.3 current-scope authorization and authenticated signaling acceptance closed on 2026-11-23. Cross-user DPAPI verification and Surfshark-on mDNS are deferred to M2. Portable bridge-marker provisioning and full UI redesign are deferred. See the [execution plan](execution-plan.md#milestones) and [test evidence](evidence.md).
 
 M1.2 closed on 2026-11-17. Board 2 exchanged known payloads over both DataChannels, reconnected cleanly, and ESP32/Windows receiving paths explicitly rejected mismatched identities with zero channel opens and application messages. Integrated heap and `webrtc_peer` task CPU were recorded; total SoC CPU and sustained-load behavior remain unmeasured. The unmodified `esp_peer` 1.5.3 backend remains prohibited; patched revision and tested firmware hashes are in [test evidence](evidence.md). Multicast discovery remains unresolved and belongs to later work.
 
@@ -51,6 +51,8 @@ No outstanding user policy questions from this review. Engineering details and h
 M1 owns transport interoperability, certificate enforcement, USB identity/storage/reset, discovery, signaling, protocol vectors, and measured acceptance limits as part of the working product. M2 adds live capture and user-facing control flows only after their safety checks pass. M5 expands hardening coverage; it is not the first security milestone. A fault found on a sample is tracked as a device/recovery issue, not a dependency on qualifying an entire batch.
 
 JetKVM API behavior, optional relay support, wake/power features, portability, and publishing-name checks stay deferred to their milestones.
+
+Cross-user DPAPI verification and Surfshark-on mDNS discovery are M2 follow-ups. Current M1 use accepts physical re-enrollment plus known-IP routing when automatic discovery is unavailable.
 
 A full visual redesign or migration from native Win32 controls to Slint/egui is deferred beyond M1.1. Keep M1.1 changes limited to usability fixes needed for acceptance.
 
