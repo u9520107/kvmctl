@@ -27,6 +27,8 @@ transport = (root / "main/transport.c").read_text()
 signaling = (root / "main/signaling.c").read_text()
 client_auth = (root / "main/client_auth.c").read_text()
 guards = "\n".join(function(transport, name) for name in (
+    "fail_session", "peer_disconnected", "on_state", "on_channel_close",
+    "find_offer_slot", "transport_status",
     "find_slot", "transport_client_session_active", "transport_close_for_client",
     "transport_authorize_client", "transport_invalidate_client", "transport_invalidate_all_clients"
 )) + "\n" + function(signaling, "session_deadline_expired")
@@ -50,6 +52,7 @@ typedef _Bool bool;
 #define ESP_ERR_NOT_FOUND 4
 #define ESP_FAIL 5
 #define BIT_CLOSED 1
+#define BIT_FAILED 2
 #define pdFALSE 0
 #define pdTRUE 1
 #define pdMS_TO_TICKS(x) (x)
@@ -65,12 +68,20 @@ typedef _Bool bool;
 #define xSemaphoreTake(lock, ticks) ((void)(lock), (void)(ticks))
 #define xSemaphoreGive(lock) ((void)(lock))
 typedef struct {
-    bool active, failed, identity_rejected, application_authorized, close_requested;
+    bool active, failed, identity_rejected, application_authorized, close_requested, usb;
     unsigned int open_channels;
     uint32_t generation;
     uint8_t client_fingerprint[32];
     void *events;
 } transport_peer_t;
+typedef enum {
+    TRANSPORT_STATUS_IDLE, TRANSPORT_STATUS_CONNECTING, TRANSPORT_STATUS_OPEN,
+    TRANSPORT_STATUS_IDENTITY_REJECTED, TRANSPORT_STATUS_FAILED,
+} transport_status_t;
+typedef enum {
+    ESP_PEER_STATE_CONNECT_FAILED, ESP_PEER_STATE_DATA_CHANNEL_DISCONNECTED,
+} esp_peer_state_t;
+typedef struct { int unused; } esp_peer_data_channel_info_t;
 static int s_peer_mux;
 static transport_peer_t s_peers[MAX_TRANSPORT_PEERS];
 static bool enrolled = true;
@@ -102,6 +113,7 @@ void *memmove(void *out, const void *in, size_t len) {
 static EventBits_t xEventGroupWaitBits(void *event, EventBits_t bits, bool clear, bool all, unsigned int ticks) {
     (void)event; (void)clear; (void)all; (void)ticks; ++waits; return bits;
 }
+static void xEventGroupSetBits(void *event, EventBits_t bits) { (void)event; (void)bits; }
 static bool client_auth_is_enrolled(const uint8_t *fingerprint) { (void)fingerprint; return enrolled; }
 static void signaling_invalidate_client(const uint8_t *fingerprint) { (void)fingerprint; ++signaling_invalidations; }
 static void signaling_invalidate_all_clients(void) { signaling_invalidate_client(NULL); }
@@ -114,6 +126,37 @@ GUARDS
 int run_checks(void) {
     uint8_t client_a[32] = {1}, client_b[32] = {2};
     transport_peer_t *peer_a = &s_peers[0], *peer_b = &s_peers[1];
+    bool any_active;
+    CHECK(find_offer_slot(NULL, &any_active) == peer_a && !any_active);
+    peer_a->active = peer_a->usb = true;
+    CHECK(find_offer_slot(NULL, &any_active) == NULL && any_active);
+    CHECK(find_offer_slot(client_b, &any_active) == NULL && any_active);
+    peer_a->usb = false;
+    peer_a->client_fingerprint[0] = 1;
+    CHECK(find_offer_slot(NULL, &any_active) == NULL && any_active);
+    CHECK(find_offer_slot(client_a, &any_active) == NULL && any_active);
+    CHECK(find_offer_slot(client_b, &any_active) == peer_b && any_active);
+
+    peer_a->open_channels = 2;
+    on_state(ESP_PEER_STATE_DATA_CHANNEL_DISCONNECTED, peer_a);
+    CHECK(peer_a->close_requested && !peer_a->failed);
+    peer_a->close_requested = false;
+    on_channel_close(NULL, peer_a);
+    CHECK(peer_a->close_requested && !peer_a->failed);
+    peer_a->active = false;
+    CHECK(transport_status() == TRANSPORT_STATUS_IDLE);
+    peer_a->active = true;
+    peer_a->open_channels = 1;
+    peer_a->close_requested = false;
+    on_channel_close(NULL, peer_a);
+    CHECK(!peer_a->close_requested && peer_a->failed);
+    peer_a->failed = false;
+    on_state(ESP_PEER_STATE_CONNECT_FAILED, peer_a);
+    peer_a->active = false;
+    CHECK(transport_status() == TRANSPORT_STATUS_FAILED);
+    peer_a->identity_rejected = true;
+    CHECK(transport_status() == TRANSPORT_STATUS_IDENTITY_REJECTED);
+    peer_a->failed = peer_a->identity_rejected = false;
     peer_a->active = true; peer_a->generation = 3; peer_a->client_fingerprint[0] = 1;
     peer_b->active = true; peer_b->generation = 2; peer_b->client_fingerprint[0] = 2;
     peer_a->application_authorized = peer_b->application_authorized = true;
@@ -147,6 +190,7 @@ int run_checks(void) {
     enrolled = true; peer_b->application_authorized = true;
     CHECK(transport_close_for_client(client_b, 2) == ESP_OK);
     CHECK(!peer_b->application_authorized && peer_b->close_requested && waits == 1);
+    CHECK(transport_authorize_client(client_b, 2) == ESP_ERR_INVALID_STATE);
     CHECK(!transport_client_session_active(client_b, 2));
     CHECK(peer_a->application_authorized && !peer_a->close_requested);
     signaling_session_t s = {0, 5000, 0};
@@ -215,4 +259,4 @@ with tempfile.TemporaryDirectory(prefix="kvmctl-signaling-guards-") as temp:
         ctypes.windll.kernel32.FreeLibrary(ctypes.c_void_p(loaded._handle))
     if result:
         raise AssertionError(f"production guard regression failed at generated harness line {result}")
-print("PASS: two-peer transport isolation, signaling deadlines, and revoke persistence retry")
+print("PASS: transport admission, disconnect status, two-peer isolation, signaling deadlines, and revoke persistence retry")

@@ -797,3 +797,34 @@ verify HID reports with Windows Raw Input filtered to the selected board identit
 and record build size, CPU, internal heap, PSRAM, setup/reconnect, queue/drop/reorder,
 transport RTT, board-local, and send-to-HID timings. PC Ethernet and pinned known-IP
 remain acceptance setup. Cross-user DPAPI and Surfshark-on DNS-SD stay deferred to M2.
+
+### WSL firmware fix: Board 2 Windows retest (2026-11-23)
+
+The firmware fix makes USB transport sessions exclusive and treats disconnects
+after both DataChannels open as clean teardown. The WSL host signaling guard
+harness passed, covering transport admission, disconnect status, two-peer
+isolation, signaling deadlines, and revoke persistence retry.
+
+The user ran the Windows CLI from clean checkout `a1b8ab5` in native PowerShell
+against Board 2 on `COM6` (ESP32-S3 N16R8 rev v0.2, GPIO48 RGB). The uncommitted
+WSL build at `firmware/build-wsl/kvmctl_firmware.bin` was 1,208,704 bytes.
+The Windows copy matched SHA-256
+`1c3017532475ceaf6c3f12f87ff27a3b4d5ae4c86bee8e3f6a301dcf2faee72c`.
+
+Flash verified the 2,031,616-byte factory app backup before writing, verified
+the replacement digest, reset the board, and exited 0. The Windows backup is
+`firmware/backups/factory-app-before-bench-fix-COM6-20261123-230002.bin`.
+The previous verified backup was preserved. The Windows image copy is in the
+Git-ignored `firmware/build/kvmctl_firmware-bench-fix.bin`.
+
+All four post-flash commands exited 0.
+
+| Command | Result |
+| --- | --- |
+| `status COM6` | Firmware `a1b8ab5-dirty`. Wi-Fi connected. |
+| `transport-test COM6` | Initial `conflicting_sdp=rejected` and reconnect `malformed_sdp=rejected`. Both stages reported `device_state=0` and `active_session=closed`. Finished with `M1.2 TRANSPORT COMPLETE sessions=2 reconnect=clean`. |
+| `signaling-test COM6` | Authorized, echoed 10 messages each on control and motion, reported `state=0` on `M1.3 RESOURCE`, and reached `M1.3 SIGNALING COMPLETE`. |
+| `signaling-test COM6 scripted` | Same authorization, echo, resource state, and completion checks passed. Also printed `M1.4 SCRIPTED` with `hid_reports=0`. |
+
+This run completes the single-board build and flash retest for this firmware
+fix. Physical USB HID output and live two-client takeover remain open for M1.4.

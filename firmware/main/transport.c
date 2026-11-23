@@ -54,6 +54,7 @@ typedef struct {
     atomic_bool failed;
     atomic_bool identity_rejected;
     atomic_bool application_authorized;
+    bool usb;
     uint8_t client_fingerprint[32];
     uint32_t generation;
     uint8_t offer[SDP_CAPACITY + 1];
@@ -379,11 +380,23 @@ static void fail_session(transport_peer_t *slot)
     xEventGroupSetBits(slot->events, BIT_FAILED);
 }
 
+static void peer_disconnected(transport_peer_t *slot)
+{
+    if (!slot || atomic_load(&slot->close_requested)) return;
+    /* Close callbacks can arrive before signaling teardown requests close. */
+    if (atomic_load(&slot->open_channels) == 2) {
+        atomic_store(&slot->close_requested, true);
+    } else {
+        fail_session(slot);
+    }
+}
+
 static int on_state(esp_peer_state_t state, void *ctx)
 {
     transport_peer_t *slot = ctx;
+    if (state == ESP_PEER_STATE_DATA_CHANNEL_DISCONNECTED) peer_disconnected(slot);
     if (slot && !atomic_load(&slot->close_requested) &&
-        (state == ESP_PEER_STATE_CONNECT_FAILED || state == ESP_PEER_STATE_DATA_CHANNEL_DISCONNECTED)) fail_session(slot);
+        state == ESP_PEER_STATE_CONNECT_FAILED) fail_session(slot);
     return 0;
 }
 
@@ -419,16 +432,16 @@ static int on_channel(esp_peer_data_channel_info_t *channel, void *ctx)
 
 static int on_channel_close(esp_peer_data_channel_info_t *channel, void *ctx)
 {
-    transport_peer_t *slot = ctx;
     (void)channel;
-    if (slot && !atomic_load(&slot->close_requested)) fail_session(slot);
+    peer_disconnected(ctx);
     return 0;
 }
 
 static int on_data(esp_peer_data_frame_t *frame, void *ctx)
 {
     transport_peer_t *slot = ctx;
-    if (!slot || !atomic_load(&slot->application_authorized)) return 0;
+    if (!slot || atomic_load(&slot->close_requested) ||
+        !atomic_load(&slot->application_authorized)) return 0;
     if (!frame || !frame->data) { if (slot) fail_session(slot); return -1; }
     bool motion_channel = slot->motion.open && frame->stream_id == slot->motion.stream;
     bool control_channel = slot->control.open && frame->stream_id == slot->control.stream;
@@ -580,7 +593,8 @@ static void peer_task(void *arg)
     } else {
         while (!atomic_load(&slot->close_requested) && !atomic_load(&slot->failed)) {
             esp_peer_main_loop(peer);
-            if (esp_peer_remote_fingerprint_rejected(peer)) break;
+            if (atomic_load(&slot->close_requested) || atomic_load(&slot->failed) ||
+                esp_peer_remote_fingerprint_rejected(peer)) break;
             portENTER_CRITICAL(&s_lease_mux);
             lease_tick_locked((uint64_t)esp_timer_get_time() / 1000ULL);
             portEXIT_CRITICAL(&s_lease_mux);
@@ -634,6 +648,24 @@ static transport_peer_t *find_slot(const uint8_t *fingerprint, uint32_t generati
     return NULL;
 }
 
+/* Caller holds s_peer_mux. USB status and close operate on the whole transport. */
+static transport_peer_t *find_offer_slot(const uint8_t *client_fingerprint, bool *any_active)
+{
+    transport_peer_t *available = NULL;
+    *any_active = false;
+    for (size_t i = 0; i < MAX_TRANSPORT_PEERS; ++i) {
+        transport_peer_t *slot = &s_peers[i];
+        if (atomic_load(&slot->active)) {
+            *any_active = true;
+            if (!client_fingerprint || slot->usb ||
+                memcmp(slot->client_fingerprint, client_fingerprint, 32) == 0) return NULL;
+        } else if (!available) {
+            available = slot;
+        }
+    }
+    return available;
+}
+
 static esp_err_t transport_offer_internal(const uint8_t *client_fingerprint,
                                           const uint8_t *session_id,
                                           const uint8_t *offer, size_t offer_len,
@@ -653,22 +685,9 @@ static esp_err_t transport_offer_internal(const uint8_t *client_fingerprint,
         for (size_t i = 0; i < 16; ++i) any_session_byte |= session_id[i];
         if (any_session_byte == 0) return ESP_ERR_INVALID_ARG;
     }
-    transport_peer_t *slot = NULL;
     portENTER_CRITICAL(&s_peer_mux);
-    if (client_fingerprint) {
-        for (size_t i = 0; i < MAX_TRANSPORT_PEERS; ++i) {
-            if (atomic_load(&s_peers[i].active) &&
-                memcmp(s_peers[i].client_fingerprint, client_fingerprint, 32) == 0) {
-                portEXIT_CRITICAL(&s_peer_mux);
-                return ESP_ERR_INVALID_STATE;
-            }
-        }
-    }
-    bool any_active = false;
-    for (size_t i = 0; i < MAX_TRANSPORT_PEERS; ++i) {
-        if (atomic_load(&s_peers[i].active)) any_active = true;
-        else if (!slot) slot = &s_peers[i];
-    }
+    bool any_active;
+    transport_peer_t *slot = find_offer_slot(client_fingerprint, &any_active);
     if (slot) {
         /* Keep terminal flags available to USB until a new session starts. */
         if (!any_active) {
@@ -681,6 +700,7 @@ static esp_err_t transport_offer_internal(const uint8_t *client_fingerprint,
         atomic_store(&slot->identity_rejected, false);
         slot->generation = ++s_generation_counter;
         if (slot->generation == 0) slot->generation = ++s_generation_counter;
+        slot->usb = !client_fingerprint;
         memset(slot->client_fingerprint, 0, sizeof(slot->client_fingerprint));
         if (client_fingerprint) memcpy(slot->client_fingerprint, client_fingerprint, 32);
         atomic_fetch_add(&s_active_peers, 1);
@@ -798,7 +818,8 @@ esp_err_t transport_authorize_client(const uint8_t fingerprint[32], uint32_t gen
     if (!fingerprint || !client_auth_is_enrolled(fingerprint)) return ESP_ERR_INVALID_STATE;
     portENTER_CRITICAL(&s_peer_mux);
     transport_peer_t *slot = find_slot(fingerprint, generation);
-    bool ready = slot && !atomic_load(&slot->failed) && !atomic_load(&slot->identity_rejected) && slot->open_channels == 2;
+    bool ready = slot && !atomic_load(&slot->close_requested) && !atomic_load(&slot->failed) &&
+                 !atomic_load(&slot->identity_rejected) && slot->open_channels == 2;
     if (ready) atomic_store(&slot->application_authorized, true);
     portEXIT_CRITICAL(&s_peer_mux);
     return ready && client_auth_is_enrolled(fingerprint) ? ESP_OK : ESP_ERR_INVALID_STATE;
