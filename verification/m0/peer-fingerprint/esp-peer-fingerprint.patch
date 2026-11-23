@@ -1,6 +1,6 @@
 --- a/components/esp_peer/src/esp_peer.c
 +++ b/components/esp_peer/src/esp_peer.c
-@@ -9,13 +9,95 @@
+@@ -9,13 +9,118 @@
  #include <stdlib.h>
  #include <string.h>
  #include "dtls_srtp.h"
@@ -19,6 +19,7 @@
 +    unsigned char expected_fingerprint[32];
 +    bool fingerprint_set;
 +    bool fingerprint_invalid;
++    bool fingerprint_rejected;
  } peer_wrapper_t;
 +
 +/* Registry keys are backend handles, also supplied as DTLS cfg.ctx.
@@ -77,6 +78,7 @@
 +    portENTER_CRITICAL(&fingerprint_lock);
 +    peer->fingerprint_set = false;
 +    peer->fingerprint_invalid = false;
++    peer->fingerprint_rejected = false;
 +    memset(peer->expected_fingerprint, 0, sizeof(peer->expected_fingerprint));
 +    portEXIT_CRITICAL(&fingerprint_lock);
 +}
@@ -95,9 +97,30 @@
 +    return match;
 +}
  
++void esp_peer_note_remote_fingerprint_rejection(void *backend)
++{
++    portENTER_CRITICAL(&fingerprint_lock);
++    for (peer_wrapper_t *peer = fingerprint_peers; peer; peer = peer->next) {
++        if (peer->handle == backend) {
++            peer->fingerprint_rejected = true;
++            break;
++        }
++    }
++    portEXIT_CRITICAL(&fingerprint_lock);
++}
++
++bool esp_peer_remote_fingerprint_rejected(esp_peer_handle_t handle)
++{
++    peer_wrapper_t *peer = handle;
++    portENTER_CRITICAL(&fingerprint_lock);
++    bool rejected = peer->fingerprint_rejected;
++    portEXIT_CRITICAL(&fingerprint_lock);
++    return rejected;
++}
++
  int esp_peer_open(esp_peer_cfg_t *cfg, const esp_peer_ops_t *ops, esp_peer_handle_t *handle)
  {
-@@ -32,6 +114,10 @@
+@@ -32,6 +137,10 @@
          free(peer);
          return ret;
      }
@@ -108,7 +131,7 @@
      *handle = peer;
      return ret;
  }
-@@ -42,6 +128,7 @@
+@@ -42,6 +151,7 @@
          return ESP_PEER_ERR_INVALID_ARG;
      }
      peer_wrapper_t *peer = (peer_wrapper_t *)handle;
@@ -116,7 +139,7 @@
      if (peer->ops.new_connection) {
          return peer->ops.new_connection(peer->handle);
      }
-@@ -90,8 +177,32 @@
+@@ -90,8 +200,32 @@
          return ESP_PEER_ERR_INVALID_ARG;
      }
      peer_wrapper_t *peer = (peer_wrapper_t *)handle;
@@ -150,7 +173,7 @@
      }
      return ESP_PEER_ERR_NOT_SUPPORT;
  }
-@@ -163,6 +274,7 @@
+@@ -163,6 +297,7 @@
          return ESP_PEER_ERR_INVALID_ARG;
      }
      peer_wrapper_t *peer = (peer_wrapper_t *)handle;
@@ -158,7 +181,7 @@
      if (peer->ops.disconnect) {
          return peer->ops.disconnect(peer->handle);
      }
-@@ -188,6 +300,15 @@
+@@ -188,6 +323,15 @@
          return ESP_PEER_ERR_INVALID_ARG;
      }
      peer_wrapper_t *peer = (peer_wrapper_t *)handle;
@@ -188,12 +211,13 @@
  /**
 --- a/components/esp_peer/src/dtls_srtp_v6.c
 +++ b/components/esp_peer/src/dtls_srtp_v6.c
-@@ -8,6 +8,48 @@
+@@ -8,6 +8,51 @@
  // #define DUMP_DTLS_KEY
  #include "dtls_common.h"
  #include "psa/crypto.h"
 +
 +extern int esp_peer_remote_fingerprint_matches(void *backend, const unsigned char digest[32]);
++extern void esp_peer_note_remote_fingerprint_rejection(void *backend);
 +
 +/* WebRTC authenticates the leaf certificate by its SDP fingerprint, not a CA.
 + * REQUIRED in both roles also rejects a peer which sends no certificate.
@@ -208,6 +232,7 @@
 +    const mbedtls_md_info_t *md = mbedtls_md_info_from_type(MBEDTLS_MD_SHA256);
 +    if (!crt || !md || !crt->raw.p || !crt->raw.len ||
 +        mbedtls_md(md, crt->raw.p, crt->raw.len, dtls->verified_remote_digest) != 0) {
++        esp_peer_note_remote_fingerprint_rejection(dtls->ctx);
 +        ESP_LOGE("PEER_FP", "PEER_FP_REJECT role=%s reason=certificate_hash_error",
 +                 dtls->role == DTLS_SRTP_ROLE_CLIENT ? "client" : "server");
 +        *flags |= MBEDTLS_X509_BADCERT_OTHER;
@@ -215,6 +240,7 @@
 +    }
 +    int match = esp_peer_remote_fingerprint_matches(dtls->ctx, dtls->verified_remote_digest);
 +    if (match != 1) {
++        esp_peer_note_remote_fingerprint_rejection(dtls->ctx);
 +        ESP_LOGE("PEER_FP", "PEER_FP_REJECT role=%s reason=%s",
 +                 dtls->role == DTLS_SRTP_ROLE_CLIENT ? "client" : "server",
 +                 match == 0 ? "pin_mismatch" : "pin_missing");
@@ -237,7 +263,7 @@
  
  static int dtls_srtp_selfsign_cert(dtls_srtp_t *dtls_srtp, bool export_for_cache)
  {
-@@ -244,9 +286,7 @@
+@@ -244,9 +289,7 @@
          mbedtls_ssl_conf_ca_chain(&dtls_srtp->conf, &dtls_srtp->cert, NULL);
          ret = mbedtls_ssl_conf_own_cert(&dtls_srtp->conf, &dtls_srtp->cert, &dtls_srtp->pkey);
          BREAK_ON_FAIL(ret);
@@ -248,7 +274,7 @@
          mbedtls_ssl_conf_read_timeout(&dtls_srtp->conf, 1000);
          mbedtls_ssl_conf_handshake_timeout(&dtls_srtp->conf, 1000, 6000);
          mbedtls_ssl_conf_dtls_anti_replay(&dtls_srtp->conf, MBEDTLS_SSL_ANTI_REPLAY_DISABLED);
-@@ -258,5 +298,8 @@
+@@ -258,5 +301,8 @@
          mbedtls_ssl_conf_srtp_mki_value_supported(&dtls_srtp->conf, MBEDTLS_SSL_DTLS_SRTP_MKI_UNSUPPORTED);
          ret = mbedtls_ssl_setup(&dtls_srtp->ssl, &dtls_srtp->conf);
          BREAK_ON_FAIL(ret);
@@ -257,7 +283,7 @@
 +        BREAK_ON_FAIL(ret);
          mbedtls_ssl_set_mtu(&dtls_srtp->ssl, DTLS_MTU_SIZE);
          return dtls_srtp;
-@@ -336,8 +379,9 @@
+@@ -336,8 +382,9 @@
              mbedtls_ssl_config_defaults(&dtls_srtp->conf, MBEDTLS_SSL_IS_CLIENT, MBEDTLS_SSL_TRANSPORT_DATAGRAM,
                                          MBEDTLS_SSL_PRESET_DEFAULT);
              dtls_srtp_conf_force_dtls12(&dtls_srtp->conf);
@@ -269,7 +295,7 @@
          mbedtls_ssl_conf_ca_chain(&dtls_srtp->conf, &dtls_srtp->cert, NULL);
          mbedtls_ssl_conf_own_cert(&dtls_srtp->conf, &dtls_srtp->cert, &dtls_srtp->pkey);
          mbedtls_ssl_conf_read_timeout(&dtls_srtp->conf, 1000);
-@@ -350,9 +394,12 @@
+@@ -350,9 +397,12 @@
          mbedtls_ssl_free(&dtls_srtp->ssl);
          mbedtls_ssl_init(&dtls_srtp->ssl);
          mbedtls_ssl_setup(&dtls_srtp->ssl, &dtls_srtp->conf);
@@ -284,18 +310,19 @@
  
 --- a/components/esp_peer/src/dtls_common.h
 +++ b/components/esp_peer/src/dtls_common.h
-@@ -534,6 +534,10 @@
+@@ -534,6 +534,11 @@
      return ret;
  }
  
 +#if ESP_IDF_VERSION_MAJOR >= 6
 +extern int esp_peer_remote_fingerprint_matches(void *backend, const unsigned char digest[32]);
++extern void esp_peer_note_remote_fingerprint_rejection(void *backend);
 +#endif
 +
  static int dtls_srtp_handshake_server(dtls_srtp_t *dtls_srtp)
  {
      int ret;
-@@ -542,6 +546,9 @@
+@@ -542,6 +547,9 @@
          unsigned char client_ip[] = "test";
          dtls_srtp_conf_force_dtls12(&dtls_srtp->conf);
          mbedtls_ssl_session_reset(&dtls_srtp->ssl);
@@ -305,13 +332,14 @@
          mbedtls_ssl_set_client_transport_id(&dtls_srtp->ssl, client_ip, sizeof(client_ip));
  #if defined(DTLS_USE_CH_REASM_BIO)
          /* Drop stale queued bytes; keep in-progress fragment assembly in ch_buf. */
-@@ -600,6 +607,14 @@
+@@ -600,6 +608,15 @@
      } else {
          ret = dtls_srtp_handshake_client(dtls_srtp);
      }
 +#if ESP_IDF_VERSION_MAJOR >= 6
 +    if (ret == 0 && (!dtls_srtp->remote_fingerprint_verified ||
 +        esp_peer_remote_fingerprint_matches(dtls_srtp->ctx, dtls_srtp->verified_remote_digest) != 1)) {
++        esp_peer_note_remote_fingerprint_rejection(dtls_srtp->ctx);
 +        ESP_LOGE("PEER_FP", "PEER_FP_REJECT role=%s reason=unverified_or_changed_pin",
 +                 dtls_srtp->role == DTLS_SRTP_ROLE_CLIENT ? "client" : "server");
 +        return MBEDTLS_ERR_X509_CERT_VERIFY_FAILED;

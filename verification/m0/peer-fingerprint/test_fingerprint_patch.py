@@ -1,4 +1,4 @@
-"""Run the patch's actual C SDP parser on Windows with installed MSVC tools."""
+"""Check the C SDP parser and per-peer rejection tracking with MSVC."""
 import ctypes
 import os
 from pathlib import Path
@@ -17,6 +17,35 @@ def main():
                        additions.index("static void clear_remote_fingerprint(")]
     source = "#include <stdbool.h>\n#include <stddef.h>\n#include <string.h>\n" + parser
     source += "\n__declspec(dllexport) int parse_test(const unsigned char *p, size_t n, unsigned char *out) { return parse_remote_fingerprint(p, n, out); }\n"
+    source += r"""
+typedef void *esp_peer_handle_t;
+typedef struct peer_wrapper {
+    struct peer_wrapper *next;
+    esp_peer_handle_t handle;
+    unsigned char expected_fingerprint[32];
+    bool fingerprint_set, fingerprint_invalid, fingerprint_rejected;
+} peer_wrapper_t;
+static peer_wrapper_t *fingerprint_peers;
+#define portENTER_CRITICAL(lock) ((void)0)
+#define portEXIT_CRITICAL(lock) ((void)0)
+"""
+    getter = additions.index("bool esp_peer_remote_fingerprint_rejected(")
+    source += additions[additions.index("static void clear_remote_fingerprint("):
+                        additions.index("\n}", getter) + 2]
+    source += r"""
+__declspec(dllexport) int rejection_test(void)
+{
+    int first_backend, second_backend;
+    peer_wrapper_t second = {.handle = &second_backend};
+    peer_wrapper_t first = {.next = &second, .handle = &first_backend};
+    fingerprint_peers = &first;
+    esp_peer_note_remote_fingerprint_rejection(&second_backend);
+    if (esp_peer_remote_fingerprint_rejected(&first) ||
+        !esp_peer_remote_fingerprint_rejected(&second)) return 0;
+    clear_remote_fingerprint(&second);
+    return !esp_peer_remote_fingerprint_rejected(&second);
+}
+"""
     vcvars = Path("C:/Program Files (x86)/Microsoft Visual Studio/2022/BuildTools/VC/Auxiliary/Build/vcvars64.bat")
     environment = os.environ.copy()
     # cmd.exe uses its own quoting rules, unlike subprocess's argv quoting.
@@ -71,10 +100,12 @@ def main():
         for invalid in (b"", b"\0", b"v=0\r\n", b"a=fingerprint:\r\n", b"x" * 8193):
             check(invalid, False)
         assert not parse(None, 0, (ctypes.c_ubyte * 32)())
+        assert library.rejection_test() == 1
         # Unload before TemporaryDirectory removes the Windows DLL.
         ctypes.windll.kernel32.FreeLibrary.argtypes = [ctypes.c_void_p]
         ctypes.windll.kernel32.FreeLibrary(library._handle)
     print(f"PASS: {checks + 1} actual-C fingerprint parser checks")
+    print("PASS: per-peer fingerprint rejection and reset")
 
 
 if __name__ == "__main__":

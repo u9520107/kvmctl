@@ -19,6 +19,9 @@
 #include "mbedtls/platform_util.h"
 #include "wifi_setup.h"
 
+/* Provided by the pinned ESP peer fingerprint patch. */
+extern bool esp_peer_remote_fingerprint_rejected(esp_peer_handle_t peer);
+
 #define MAX_TRANSPORT_PEERS 2
 #define SDP_CAPACITY 8192
 #define CONTROL_CAPACITY 512
@@ -59,7 +62,7 @@ typedef struct {
     echo_channel_t control;
     echo_channel_t motion;
     response_queue_t responses;
-    uint8_t open_channels;
+    atomic_uchar open_channels;
     uint64_t control_sequence;
     uint64_t response_sequence;
     uint64_t motion_sequence;
@@ -285,9 +288,6 @@ static int capture_peer_log(const char *format, va_list args)
     va_copy(copy, args);
     int length = vsnprintf(message, sizeof(message), format, copy);
     va_end(copy);
-    if (length > 0 && strstr(message, "PEER_FP_REJECT")) {
-        for (size_t i = 0; i < MAX_TRANSPORT_PEERS; ++i) atomic_store(&s_peers[i].identity_rejected, true);
-    }
     if (length > 0 && !strstr(message, "esp_https_server") &&
                       (strstr(message, "esp-tls") || strstr(message, "ESP-TLS") ||
                        strstr(message, "esp_tls") || strstr(message, "https_server") ||
@@ -501,12 +501,17 @@ static void peer_task(void *arg)
     } else {
         while (!atomic_load(&slot->close_requested) && !atomic_load(&slot->failed)) {
             esp_peer_main_loop(peer);
+            if (esp_peer_remote_fingerprint_rejected(peer)) break;
             portENTER_CRITICAL(&s_lease_mux);
             lease_tick_locked((uint64_t)esp_timer_get_time() / 1000ULL);
             portEXIT_CRITICAL(&s_lease_mux);
             if (!send_response(peer, slot) || !send_echo(peer, &slot->control) || !send_echo(peer, &slot->motion)) fail_session(slot);
             vTaskDelay(pdMS_TO_TICKS(10));
         }
+    }
+    if (peer && esp_peer_remote_fingerprint_rejected(peer)) {
+        atomic_store(&slot->identity_rejected, true);
+        fail_session(slot);
     }
     if (peer) esp_peer_close(peer);
     vTaskDelay(1);
@@ -574,16 +579,27 @@ static esp_err_t transport_offer_internal(const uint8_t *client_fingerprint,
             }
         }
     }
+    bool any_active = false;
     for (size_t i = 0; i < MAX_TRANSPORT_PEERS; ++i) {
-        bool inactive = false;
-        if (atomic_compare_exchange_strong(&s_peers[i].active, &inactive, true)) { slot = &s_peers[i]; break; }
+        if (atomic_load(&s_peers[i].active)) any_active = true;
+        else if (!slot) slot = &s_peers[i];
     }
     if (slot) {
+        /* Keep terminal flags available to USB until a new session starts. */
+        if (!any_active) {
+            for (size_t i = 0; i < MAX_TRANSPORT_PEERS; ++i) {
+                atomic_store(&s_peers[i].failed, false);
+                atomic_store(&s_peers[i].identity_rejected, false);
+            }
+        }
+        atomic_store(&slot->failed, false);
+        atomic_store(&slot->identity_rejected, false);
         slot->generation = ++s_generation_counter;
         if (slot->generation == 0) slot->generation = ++s_generation_counter;
         memset(slot->client_fingerprint, 0, sizeof(slot->client_fingerprint));
         if (client_fingerprint) memcpy(slot->client_fingerprint, client_fingerprint, 32);
         atomic_fetch_add(&s_active_peers, 1);
+        atomic_store(&slot->active, true);
     }
     portEXIT_CRITICAL(&s_peer_mux);
     if (!slot) return ESP_ERR_INVALID_STATE;
@@ -609,8 +625,6 @@ static esp_err_t transport_offer_internal(const uint8_t *client_fingerprint,
         atomic_store(&s_last_event_sequence, 0);
     }
     xEventGroupClearBits(slot->events, BIT_ANSWER | BIT_FAILED | BIT_CLOSED);
-    atomic_store(&slot->failed, false);
-    atomic_store(&slot->identity_rejected, false);
     atomic_store(&slot->close_requested, false);
     atomic_store(&slot->application_authorized, false);
     slot->answer_len = 0;
@@ -719,14 +733,23 @@ void transport_invalidate_all_clients(void)
 transport_status_t transport_status(void)
 {
     bool any_active = false, any_open = false, any_failed = false, any_identity_rejected = false;
+    bool inactive_failed = false, inactive_identity_rejected = false;
     for (size_t i = 0; i < MAX_TRANSPORT_PEERS; ++i) {
-        any_active |= atomic_load(&s_peers[i].active);
-        any_open |= s_peers[i].open_channels == 2;
-        any_failed |= atomic_load(&s_peers[i].failed);
-        any_identity_rejected |= atomic_load(&s_peers[i].identity_rejected);
+        if (atomic_load(&s_peers[i].active)) {
+            any_active = true;
+            any_open |= s_peers[i].open_channels == 2;
+            any_failed |= atomic_load(&s_peers[i].failed);
+            any_identity_rejected |= atomic_load(&s_peers[i].identity_rejected);
+        } else {
+            inactive_failed |= atomic_load(&s_peers[i].failed);
+            inactive_identity_rejected |= atomic_load(&s_peers[i].identity_rejected);
+        }
+    }
+    if (!any_active) {
+        if (inactive_identity_rejected) return TRANSPORT_STATUS_IDENTITY_REJECTED;
+        return inactive_failed ? TRANSPORT_STATUS_FAILED : TRANSPORT_STATUS_IDLE;
     }
     if (any_identity_rejected) return TRANSPORT_STATUS_IDENTITY_REJECTED;
-    if (!any_active) return TRANSPORT_STATUS_IDLE;
     if (any_failed) return TRANSPORT_STATUS_FAILED;
     return any_open ? TRANSPORT_STATUS_OPEN : TRANSPORT_STATUS_CONNECTING;
 }
