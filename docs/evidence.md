@@ -828,3 +828,266 @@ All four post-flash commands exited 0.
 
 This run completes the single-board build and flash retest for this firmware
 fix. Physical USB HID output and live two-client takeover remain open for M1.4.
+
+### M1.4 live takeover on Board 2 (2026-11-24)
+
+Windows `main` was clean at `5d123b1ad7fcb9b75c790922a884a065997412c9`
+before changes. `git cat-file -t
+5d123b1` returned `commit` and `git merge-base --is-ancestor 5d123b1 HEAD`
+exited 0. The client used the working tree based on that revision. The initial
+COM6 status reported firmware `a1b8ab5-dirty` and Wi-Fi connected. The local
+copy of the previously verified Board 2 app image matched SHA-256
+`1c3017532475ceaf6c3f12f87ff27a3b4d5ae4c86bee8e3f6a301dcf2faee72c`.
+
+```powershell
+cargo run --offline -p kvmctl -- status COM6
+cargo run --offline -p kvmctl -- enroll COM6
+cargo run --offline -p kvmctl -- enroll COM6 takeover
+cargo run --offline -p kvmctl -- signaling-test COM6 takeover 192.168.50.137
+```
+
+Sandboxed enrollment reported `Windows DPAPI operation failed`. Native-profile
+enrollment confirmed the existing A credential and enrolled a new B credential.
+Both are DPAPI-protected under the same Windows user, with fingerprints
+`64df35de642ae1a5e123912b3ba3101abfead24e655ae8efc5ca1826e1d7edd5` (A) and
+`70aa21bad6f16f9a6fb43ee544cdace504bb790097915454ce4b67953080580e` (B).
+On the prior image A opened both DataChannels and completed transcript authorization.
+B's signaling setup returned `identity_failed` before its DataChannels opened,
+so the original image produced no live lease ordering evidence.
+
+The diagnostic app was built in Ubuntu WSL from `5d123b1` plus the
+working-tree transport diagnostics, using ESP-IDF 6.1.1 and esp-webrtc-solution
+`3971094e2e7c2ab7cb4de59e4eae710e1902d2b4`.
+
+```bash
+source ~/esp/esp-idf-v6.1.1/export.sh
+export KVMCTL_LIBSRTP_SOURCE="$HOME/esp/espressif__esp_libsrtp"
+bash firmware/build-transport.sh "$HOME/esp/esp-webrtc-v1.3.0" build
+cp firmware/build-wsl/kvmctl_firmware.bin "$windows/firmware/build/kvmctl_firmware-m14-diagnostic.bin"
+sha256sum "$windows/firmware/build/kvmctl_firmware-m14-diagnostic.bin"
+```
+
+The build used `windows=/mnt/c/Users/night/workspace/kvmctl` and temporarily
+copied the Windows working-tree `firmware/main/transport.c` into the WSL checkout.
+The copied Windows app is 1,209,104 bytes, SHA-256
+`112be2cc267f26137f74492999c023cdba4e2ea4e2a2ab13d4c2b4f20c1aa0aa`.
+The WSL source file was restored after the build.
+
+```powershell
+certutil -hashfile .\firmware\build\kvmctl_firmware-m14-diagnostic.bin SHA256
+'yes' | cargo run --offline -p kvmctl -- flash COM6 .\firmware\build\kvmctl_firmware-m14-diagnostic.bin .\firmware\backups\factory-app-before-m14-diagnostic-COM6-20261124.bin
+certutil -hashfile .\firmware\backups\factory-app-before-m14-diagnostic-COM6-20261124.bin SHA256
+cargo run --offline -p kvmctl -- signaling-test COM6 takeover 192.168.50.137
+```
+
+The CLI verified the 2,031,616-byte factory app backup at `0x10000` before
+writing. Backup SHA-256 is
+`24def7c13f819c5bda10455cbeb1d98c14323cb05900bf71b6689d4b6e397ff1`.
+Its first 1,208,704 bytes match the prior bench image SHA-256 above.
+The CLI verified the replacement digest and reset the board. Two diagnostic
+takeover runs again authorized A and failed during B setup. The second run
+reported `DTLS peer open failed (-2), internal free=20079 largest=7680`.
+The internal heap minima were 3,795 and 4,591 bytes. Both runs ended at epoch
+0 with held keys and buttons clear. USB transport status reported state 4
+(failed). No lease handoff was exercised.
+
+The follow-up zero-HID build moves the two fixed-size SDP offer/answer pairs
+from internal RAM to PSRAM, matching the existing WSS SDP allocation. The
+buffers remain bounded and are cleared on cleanup. TLS allocation settings
+and pinned signaling checks stay in place.
+
+The same WSL build command produced the 1,209,088-byte PSRAM app, SHA-256
+`0ef17f528e97fc14b838b29c17ea3679fea63c30e899b18208d332b71db69936`.
+
+```powershell
+certutil -hashfile .\firmware\build\kvmctl_firmware-m14-peer-psram.bin SHA256
+'yes' | cargo run --offline -p kvmctl -- flash COM6 .\firmware\build\kvmctl_firmware-m14-peer-psram.bin .\firmware\backups\factory-app-before-m14-peer-psram-COM6-20261124.bin
+certutil -hashfile .\firmware\backups\factory-app-before-m14-peer-psram-COM6-20261124.bin SHA256
+cargo run --offline -p kvmctl -- signaling-test COM6 takeover 192.168.50.137
+```
+
+Passing host checks included `cargo test --workspace --offline` (41 tests),
+`cargo fmt --all -- --check`, `git diff --check`, and the WSL runs
+`python3 firmware/test_signaling_guards.py` and `python3 firmware/test_usb_admin.py`
+against the Windows working tree.
+
+The app-only swap verified its backup and replacement, then reset Board 2.
+Backup SHA-256 was
+`42bb60cb081d71fbf08138107e5f754aeb3d2ae4c5b0ffea0167a43f56499a50`.
+Its first 1,209,104 bytes match the diagnostic app hash. The first takeover
+attempt immediately after reset timed out reading a complete USB status
+response. A subsequent `cargo run --offline -p kvmctl -- status COM6`
+succeeded and reported `5d123b1-dirty` with Wi-Fi connected.
+
+On the PSRAM SDP image, A authorized and B passed offer setup, then timed out
+waiting 25 seconds for a DataChannel. Internal free heap fell to 23 bytes.
+The run ended at USB transport state 0, epoch 0, and empty held state.
+No lease handoff occurred. The follow-up configuration selects ESP-IDF's
+PSRAM allocator for mbedTLS to relieve internal heap pressure. This puts
+mbedTLS dynamic allocations in external RAM. Physical board compromise is
+outside the current threat model. See [design.md](design.md).
+
+The SDP-only image passed `cargo run --offline -p kvmctl -- transport-test COM6`
+with two clean sessions and both SDP rejection checks. It also passed
+`cargo run --offline -p kvmctl -- signaling-test COM6 scripted 192.168.50.137`.
+Scripted telemetry ended at epoch 2, USB transport state 0, response queue
+depth 0, empty held state, and zero rejections, drops, and reorders.
+The firmware has no USB HID emitter. The client reported `hid_reports=0`
+and `physical_input_capture=off`.
+
+The mbedTLS PSRAM app was built from the same WSL revision with the Windows
+transport and allocation changes. The build set `CONFIG_MBEDTLS_EXTERNAL_MEM_ALLOC=y`
+in the existing generated sdkconfig before the WSL command below and verified
+the effective setting. It restored the WSL sources and cached sdkconfig afterward.
+The Windows image is 1,209,088 bytes, SHA-256
+`7fdf67c70cbb581d3df4e2b6ba7c170c13602a0ad88a4d9b63fb5d758a73216d`.
+
+```bash
+bash firmware/build-transport.sh "$HOME/esp/esp-webrtc-v1.3.0" reconfigure build
+sha256sum "$windows/firmware/build/kvmctl_firmware-m14-tls-psram.bin"
+```
+
+```powershell
+certutil -hashfile .\firmware\build\kvmctl_firmware-m14-tls-psram.bin SHA256
+'yes' | cargo run --offline -p kvmctl -- flash COM6 .\firmware\build\kvmctl_firmware-m14-tls-psram.bin .\firmware\backups\factory-app-before-m14-tls-psram-COM6-20261124.bin
+certutil -hashfile .\firmware\backups\factory-app-before-m14-tls-psram-COM6-20261124.bin SHA256
+Start-Sleep -Seconds 8
+cargo run --offline -p kvmctl -- signaling-test COM6 takeover 192.168.50.137
+```
+
+The CLI verified the 2,031,616-byte backup and replacement digest, then reset
+Board 2. Backup SHA-256 was
+`6e21f103f20a171e5a25d07fad1ccd70075b9b831c965b92bafc11a6fb77e41c`.
+Both Windows clients completed pinned WSS, DTLS and transcript authorization
+while connected concurrently. DataChannels opened in 3,983 ms (A) and 3,889 ms (B).
+The takeover command exited 0.
+
+| Step | Observed endpoint response or telemetry |
+| --- | --- |
+| A acquires | A response sequence 0, lease state `owned` by A, epoch 1. Held keys/buttons became 1/1. |
+| B requests, A rejects | Request `846ef0c95374fb16909bb629e632a939`. B sequence 0 `pending`, A sequence 1 notice with 10,000 ms, B sequence 1 `accepted=false`. Both sequence 2 responses returned A as owner at epoch 1. |
+| B requests again | Request `2cd6ef6f3dd23090a76a6f5bda27cf2a`. B sequence 3 `pending`, A sequence 3 notice with 10,000 ms. Board timestamp 21,357 ms. |
+| A stays active | Nine heartbeats preserved epoch 1 and held state 1/1. Last heartbeat sequence 13 at board timestamp 30,613 ms. At heartbeat 8, B sequence 4 rejected B's input with `stale_epoch` at epoch 1. |
+| Timeout handoff | Both peers reported B as sole owner at epoch 3 (A sequence 4, B sequence 5). Client elapsed time 10,141 ms. USB telemetry showed held state 0/0. |
+| Input ordering | A sent a key using epoch 1. A sequence 5 returned `stale_epoch` at endpoint epoch 3. USB held state stayed 0/0. Only then did B send epoch-3 key/button input, which set held state 1/1. |
+| Release and close | Both sequence 6 responses reported no owner at epoch 4. Final USB state 0, queue depth 0, held state 0/0, 21 events, two expected stale input drops, zero parser rejections and reorders. |
+
+The client reported `hid_reports=0` and `physical_input_capture=off`.
+The takeover image linked no USB HID emitter. Internal heap start/minimum/after
+was 204,947/84,371/149,987 bytes, and PSRAM was 8,292,188/7,374,028/8,260,336
+bytes. These are two-peer bench readings for this run.
+
+Intermediate repeats using the same command exposed timing sensitivity in the
+client. The run at epoch 5 failed its echo check after heartbeat 8 and closed
+at epoch 8. The run at epoch 9 exceeded a per-heartbeat observation deadline
+and closed at epoch 10. The run at epoch 11 could no longer verify A's held
+state at its final sample and closed at epoch 14. All three ended with USB
+state 0, empty held state, and zero HID. The updated scenario sends heartbeats
+on a 750 ms asynchronous schedule and checks the most recent accepted
+sequence through USB telemetry before waiting for the grant.
+
+### M1.4 scripted USB HID on Board 2 (2026-11-24)
+
+Board 2's native USB cable was already connected. Before switching to the
+bench image, `pnputil /enum-devices /instanceid 'USB\VID_303A&PID_1001&MI_00\6&2a6611de&0&0000' /relations`
+showed COM7's parent serial `7C:4F:AD:BC:C5:4C`, matching the COM6 flash
+probe's board MAC. The bench changes the native device to a keyboard and
+mouse with VID:PID `303A:4004` and fingerprint-derived serial
+`e299faff8cb8d99166647efa`. The CH343 administration port is COM6.
+
+The opt-in app was built under Ubuntu WSL from `5d123b1` and the Windows
+working-tree firmware changes. The build reused the pinned M0 caches for
+`esp_tinyusb` 2.4.0 and `tinyusb` 0.21.0~6. SDK configuration confirmed
+`CONFIG_MBEDTLS_EXTERNAL_MEM_ALLOC=y` and `CONFIG_TINYUSB_HID_COUNT=1`.
+The image is 1,240,608 bytes with SHA-256
+`346b273a211f99b0e55af204211891cd603b5d0906d61cd8ca43e875cb0d4f4d`.
+WSL inputs were restored after the build.
+
+```bash
+source ~/esp/esp-idf-v6.1.1/export.sh
+export KVMCTL_LIBSRTP_SOURCE="$HOME/esp/espressif__esp_libsrtp"
+export KVMCTL_HID_BENCH_COMPONENTS="$windows/verification/m0/usb-hid-uart/managed_components"
+KVMCTL_HID_BENCH=1 bash firmware/build-transport.sh "$HOME/esp/esp-webrtc-v1.3.0" reconfigure build
+cp firmware/build-wsl/hid-bench/kvmctl_firmware.bin "$windows/firmware/build/kvmctl_firmware-m14-hid-bench.bin"
+sha256sum "$windows/firmware/build/kvmctl_firmware-m14-hid-bench.bin"
+```
+
+```powershell
+certutil -hashfile .\firmware\build\kvmctl_firmware-m14-hid-bench.bin SHA256
+'yes' | cargo run --offline -p kvmctl -- flash COM6 .\firmware\build\kvmctl_firmware-m14-hid-bench.bin .\firmware\backups\factory-app-before-m14-hid-bench-COM6-20261124.bin
+certutil -hashfile .\firmware\backups\factory-app-before-m14-hid-bench-COM6-20261124.bin SHA256
+Start-Sleep -Seconds 8
+cargo run --offline -p kvmctl -- status COM6
+```
+
+The CLI verified the 2,031,616-byte backup before writing, verified the
+replacement digest, and reset Board 2. Backup SHA-256 was
+`5d16b550e6069a6c02874aff11e0ba666ada67fbda1368a211f76c1b1527bebc`.
+Its app bytes match the preceding zero-HID mbedTLS PSRAM image hash.
+COM6 status returned firmware `5d123b1-dirty` and Wi-Fi connected.
+
+```powershell
+pnputil /enum-devices /instanceid 'USB\VID_303A&PID_4004\e299faff8cb8d99166647efa' /relations
+cargo run --offline -p kvmctl -- signaling-test COM6 hid-bench 192.168.50.137
+```
+
+Windows enumerated `HID\VID_303A&PID_4004&Col01\6&33db1976&0&0000` and
+`HID\VID_303A&PID_4004&Col02\6&33db1976&0&0001` as children of the selected
+native USB device. The Raw Input observer matched both collections to that
+exact VID/PID/serial parent. Both pinned DataChannels opened in 4,201 ms,
+and the endpoint and client transcript proofs passed. The command exited 0.
+
+```text
+M1.4 RAW INPUT shift=make-break key_a=make-break left_button=down-up vertical=120 horizontal=-120 relative=(12,-4) release=true
+M1.3 SIGNALING COMPLETE scenario=hid-bench hid_reports=7 physical_input_capture=off
+```
+
+The seven completed USB reports were keyboard press, mouse button press,
+vertical wheel, horizontal wheel, relative motion, keyboard release, and
+mouse release. The script issued a lease release to trigger both neutral
+reports. Final transport state 0, lease epoch 2, queue depth 0, key/button
+state 0/0, eight scripted events, and no rejections, drops, or reorders.
+Internal free heap start/minimum/after was 194,827/130,235/170,023 bytes.
+PSRAM was 8,292,172/7,852,940/8,289,256 bytes. Control RTT min/max was
+13,850/114,627 µs. Motion RTT min/max was 16,229/28,822 µs.
+
+The default WSL build from the same tree also passed with the bench flag
+unset and no `KVMCTL_HID_BENCH` define in its compile commands. The default image
+has SHA-256 `b9f1a73058d1de69e08254a7bb4092a2207b09d8f78bcce8a46076b5e07cc90c`.
+The WSL signaling and USB decoder checks passed again, along with all 41
+Windows Rust tests. The default image was built for verification only.
+
+Post-bench transport checks ran with the HID-capable app still installed
+and the lifetime report count already at seven. Each command required
+the count to remain unchanged.
+
+```powershell
+cargo run --offline -p kvmctl -- transport-test COM6
+cargo run --offline -p kvmctl -- signaling-test COM6 scripted 192.168.50.137
+cargo run --offline -p kvmctl -- signaling-test COM6 takeover 192.168.50.137
+cargo run --offline -p kvmctl -- signaling-test COM6 takeover 192.168.50.137
+```
+
+All four exited 0 with `hid_reports=0` for the run. USB transport returned
+to idle after each of two sessions, rejected conflicting and malformed SDP,
+and reconnected cleanly. Single-client scripted signaling ended idle at
+epoch 4 with no drops or reorders.
+
+The final takeover scenario passed twice, with A/B/idle epochs 5/7/8 and
+9/11/12. Both runs saw the explicit rejection and A's continuing ownership,
+then confirmed the latest heartbeat at control sequence 15 and A's held
+state before handoff. B's early input returned `stale_epoch` at A's epoch.
+The no-response handoffs arrived after 10,323 ms and 10,237 ms. In each, both
+clients reported B as sole owner, USB held state cleared, A's old-epoch input
+returned `stale_epoch` at B's epoch, and B's subsequent key/button set held
+state. Both peers received idle at the final epoch. Each final USB status
+showed transport state 0, queue depth 0, held state 0/0, 23 processed events,
+two intentional stale-input drops, and no parser rejections or reorders.
+Internal heap minima were 69,459 and 69,335 bytes. PSRAM minima were
+7,372,592 and 7,373,156 bytes.
+
+Physical release was observed on explicit lease release. Physical release
+on disconnect, heartbeat expiry, takeover, revoke, restart, and USB
+transfer failure was not separately exercised. Sustained load, total SoC
+CPU, and send-to-HID timing remain unmeasured. Firmware images and verified
+factory-app backups are in ignored build and backup directories.

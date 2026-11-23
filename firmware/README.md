@@ -39,6 +39,23 @@ script invocation to edit the WSL build configuration. For Windows flashing,
 copy the resulting app image to a Windows-accessible path and use that path
 with the `kvmctl flash` command below.
 
+## Scripted USB HID bench
+
+Use the same WSL setup with an explicit bench build. Its build directory is
+separate from the default firmware.
+
+```sh
+KVMCTL_HID_BENCH=1 bash firmware/build-transport.sh "$HOME/esp/esp-webrtc-v1.3.0"
+sha256sum firmware/build-wsl/hid-bench/kvmctl_firmware.bin
+```
+
+For an offline build, set `KVMCTL_HID_BENCH_COMPONENTS` to a directory containing
+the pinned `espressif__esp_tinyusb` and `espressif__tinyusb` components from the
+M0 HID probe. Copy the bench app to the Windows build directory and use
+`kvmctl flash` with a fresh backup path. The bench image enumerates a USB
+keyboard and mouse. It emits script reports only for the current authenticated
+lease after an explicit arm request. See the [Windows client bench command](../client/README.md#scripted-usb-hid-bench).
+
 ## Windows build
 
 From `firmware/` in Windows PowerShell, build with ESP-IDF 6.1.1 and the pinned

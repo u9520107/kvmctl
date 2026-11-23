@@ -1,0 +1,7 @@
+dependencies:
+  espressif/esp_tinyusb:
+    version: "==2.4.0"
+    require: private
+  espressif/tinyusb:
+    version: "==0.21.0~6"
+    require: private

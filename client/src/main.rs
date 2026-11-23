@@ -13,6 +13,8 @@ mod hid_protocol;
 #[cfg(windows)]
 mod protocol;
 #[cfg(windows)]
+mod raw_input;
+#[cfg(windows)]
 mod signaling;
 #[cfg(windows)]
 mod transport;
@@ -66,6 +68,7 @@ struct TransportMetrics {
     scripted_reorders: u32,
     normalized_keys: u32,
     normalized_buttons: u32,
+    hid_reports: Option<u32>,
 }
 
 impl Default for TransportMetrics {
@@ -94,6 +97,7 @@ impl Default for TransportMetrics {
             scripted_reorders: 0,
             normalized_keys: 0,
             normalized_buttons: 0,
+            hid_reports: None,
         }
     }
 }
@@ -312,7 +316,7 @@ fn decode_transport_status_response(
     }
     r.expect_uint(5)?;
     let (result_major, result_fields) = r.head()?;
-    if result_major != 5 || (result_fields != 12 && result_fields != 22) {
+    if result_major != 5 || !matches!(result_fields, 12 | 22 | 23) {
         return Err("invalid transport telemetry field count".into());
     }
     let mut values = [0; 10];
@@ -325,12 +329,18 @@ fn decode_transport_status_response(
     r.expect_uint(11)?;
     let tls_rate_limited = r.uint()?;
     let mut telemetry = [0u64; 10];
-    if result_fields == 22 {
+    if result_fields >= 22 {
         for (index, value) in telemetry.iter_mut().enumerate() {
             r.expect_uint((index + 12) as u64)?;
             *value = r.uint()?;
         }
     }
+    let hid_reports = if result_fields == 23 {
+        r.expect_uint(22)?;
+        Some(u32::try_from(r.uint()?).map_err(|_| "invalid HID report count")?)
+    } else {
+        None
+    };
     if values[0] > 4
         || values[1..].iter().any(|value| *value > u32::MAX as u64)
         || diagnostic.len() > 96
@@ -367,6 +377,7 @@ fn decode_transport_status_response(
         scripted_reorders: telemetry[7] as u32,
         normalized_keys: telemetry[8] as u32,
         normalized_buttons: telemetry[9] as u32,
+        hid_reports,
     })
 }
 
@@ -1593,7 +1604,7 @@ fn run() -> Result<(), String> {
     let command = args.first().map(String::as_str).unwrap_or("status");
     if command == "--help" || command == "-h" {
         println!(
-            "kvmctl [status [COMx] | wifi [COMx] | enroll [COMx] | clients [COMx] | revoke [COMx] <fingerprint|all> | discover [COMx] | signaling-test [COMx] [scenario [IPv4] | IPv4] | led [COMx] on|off <brightness> <RRGGBB> | transport-test [COMx] | flash [COMx] <firmware.bin> <backup.bin> | ports]; scenario scripted sends opt-in events with zero HID output"
+            "kvmctl [status [COMx] | wifi [COMx] | enroll [COMx] [takeover] | clients [COMx] | revoke [COMx] <fingerprint|all> | discover [COMx] | signaling-test [COMx] [scenario [IPv4] | IPv4] | led [COMx] on|off <brightness> <RRGGBB> | transport-test [COMx] | flash [COMx] <firmware.bin> <backup.bin> | ports]; scripted and takeover scenarios use zero HID output"
         );
         return Ok(());
     }
@@ -1625,6 +1636,9 @@ fn run() -> Result<(), String> {
         "signaling-test" => (None, args.get(1..).unwrap_or(&[])),
         "flash" => (None, args.get(1..).unwrap_or(&[])),
         "revoke" => (None, args.get(1..).unwrap_or(&[])),
+        "enroll" if args.get(1).is_some_and(|arg| arg == "takeover") => {
+            (None, args.get(1..).unwrap_or(&[]))
+        }
         _ => (
             args.get(1).map(String::as_str),
             args.get(2..).unwrap_or(&[]),
@@ -1650,10 +1664,13 @@ fn run() -> Result<(), String> {
     }
     if matches!(
         command,
-        "status" | "wifi" | "enroll" | "clients" | "discover" | "transport-test"
+        "status" | "wifi" | "clients" | "discover" | "transport-test"
     ) && !params.is_empty()
     {
         return Err("this command takes only an optional COM port".into());
+    }
+    if command == "enroll" && !params.is_empty() && params != ["takeover"] {
+        return Err("usage: kvmctl enroll [COMx] [takeover]".into());
     }
     if command == "signaling-test"
         && (params.len() > 2
@@ -1668,6 +1685,8 @@ fn run() -> Result<(), String> {
                             | "resources"
                             | "revoke-active"
                             | "scripted"
+                            | "takeover"
+                            | "hid-bench"
                     )
             })
             || params
@@ -1780,7 +1799,7 @@ fn run() -> Result<(), String> {
                 wifi_name(status.wifi_state)
             ));
         }
-        let credential = credentials::ClientCredential::load_existing().map_err(|error| {
+        let credential = credentials::ClientCredential::load_existing(false).map_err(|error| {
             format!(
                 "{error}; run `cargo run --offline -p kvmctl -- enroll {}` first",
                 selected.name
@@ -1798,6 +1817,24 @@ fn run() -> Result<(), String> {
             "success"
         } else {
             params.first().map(String::as_str).unwrap_or("success")
+        };
+        let takeover_peer = if scenario == "takeover" {
+            let credential =
+                credentials::ClientCredential::load_existing(true).map_err(|error| {
+                    format!(
+                        "{error}; run `cargo run --offline -p kvmctl -- enroll {} takeover` first",
+                        selected.name
+                    )
+                })?;
+            if !enrolled.contains(&credential.fingerprint) {
+                return Err(format!(
+                    "takeover peer is not enrolled; run `cargo run --offline -p kvmctl -- enroll {} takeover` first",
+                    selected.name
+                ));
+            }
+            Some(credential)
+        } else {
+            None
         };
         let manual_address = if direct_only {
             params.first().map(String::as_str)
@@ -1851,12 +1888,24 @@ fn run() -> Result<(), String> {
                 ));
             }
         };
+        let hid_mode = if scenario == "hid-bench" {
+            "scripted HID"
+        } else {
+            "zero HID"
+        };
         println!(
-            "Running M1.3 signaling scenario `{scenario}`. HID output and physical-input capture remain disabled."
+            "Running signaling scenario `{scenario}` in {hid_mode} mode. Physical-input capture is off."
         );
         let endpoint_fingerprint = status.identity_fingerprint;
-        let address = transport::run_signaling_test(port, &service, status, credential, scenario)
-            .map_err(|error| error.to_string())?;
+        let address = transport::run_signaling_test(
+            port,
+            &service,
+            status,
+            credential,
+            takeover_peer,
+            scenario,
+        )
+        .map_err(|error| error.to_string())?;
         if let std::net::SocketAddr::V4(address) = address {
             let address = *address.ip();
             serial::remember_board_ip(&selected, &endpoint_fingerprint, address).map_err(
@@ -1932,7 +1981,7 @@ fn run() -> Result<(), String> {
             Ok(())
         }
         "enroll" => {
-            let credential = credentials::ClientCredential::load_or_create()?;
+            let credential = credentials::ClientCredential::load_or_create(!params.is_empty())?;
             let existing = port.list_clients()?;
             if existing.contains(&credential.fingerprint) {
                 println!("This Windows user is already enrolled on the selected board.");
@@ -2214,6 +2263,7 @@ mod tests {
         put_uint(&mut response, 4);
         put_uint(&mut response, 0);
         put_uint(&mut response, 5);
+        let result_header = response.len();
         put_head(&mut response, 5, 22);
         for (key, value) in [
             (0, 3),
@@ -2263,9 +2313,19 @@ mod tests {
         assert_eq!(metrics.response_queue_depth, 2);
         assert_eq!(metrics.scripted_drops, 2);
         assert_eq!(metrics.normalized_keys, 1);
+        assert_eq!(metrics.hid_reports, None);
         assert_eq!(
             &metrics.tls_diagnostic[..metrics.tls_diagnostic_len],
             b"ESP-TLS: handshake_failure"
+        );
+        response[result_header] = 0xb7;
+        put_uint(&mut response, 22);
+        put_uint(&mut response, 6);
+        assert_eq!(
+            decode_transport_status_response(&response, &id)
+                .unwrap()
+                .hid_reports,
+            Some(6)
         );
     }
 

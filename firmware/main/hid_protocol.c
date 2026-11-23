@@ -71,6 +71,7 @@ static bool payload(reader_t *r, uint64_t type, kvmctl_hid_event_t *event)
     case KVMCTL_HID_LEASE_REQUEST:
     case KVMCTL_HID_HEARTBEAT:
     case KVMCTL_HID_LEASE_RELEASE:
+    case KVMCTL_HID_BENCH_ARM:
         if (!map(r, 0)) return false;
         return true;
     case KVMCTL_HID_TAKEOVER_REQUEST:

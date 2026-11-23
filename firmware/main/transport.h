@@ -37,6 +37,7 @@ typedef struct {
     uint32_t scripted_reorders;
     uint32_t normalized_keys;
     uint32_t normalized_buttons;
+    uint32_t hid_reports;
     char tls_diagnostic[TRANSPORT_DIAGNOSTIC_CAPACITY];
 } transport_metrics_t;
 

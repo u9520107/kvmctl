@@ -494,7 +494,7 @@ async fn wait_open(
     Ok(())
 }
 
-pub(crate) fn run_test(port: crate::serial::Port) -> Result<()> {
+pub(crate) fn run_test(mut port: crate::serial::Port) -> Result<()> {
     install_certificate_log()?;
     CERTIFICATE_REJECTED.store(false, Ordering::Release);
     RTC_ERROR_LOGS.store(0, Ordering::Relaxed);
@@ -507,20 +507,32 @@ pub(crate) fn run_test(port: crate::serial::Port) -> Result<()> {
     {
         eprintln!("M1.2 TRANSPORT TEST_FIXTURE mode enabled");
     }
+    let hid_baseline = port
+        .transport_status()
+        .map_err(anyhow::Error::msg)?
+        .hid_reports;
     let runtime = default_runtime().context("no WebRTC runtime")?;
     let mut result: Option<Result<()>> = None;
     runtime.block_on(Box::pin(async {
         result = Some(
             async {
                 let port = exchange(runtime.clone(), port, "initial").await?;
-                let _port = exchange(runtime.clone(), port, "reconnect").await?;
+                let mut port = exchange(runtime.clone(), port, "reconnect").await?;
+                let hid_after = port
+                    .transport_status()
+                    .map_err(anyhow::Error::msg)?
+                    .hid_reports;
+                ensure!(
+                    hid_after == hid_baseline,
+                    "unexpected HID reports in USB transport test"
+                );
                 Ok(())
             }
             .await,
         );
     }));
     result.context("runtime did not execute")??;
-    eprintln!("M1.2 TRANSPORT COMPLETE sessions=2 reconnect=clean");
+    eprintln!("M1.2 TRANSPORT COMPLETE sessions=2 reconnect=clean hid_reports=0");
     Ok(())
 }
 
@@ -649,9 +661,16 @@ impl Drop for PortMonitor {
     }
 }
 
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum ScriptMode {
+    Transport,
+    HidBench,
+}
+const SCRIPTED_HID_REPORTS: u32 = 7;
+
 enum TranscriptProofCase<'a> {
     Valid {
-        scripted: bool,
+        scripted: Option<ScriptMode>,
         check_isolation: bool,
         check_resources: bool,
         revoke_after_authorization: bool,
@@ -796,17 +815,32 @@ async fn test_competing_signaling(
     Ok(())
 }
 
-async fn exchange_signaling(
+struct SignalingPeer<P> {
+    session: crate::signaling::Session,
+    pc: P,
+    control: Arc<dyn DataChannel>,
+    motion: Arc<dyn DataChannel>,
+    offer_sdp: String,
+    proof: Vec<u8>,
+}
+
+impl<P: PeerConnection> SignalingPeer<P> {
+    async fn close(mut self, runtime: &dyn Runtime) {
+        self.session.close();
+        drop(self.session);
+        let _ = timeout(runtime, Duration::from_secs(10), self.pc.close()).await;
+    }
+}
+
+async fn open_signaling_peer(
     runtime: Arc<dyn Runtime>,
     monitor: &PortMonitor,
     address: SocketAddr,
     hostname: &str,
     status: &crate::Status,
     credential: &crate::credentials::ClientCredential,
-    proof_case: TranscriptProofCase<'_>,
-) -> Result<Vec<u8>> {
+) -> Result<SignalingPeer<impl PeerConnection>> {
     let started = Instant::now();
-    let authorized_case = matches!(&proof_case, TranscriptProofCase::Valid { .. });
     let mut session = crate::signaling::Session::connect(
         address,
         hostname,
@@ -864,37 +898,83 @@ async fn exchange_signaling(
         eprintln!("M1.3 DTLS_OPEN elapsed_ms={} control=ordered-reliable motion=unordered-zero-retransmit",
                   started.elapsed().as_millis());
 
+        Ok((control, motion, offer_sdp, offer_exchange.client_transcript_proof))
+    }.await;
+    match result {
+        Ok((control, motion, offer_sdp, proof)) => Ok(SignalingPeer {
+            session,
+            pc,
+            control,
+            motion,
+            offer_sdp,
+            proof,
+        }),
+        Err(error) => {
+            session.close();
+            drop(session);
+            let _ = timeout(&*runtime, Duration::from_secs(10), pc.close()).await;
+            Err(error)
+        }
+    }
+}
+
+async fn exchange_signaling(
+    runtime: Arc<dyn Runtime>,
+    monitor: &PortMonitor,
+    address: SocketAddr,
+    hostname: &str,
+    status: &crate::Status,
+    credential: &crate::credentials::ClientCredential,
+    proof_case: TranscriptProofCase<'_>,
+) -> Result<Vec<u8>> {
+    let authorized_case = matches!(&proof_case, TranscriptProofCase::Valid { .. });
+    let mut peer = open_signaling_peer(
+        runtime.clone(),
+        monitor,
+        address,
+        hostname,
+        status,
+        credential,
+    )
+    .await?;
+    let control = &peer.control;
+    let motion = &peer.motion;
+    let offer_sdp = &peer.offer_sdp;
+    let proof = &peer.proof;
+    let result = async {
         match proof_case {
             TranscriptProofCase::Valid { scripted, check_isolation, check_resources, revoke_after_authorization } => {
-                session.send_transcript_proof(&offer_exchange.client_transcript_proof)
+                peer.session.send_transcript_proof(proof)
                     .map_err(anyhow::Error::msg)?;
                 eprintln!("M1.3 AUTHORIZED client_proof=valid endpoint_transcript=verified dtls_identity=verified");
-                if scripted {
-                    scripted_transport_zero_hid(
+                if let Some(mode) = scripted {
+                    scripted_transport(
                         &*runtime,
                         monitor,
-                        &control,
-                        &motion,
-                        session.session_id(),
+                        control,
+                        motion,
+                        peer.session.session_id(),
                         credential.fingerprint,
+                        status.identity_fingerprint,
+                        mode,
                     )
                     .await?;
                 }
                 if check_isolation {
-                    test_competing_signaling(&*runtime, &control, &motion, address, hostname, status, credential, &offer_sdp).await?;
+                    test_competing_signaling(&*runtime, control, motion, address, hostname, status, credential, offer_sdp).await?;
                 }
                 if check_resources {
-                    run_resource_test(&*runtime, &control, &motion, monitor, address, hostname, status, credential).await?;
+                    run_resource_test(&*runtime, control, motion, monitor, address, hostname, status, credential).await?;
                 }
                 if revoke_after_authorization {
-                    echo_signaling(&*runtime, &control, "control-before-active-revoke", 1).await?;
-                    echo_signaling(&*runtime, &motion, "motion-before-active-revoke", 1).await?;
+                    echo_signaling(&*runtime, control, "control-before-active-revoke", 1).await?;
+                    echo_signaling(&*runtime, motion, "motion-before-active-revoke", 1).await?;
                     monitor.revoke_client(credential.fingerprint)?;
                     wait_device_closed(&monitor.device_status).await?;
                     send_after_revocation_and_reject_echo(
                         &*runtime,
-                        &control,
-                        &motion,
+                        control,
+                        motion,
                         &monitor.device_status,
                     )
                     .await?;
@@ -909,40 +989,38 @@ async fn exchange_signaling(
                         }
                     }
                     eprintln!("M1.3 REVOCATION usb_revoke=active_session_closed reconnect=unauthorized");
-                    return Ok(offer_exchange.client_transcript_proof);
+                    return Ok(proof.clone());
                 }
-                echo_signaling(&*runtime, &control, "control", 10).await?;
-                echo_signaling(&*runtime, &motion, "motion", 10).await?;
-                Ok(offer_exchange.client_transcript_proof)
+                echo_signaling(&*runtime, control, "control", 10).await?;
+                echo_signaling(&*runtime, motion, "motion", 10).await?;
+                Ok(proof.clone())
             }
             TranscriptProofCase::Missing => {
-                send_before_authorization_and_reject_echo(&*runtime, &control, &motion).await?;
+                send_before_authorization_and_reject_echo(&*runtime, control, motion).await?;
                 eprintln!("M1.3 PROOF negative=missing accepted_application_bytes=0 echoed=false");
-                Ok(offer_exchange.client_transcript_proof)
+                Ok(proof.clone())
             }
             TranscriptProofCase::Invalid => {
-                let mut invalid = offer_exchange.client_transcript_proof;
+                let mut invalid = proof.clone();
                 *invalid.last_mut().ok_or_else(|| anyhow::anyhow!("empty transcript proof"))? ^= 1;
-                send_before_authorization_and_reject_echo(&*runtime, &control, &motion).await?;
-                session.send_transcript_proof_frame(&invalid).map_err(anyhow::Error::msg)?;
-                let rejection = session.receive_rejection().map_err(anyhow::Error::msg)?;
+                send_before_authorization_and_reject_echo(&*runtime, control, motion).await?;
+                peer.session.send_transcript_proof_frame(&invalid).map_err(anyhow::Error::msg)?;
+                let rejection = peer.session.receive_rejection().map_err(anyhow::Error::msg)?;
                 ensure!(rejection.contains("unauthorized"), "invalid proof got unexpected error: {rejection}");
                 eprintln!("M1.3 PROOF negative=invalid accepted_application_bytes=0 echoed=false result=unauthorized");
                 Ok(Vec::new())
             }
             TranscriptProofCase::Replayed(replayed) => {
-                send_before_authorization_and_reject_echo(&*runtime, &control, &motion).await?;
-                session.send_transcript_proof_frame(replayed).map_err(anyhow::Error::msg)?;
-                let rejection = session.receive_rejection().map_err(anyhow::Error::msg)?;
+                send_before_authorization_and_reject_echo(&*runtime, control, motion).await?;
+                peer.session.send_transcript_proof_frame(replayed).map_err(anyhow::Error::msg)?;
+                let rejection = peer.session.receive_rejection().map_err(anyhow::Error::msg)?;
                 ensure!(rejection.contains("unauthorized"), "replayed proof got unexpected error: {rejection}");
                 eprintln!("M1.3 PROOF negative=replayed_previous_session accepted_application_bytes=0 echoed=false result=unauthorized");
                 Ok(Vec::new())
             }
         }
     }.await;
-    session.close();
-    drop(session);
-    let _ = timeout(&*runtime, Duration::from_secs(10), pc.close()).await;
+    peer.close(&*runtime).await;
     let cleanup = wait_device_closed(&monitor.device_status).await;
     let proof = result?;
     cleanup?;
@@ -1054,13 +1132,12 @@ impl ResponseCursor {
             self.next_sequence,
             envelope.sequence
         );
-        if !matches!(&envelope.event, crate::hid_protocol::Event::Error { .. }) {
-            ensure!(
-                envelope.lease_epoch == expected_epoch,
-                "endpoint response lease epoch mismatch: expected {expected_epoch}, received {}",
-                envelope.lease_epoch
-            );
-        }
+        ensure!(
+            envelope.lease_epoch == expected_epoch,
+            "endpoint response lease epoch mismatch: expected {expected_epoch}, received {} ({:?})",
+            envelope.lease_epoch,
+            envelope.event
+        );
         self.next_sequence = self
             .next_sequence
             .checked_add(1)
@@ -1163,13 +1240,15 @@ fn wait_for_scripted_telemetry(
     }
 }
 
-async fn scripted_transport_zero_hid(
+async fn scripted_transport(
     runtime: &dyn Runtime,
     monitor: &PortMonitor,
     control: &Arc<dyn DataChannel>,
     motion: &Arc<dyn DataChannel>,
     session_id: [u8; 16],
     client_fingerprint: [u8; 32],
+    endpoint_fingerprint: [u8; 32],
+    mode: ScriptMode,
 ) -> Result<()> {
     use crate::hid_protocol::{self, Envelope, Event};
 
@@ -1181,6 +1260,7 @@ async fn scripted_transport_zero_hid(
         event,
     };
     let mut responses = ResponseCursor::new(session_id);
+    let epoch = next_lease_epoch(monitor.fresh_snapshot()?.lease_epoch);
 
     send_hid_event(
         control,
@@ -1188,28 +1268,59 @@ async fn scripted_transport_zero_hid(
     )
     .await?;
     require_response(
-        receive_endpoint_response(runtime, control, &mut responses, 1).await?,
+        receive_endpoint_response(runtime, control, &mut responses, epoch).await?,
         EndpointResponse::LeaseState {
             owner: Some(client_fingerprint),
             state: 1,
         },
     )
     .context("lease request response")?;
+    let hid_bench = mode == ScriptMode::HidBench;
+    let offset = u64::from(hid_bench);
+    let hid_baseline = monitor.fresh_snapshot()?.hid_reports;
+    let observer = if hid_bench {
+        ensure!(
+            hid_baseline.is_some(),
+            "firmware did not expose HID bench telemetry"
+        );
+        let serial = crate::hex(&endpoint_fingerprint[..12]);
+        Some(crate::raw_input::Observer::start(0x303a, 0x4004, &serial)?)
+    } else {
+        None
+    };
+    if hid_bench {
+        send_hid_event(
+            control,
+            event(hid_protocol::HID_BENCH_ARM, epoch, 1, Event::HidBenchArm),
+        )
+        .await?;
+        require_response(
+            receive_endpoint_response(runtime, control, &mut responses, epoch).await?,
+            EndpointResponse::LeaseState {
+                owner: Some(client_fingerprint),
+                state: 1,
+            },
+        )
+        .context("HID bench arm response")?;
+    }
+    if let Some(observer) = &observer {
+        observer.check_focus()?;
+    }
     let telemetry_baseline = monitor
         .fresh_snapshot()
         .context("scripted telemetry baseline")?;
 
     send_hid_event(
         control,
-        event(hid_protocol::HEARTBEAT, 1, 1, Event::Heartbeat),
+        event(hid_protocol::HEARTBEAT, epoch, 1 + offset, Event::Heartbeat),
     )
     .await?;
     send_hid_event(
         control,
         event(
             hid_protocol::KEYBOARD_STATE,
-            1,
-            2,
+            epoch,
+            2 + offset,
             Event::KeyboardState {
                 modifiers: 2,
                 keys: vec![(7, 4)],
@@ -1217,12 +1328,15 @@ async fn scripted_transport_zero_hid(
         ),
     )
     .await?;
+    if let Some(observer) = &observer {
+        observer.check_focus()?;
+    }
     send_hid_event(
         control,
         event(
             hid_protocol::MOUSE_BUTTONS,
-            1,
-            3,
+            epoch,
+            3 + offset,
             Event::MouseButtons { mask: 1 },
         ),
     )
@@ -1231,8 +1345,8 @@ async fn scripted_transport_zero_hid(
         control,
         event(
             hid_protocol::WHEEL,
-            1,
-            4,
+            epoch,
+            4 + offset,
             Event::Wheel {
                 vertical: 1,
                 horizontal: -1,
@@ -1240,30 +1354,446 @@ async fn scripted_transport_zero_hid(
         ),
     )
     .await?;
-    wait_for_scripted_telemetry(monitor, &telemetry_baseline, 4, 4)
+    wait_for_scripted_telemetry(monitor, &telemetry_baseline, 4, 4 + offset)
         .context("control telemetry barrier")?;
+    if hid_bench {
+        wait_for_hid_reports(monitor, hid_baseline.context("missing report count")?, 4)?;
+    }
+    if let Some(observer) = &observer {
+        observer.check_focus()?;
+    }
     send_hid_event(
         motion,
-        event(hid_protocol::MOTION, 1, 0, Event::Motion { dx: 12, dy: -4 }),
+        event(
+            hid_protocol::MOTION,
+            epoch,
+            0,
+            Event::Motion { dx: 12, dy: -4 },
+        ),
     )
     .await?;
     wait_for_scripted_telemetry(monitor, &telemetry_baseline, 5, 0)
         .context("motion telemetry barrier")?;
+    if hid_bench {
+        wait_for_hid_reports(monitor, hid_baseline.context("missing report count")?, 5)?;
+    }
     send_hid_event(
         control,
-        event(hid_protocol::LEASE_RELEASE, 1, 5, Event::LeaseRelease),
+        event(
+            hid_protocol::LEASE_RELEASE,
+            epoch,
+            5 + offset,
+            Event::LeaseRelease,
+        ),
     )
     .await?;
     require_response(
-        receive_endpoint_response(runtime, control, &mut responses, 2).await?,
+        receive_endpoint_response(runtime, control, &mut responses, next_lease_epoch(epoch))
+            .await?,
         EndpointResponse::LeaseState {
             owner: None,
             state: 0,
         },
     )
     .context("lease release response")?;
+    if let Some(before) = hid_baseline {
+        let expected = if hid_bench { SCRIPTED_HID_REPORTS } else { 0 };
+        let metrics = wait_for_hid_reports(monitor, before, expected)?;
+        ensure!(
+            metrics.normalized_keys == 0 && metrics.normalized_buttons == 0,
+            "lease release left held state"
+        );
+    }
+    if let Some(observer) = observer {
+        observer.verify()?;
+    } else {
+        eprintln!(
+            "M1.4 SCRIPTED secure_path=true key=true modifier=true button=true wheel=true motion=true hid_reports=0 physical_input_capture=off"
+        );
+    }
+    Ok(())
+}
+
+fn wait_for_hid_reports(
+    monitor: &PortMonitor,
+    before: u32,
+    expected: u32,
+) -> Result<crate::TransportMetrics> {
+    let deadline = Instant::now() + Duration::from_secs(2);
+    loop {
+        let metrics = monitor.fresh_snapshot()?;
+        let count = metrics
+            .hid_reports
+            .context("HID report telemetry disappeared")?
+            .wrapping_sub(before);
+        if count == expected {
+            return Ok(metrics);
+        }
+        ensure!(
+            count < expected && Instant::now() < deadline,
+            "expected {expected} HID reports, observed {count}"
+        );
+        std::thread::sleep(Duration::from_millis(20));
+    }
+}
+
+struct TakeoverClient<'a> {
+    label: &'static str,
+    runtime: &'a dyn Runtime,
+    control: &'a Arc<dyn DataChannel>,
+    responses: ResponseCursor,
+    sequence: u64,
+}
+
+impl<'a> TakeoverClient<'a> {
+    fn new<P>(label: &'static str, runtime: &'a dyn Runtime, peer: &'a SignalingPeer<P>) -> Self {
+        Self {
+            label,
+            runtime,
+            control: &peer.control,
+            responses: ResponseCursor::new(peer.session.session_id()),
+            sequence: 0,
+        }
+    }
+
+    async fn send(
+        &mut self,
+        message_type: u64,
+        epoch: u32,
+        event: crate::hid_protocol::Event,
+    ) -> Result<()> {
+        send_hid_event(
+            self.control,
+            crate::hid_protocol::Envelope {
+                message_type,
+                session_id: self.responses.session_id,
+                lease_epoch: epoch,
+                sequence: self.sequence,
+                event,
+            },
+        )
+        .await?;
+        self.sequence += 1;
+        Ok(())
+    }
+
+    async fn expect(&mut self, epoch: u32, expected: EndpointResponse) -> Result<()> {
+        let received =
+            receive_endpoint_response(self.runtime, self.control, &mut self.responses, epoch)
+                .await
+                .with_context(|| {
+                    format!(
+                        "client {} expected {expected:?} at epoch {epoch}",
+                        self.label
+                    )
+                })?;
+        eprintln!(
+            "M1.4 TAKEOVER client={} epoch={epoch} response_sequence={} response={received:?}",
+            self.label,
+            self.responses.next_sequence - 1
+        );
+        ensure!(
+            received == expected,
+            "client {} expected {expected:?}",
+            self.label
+        );
+        Ok(())
+    }
+}
+
+fn next_lease_epoch(epoch: u32) -> u32 {
+    epoch.wrapping_add(1).max(1)
+}
+
+async fn takeover_heartbeat_processed(
+    runtime: &dyn Runtime,
+    monitor: &PortMonitor,
+    epoch: u32,
+    sequence: u64,
+    deadline: Instant,
+) -> Result<crate::TransportMetrics> {
+    loop {
+        let metrics = monitor.snapshot();
+        ensure!(
+            metrics.lease_epoch == epoch
+                && metrics.normalized_keys == 1
+                && metrics.normalized_buttons == 1,
+            "A lost its lease or held state before the takeover window ended"
+        );
+        if metrics.last_event_sequence == sequence {
+            return Ok(metrics);
+        }
+        ensure!(
+            Instant::now() < deadline,
+            "A heartbeat {sequence} was not processed"
+        );
+        runtime.sleep(Duration::from_millis(20)).await;
+    }
+}
+
+async fn exercise_takeover(
+    monitor: &PortMonitor,
+    mut a: TakeoverClient<'_>,
+    mut b: TakeoverClient<'_>,
+    owner_a: [u8; 32],
+    owner_b: [u8; 32],
+) -> Result<u32> {
+    use crate::hid_protocol::{self as hid, Event};
+
+    let owned = |owner| EndpointResponse::LeaseState {
+        owner: Some(owner),
+        state: 1,
+    };
+    let pending = || EndpointResponse::LeaseState {
+        owner: Some(owner_a),
+        state: 2,
+    };
+    let notice = |request_id| EndpointResponse::TakeoverNotice {
+        request_id,
+        requester: owner_b,
+        response_window_ms: 10_000,
+    };
+    let stale = || EndpointResponse::Error {
+        code: "stale_epoch".into(),
+    };
+    let key = || Event::KeyboardState {
+        modifiers: 2,
+        keys: vec![(7, 4)],
+    };
+    let button = || Event::MouseButtons { mask: 1 };
+    let baseline = monitor.fresh_snapshot()?;
+    let a_epoch = next_lease_epoch(baseline.lease_epoch);
+    let b_epoch = next_lease_epoch(next_lease_epoch(a_epoch));
+    a.send(hid::LEASE_REQUEST, 0, Event::LeaseRequest).await?;
+    a.expect(a_epoch, owned(owner_a)).await?;
+    a.send(hid::KEYBOARD_STATE, a_epoch, key()).await?;
+    a.send(hid::MOUSE_BUTTONS, a_epoch, button()).await?;
+    wait_for_scripted_telemetry(monitor, &baseline, 3, 2)?;
+    let held = monitor.fresh_snapshot()?;
+    ensure!(
+        held.normalized_keys == 1 && held.normalized_buttons == 1,
+        "A input did not set held keys and buttons"
+    );
+    eprintln!("M1.4 TAKEOVER A-held epoch={a_epoch} keys=1 buttons=1");
+
+    let rejected = crate::random_id().map_err(anyhow::Error::msg)?;
+    b.send(
+        hid::TAKEOVER_REQUEST,
+        0,
+        Event::TakeoverRequest {
+            request_id: rejected,
+        },
+    )
+    .await?;
+    b.expect(a_epoch, pending()).await?;
+    a.expect(a_epoch, notice(rejected)).await?;
+    a.send(
+        hid::TAKEOVER_RESPONSE,
+        a_epoch,
+        Event::TakeoverResponse {
+            request_id: rejected,
+            accepted: false,
+        },
+    )
+    .await?;
+    b.expect(
+        a_epoch,
+        EndpointResponse::TakeoverResponse {
+            request_id: rejected,
+            accepted: false,
+        },
+    )
+    .await?;
+    a.expect(a_epoch, owned(owner_a)).await?;
+    b.expect(a_epoch, owned(owner_a)).await?;
+
+    a.send(hid::HEARTBEAT, a_epoch, Event::Heartbeat).await?;
+    takeover_heartbeat_processed(
+        a.runtime,
+        monitor,
+        a_epoch,
+        a.sequence - 1,
+        Instant::now() + Duration::from_millis(1500),
+    )
+    .await?;
+    let timed = crate::random_id().map_err(anyhow::Error::msg)?;
+    let requested = Instant::now();
+    b.send(
+        hid::TAKEOVER_REQUEST,
+        0,
+        Event::TakeoverRequest { request_id: timed },
+    )
+    .await?;
+    b.expect(a_epoch, pending()).await?;
+    a.expect(a_epoch, notice(timed)).await?;
+    let pending_board_ms = monitor.fresh_snapshot()?.board_timestamp_ms;
+    eprintln!("M1.4 TAKEOVER pending epoch={a_epoch} board_timestamp_ms={pending_board_ms}");
+    for heartbeat in 1..=11 {
+        let due = requested + Duration::from_millis(750 * heartbeat);
+        a.runtime
+            .sleep(due.saturating_duration_since(Instant::now()))
+            .await;
+        a.send(hid::HEARTBEAT, a_epoch, Event::Heartbeat).await?;
+        let metrics = monitor.snapshot();
+        ensure!(
+            metrics.lease_epoch == a_epoch
+                && metrics.normalized_keys == 1
+                && metrics.normalized_buttons == 1,
+            "A lost its lease or held state before the takeover window ended"
+        );
+        eprintln!(
+            "M1.4 TAKEOVER heartbeat={heartbeat} epoch={a_epoch} sequence_sent={} last_board_sequence={}",
+            a.sequence - 1,
+            metrics.last_event_sequence,
+        );
+        if heartbeat == 8 {
+            b.send(hid::KEYBOARD_STATE, a_epoch, key()).await?;
+            b.expect(a_epoch, stale()).await?;
+        }
+    }
+    let final_sample = requested + Duration::from_secs(9);
+    a.runtime
+        .sleep(final_sample.saturating_duration_since(Instant::now()))
+        .await;
+    let last_heartbeat = takeover_heartbeat_processed(
+        a.runtime,
+        monitor,
+        a_epoch,
+        a.sequence - 1,
+        requested + Duration::from_millis(9700),
+    )
+    .await?;
     eprintln!(
-        "M1.4 SCRIPTED secure_path=true key=true modifier=true button=true wheel=true motion=true hid_reports=0 physical_input_capture=off"
+        "M1.4 TAKEOVER A-still-held epoch={a_epoch} board_timestamp_ms={} last_heartbeat_sequence={}",
+        last_heartbeat.board_timestamp_ms, last_heartbeat.last_event_sequence,
+    );
+    b.expect(b_epoch, owned(owner_b)).await?;
+    let elapsed = requested.elapsed();
+    ensure!(
+        elapsed >= Duration::from_secs(10),
+        "takeover granted before the 10-second window"
+    );
+    a.expect(b_epoch, owned(owner_b)).await?;
+    let cleared = monitor.fresh_snapshot()?;
+    ensure!(
+        cleared.lease_epoch == b_epoch
+            && cleared.normalized_keys == 0
+            && cleared.normalized_buttons == 0,
+        "held input survived the handoff"
+    );
+    eprintln!(
+        "M1.4 TAKEOVER timeout_ms={} B-owned epoch={b_epoch} keys=0 buttons=0",
+        elapsed.as_millis()
+    );
+    a.send(hid::KEYBOARD_STATE, a_epoch, key()).await?;
+    a.expect(b_epoch, stale()).await?;
+    let before_b = monitor.fresh_snapshot()?;
+    ensure!(
+        before_b.normalized_keys == 0 && before_b.normalized_buttons == 0,
+        "A's stale input changed held state"
+    );
+    b.send(hid::KEYBOARD_STATE, b_epoch, key()).await?;
+    b.send(hid::MOUSE_BUTTONS, b_epoch, button()).await?;
+    wait_for_scripted_telemetry(monitor, &before_b, 2, b.sequence - 1)?;
+    let accepted = monitor.fresh_snapshot()?;
+    ensure!(
+        accepted.lease_epoch == b_epoch
+            && accepted.normalized_keys == 1
+            && accepted.normalized_buttons == 1,
+        "B's input did not set held keys and buttons"
+    );
+    eprintln!("M1.4 TAKEOVER B-input accepted epoch={b_epoch} keys=1 buttons=1");
+    b.send(hid::LEASE_RELEASE, b_epoch, Event::LeaseRelease)
+        .await?;
+    let idle_epoch = next_lease_epoch(b_epoch);
+    a.expect(
+        idle_epoch,
+        EndpointResponse::LeaseState {
+            owner: None,
+            state: 0,
+        },
+    )
+    .await?;
+    b.expect(
+        idle_epoch,
+        EndpointResponse::LeaseState {
+            owner: None,
+            state: 0,
+        },
+    )
+    .await?;
+    Ok(idle_epoch)
+}
+
+async fn run_takeover(
+    runtime: Arc<dyn Runtime>,
+    monitor: &PortMonitor,
+    address: SocketAddr,
+    hostname: &str,
+    status: &crate::Status,
+    credential_a: &crate::credentials::ClientCredential,
+    credential_b: &crate::credentials::ClientCredential,
+) -> Result<()> {
+    ensure!(
+        credential_a.fingerprint != credential_b.fingerprint,
+        "takeover requires two distinct enrolled identities"
+    );
+    eprintln!(
+        "M1.4 TAKEOVER A={} B={}",
+        crate::hex(&credential_a.fingerprint),
+        crate::hex(&credential_b.fingerprint)
+    );
+    let mut a = open_signaling_peer(
+        runtime.clone(),
+        monitor,
+        address,
+        hostname,
+        status,
+        credential_a,
+    )
+    .await?;
+    let result = async {
+        a.session.send_transcript_proof(&a.proof).map_err(anyhow::Error::msg)
+            .context("client A transcript authorization")?;
+        eprintln!("M1.4 TAKEOVER client=A authorized=true");
+        let mut b = open_signaling_peer(runtime.clone(), monitor, address, hostname, status, credential_b).await
+            .context("client B signaling setup")?;
+        let result = async {
+            b.session.send_transcript_proof(&b.proof).map_err(anyhow::Error::msg)
+                .context("client B transcript authorization")?;
+            eprintln!("M1.4 TAKEOVER both_clients_authorized=true endpoint_transcripts=verified dtls_identities=verified");
+            exercise_takeover(
+                monitor,
+                TakeoverClient::new("A", &*runtime, &a),
+                TakeoverClient::new("B", &*runtime, &b),
+                credential_a.fingerprint,
+                credential_b.fingerprint,
+            ).await
+        }.await;
+        b.close(&*runtime).await;
+        result
+    }.await;
+    a.close(&*runtime).await;
+    let cleanup = wait_device_closed(&monitor.device_status).await;
+    let idle_epoch = result?;
+    cleanup?;
+    let final_status = monitor.fresh_snapshot()?;
+    ensure!(
+        final_status.state == 0
+            && final_status.lease_epoch == idle_epoch
+            && final_status.normalized_keys == 0
+            && final_status.normalized_buttons == 0
+            && final_status.response_queue_depth == 0,
+        "takeover did not leave an idle endpoint and empty held state"
+    );
+    ensure!(
+        final_status.scripted_rejections == 0
+            && final_status.scripted_reorders == 0
+            && final_status.scripted_drops == 2,
+        "expected exactly two stale input drops and no parser rejections or reorders"
+    );
+    eprintln!(
+        "M1.4 TAKEOVER sessions=closed lease=idle epoch={idle_epoch} keys=0 buttons=0 hid_reports=0"
     );
     Ok(())
 }
@@ -1471,6 +2001,7 @@ pub(crate) fn run_signaling_test(
     service: &crate::discovery::Service,
     status: crate::Status,
     credential: crate::credentials::ClientCredential,
+    takeover_peer: Option<crate::credentials::ClientCredential>,
     scenario: &str,
 ) -> Result<SocketAddr> {
     ensure!(
@@ -1483,6 +2014,8 @@ pub(crate) fn run_signaling_test(
                 | "resources"
                 | "revoke-active"
                 | "scripted"
+                | "takeover"
+                | "hid-bench"
         ),
         "unknown signaling-test scenario"
     );
@@ -1490,13 +2023,29 @@ pub(crate) fn run_signaling_test(
     let address = crate::discovery::socket_address(service).map_err(anyhow::Error::msg)?;
     let hostname = service.hostname.clone();
     let monitor = PortMonitor::start(port);
+    let initial_hid_reports = monitor.fresh_snapshot()?.hid_reports;
     let runtime = default_runtime().context("no WebRTC runtime")?;
     let mut result: Option<Result<()>> = None;
     runtime.block_on(Box::pin(async {
         result = Some(
             async {
                 match scenario {
-                    "scripted" => {
+                    "takeover" => {
+                        let peer = takeover_peer
+                            .as_ref()
+                            .context("missing takeover identity")?;
+                        run_takeover(
+                            runtime.clone(),
+                            &monitor,
+                            address,
+                            &hostname,
+                            &status,
+                            &credential,
+                            peer,
+                        )
+                        .await?;
+                    }
+                    "scripted" | "hid-bench" => {
                         let _proof = exchange_signaling(
                             runtime.clone(),
                             &monitor,
@@ -1505,7 +2054,11 @@ pub(crate) fn run_signaling_test(
                             &status,
                             &credential,
                             TranscriptProofCase::Valid {
-                                scripted: true,
+                                scripted: Some(if scenario == "hid-bench" {
+                                    ScriptMode::HidBench
+                                } else {
+                                    ScriptMode::Transport
+                                }),
                                 check_isolation: false,
                                 check_resources: false,
                                 revoke_after_authorization: false,
@@ -1522,7 +2075,7 @@ pub(crate) fn run_signaling_test(
                             &status,
                             &credential,
                             TranscriptProofCase::Valid {
-                                scripted: false,
+                                scripted: None,
                                 check_isolation: true,
                                 check_resources: false,
                                 revoke_after_authorization: false,
@@ -1563,7 +2116,7 @@ pub(crate) fn run_signaling_test(
                             &status,
                             &credential,
                             TranscriptProofCase::Valid {
-                                scripted: false,
+                                scripted: None,
                                 check_isolation: false,
                                 check_resources: false,
                                 revoke_after_authorization: false,
@@ -1590,7 +2143,7 @@ pub(crate) fn run_signaling_test(
                             &status,
                             &credential,
                             TranscriptProofCase::Valid {
-                                scripted: false,
+                                scripted: None,
                                 check_isolation: false,
                                 check_resources: true,
                                 revoke_after_authorization: false,
@@ -1607,7 +2160,7 @@ pub(crate) fn run_signaling_test(
                             &status,
                             &credential,
                             TranscriptProofCase::Valid {
-                                scripted: false,
+                                scripted: None,
                                 check_isolation: false,
                                 check_resources: false,
                                 revoke_after_authorization: true,
@@ -1626,10 +2179,20 @@ pub(crate) fn run_signaling_test(
     let (port, metrics, usb_admin_ok) = monitor.finish()?;
     let _ = port;
     if let Err(error) = result {
+        if scenario == "takeover" {
+            eprintln!(
+                "M1.4 TAKEOVER FAILED state={} epoch={} keys={} buttons={} internal_free_min_bytes={} hid_reports=0",
+                metrics.state,
+                metrics.lease_epoch,
+                metrics.normalized_keys,
+                metrics.normalized_buttons,
+                metrics.internal_free_min,
+            );
+        }
         let diagnostic = &metrics.tls_diagnostic[..metrics.tls_diagnostic_len];
         if !diagnostic.is_empty() {
             return Err(anyhow::Error::msg(format!(
-                "{error}; ESP TLS diagnostic: {}",
+                "{error:#}; ESP TLS diagnostic: {}",
                 String::from_utf8_lossy(diagnostic)
             )));
         }
@@ -1663,8 +2226,28 @@ pub(crate) fn run_signaling_test(
         metrics.normalized_keys,
         metrics.normalized_buttons,
     );
+    let mut hid_reports = 0;
+    if scenario == "hid-bench" {
+        hid_reports = metrics
+            .hid_reports
+            .context("missing final bench report count")?
+            .wrapping_sub(initial_hid_reports.context("missing initial bench report count")?);
+        ensure!(
+            hid_reports == SCRIPTED_HID_REPORTS,
+            "expected {SCRIPTED_HID_REPORTS} HID reports, observed {hid_reports}"
+        );
+        ensure!(
+            metrics.state == 0 && metrics.normalized_keys == 0 && metrics.normalized_buttons == 0,
+            "bench left active transport or held input"
+        );
+    } else {
+        ensure!(
+            metrics.hid_reports == initial_hid_reports,
+            "unexpected HID reports in signaling transport test"
+        );
+    }
     eprintln!(
-        "M1.3 SIGNALING COMPLETE scenario={scenario} hid_reports=0 physical_input_capture=off"
+        "M1.3 SIGNALING COMPLETE scenario={scenario} hid_reports={hid_reports} physical_input_capture=off"
     );
     Ok(address)
 }

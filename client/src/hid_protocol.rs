@@ -13,6 +13,7 @@ pub const HEARTBEAT: u64 = 0x24;
 pub const TAKEOVER_NOTICE: u64 = 0x25;
 pub const ERROR: u64 = 0x26;
 pub const LEASE_RELEASE: u64 = 0x27;
+pub const HID_BENCH_ARM: u64 = 0x28;
 pub const KEYBOARD_STATE: u64 = 0x30;
 pub const MOUSE_BUTTONS: u64 = 0x31;
 pub const WHEEL: u64 = 0x32;
@@ -50,6 +51,7 @@ pub enum Event {
         code: String,
     },
     LeaseRelease,
+    HidBenchArm,
     KeyboardState {
         modifiers: u8,
         keys: Vec<(u16, u16)>,
@@ -241,7 +243,9 @@ pub fn encode(envelope: &Envelope) -> Vec<u8> {
     uint(&mut out, envelope.sequence);
     field(&mut out, 6);
     match &envelope.event {
-        Event::LeaseRequest | Event::Heartbeat | Event::LeaseRelease => put_head(&mut out, 5, 0),
+        Event::LeaseRequest | Event::Heartbeat | Event::LeaseRelease | Event::HidBenchArm => {
+            put_head(&mut out, 5, 0)
+        }
         Event::TakeoverRequest { request_id } => {
             put_head(&mut out, 5, 1);
             field(&mut out, 0);
@@ -342,12 +346,13 @@ fn signed_value(reader: &mut Reader<'_>) -> Result<i16, DecodeError> {
 
 fn payload(reader: &mut Reader<'_>, message_type: u64) -> Result<Event, DecodeError> {
     match message_type {
-        LEASE_REQUEST | HEARTBEAT | LEASE_RELEASE => {
+        LEASE_REQUEST | HEARTBEAT | LEASE_RELEASE | HID_BENCH_ARM => {
             reader.map(0)?;
             Ok(match message_type {
                 LEASE_REQUEST => Event::LeaseRequest,
                 HEARTBEAT => Event::Heartbeat,
-                _ => Event::LeaseRelease,
+                LEASE_RELEASE => Event::LeaseRelease,
+                _ => Event::HidBenchArm,
             })
         }
         TAKEOVER_REQUEST => {
@@ -790,6 +795,7 @@ mod tests {
                 Event::TakeoverNotice { .. } => TAKEOVER_NOTICE,
                 Event::Error { .. } => ERROR,
                 Event::LeaseRelease => LEASE_RELEASE,
+                Event::HidBenchArm => HID_BENCH_ARM,
                 Event::KeyboardState { .. } => KEYBOARD_STATE,
                 Event::MouseButtons { .. } => MOUSE_BUTTONS,
                 Event::Wheel { .. } => WHEEL,

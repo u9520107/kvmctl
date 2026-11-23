@@ -110,8 +110,8 @@ pub struct ClientCredential {
 }
 
 impl ClientCredential {
-    pub fn load_existing() -> Result<Self, String> {
-        let path = credential_path()?;
+    pub fn load_existing(takeover_peer: bool) -> Result<Self, String> {
+        let path = credential_path(takeover_peer)?;
         Self::load_from(&path)
     }
 
@@ -122,8 +122,8 @@ impl ClientCredential {
         Self::from_private_blob(private_blob)
     }
 
-    pub fn load_or_create() -> Result<Self, String> {
-        let path = credential_path()?;
+    pub fn load_or_create(takeover_peer: bool) -> Result<Self, String> {
+        let path = credential_path(takeover_peer)?;
         if path.exists() {
             return Self::load_from(&path);
         }
@@ -348,10 +348,15 @@ fn import_key(blob: &[u8], kind: &[u16]) -> Result<(*mut c_void, *mut c_void), S
     Ok((algorithm, key))
 }
 
-fn credential_path() -> Result<PathBuf, String> {
+fn credential_path(takeover_peer: bool) -> Result<PathBuf, String> {
     let root =
         std::env::var_os("LOCALAPPDATA").ok_or("Windows user profile path is unavailable")?;
-    Ok(PathBuf::from(root).join("kvmctl").join("client-key.dpapi"))
+    let filename = if takeover_peer {
+        "takeover-client-key.dpapi"
+    } else {
+        "client-key.dpapi"
+    };
+    Ok(PathBuf::from(root).join("kvmctl").join(filename))
 }
 
 fn protect(input: &[u8]) -> Result<Vec<u8>, String> {

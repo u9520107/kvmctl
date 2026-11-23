@@ -31,6 +31,9 @@ fi
 export KVMCTL_LIBSRTP_SOURCE
 
 build_dir="$firmware/build-wsl"
+if [[ ${KVMCTL_HID_BENCH:-0} == 1 ]]; then
+    build_dir="$build_dir/hid-bench"
+fi
 mkdir -p -- "$build_dir"
 exec 9>"$build_dir/.build.lock"
 flock 9
