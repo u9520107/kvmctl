@@ -5,6 +5,7 @@
 #include "esp_system.h"
 #include "esp_timer.h"
 #include "freertos/FreeRTOS.h"
+#include "freertos/semphr.h"
 #include "freertos/task.h"
 #include "nvs.h"
 #include "transport.h"
@@ -16,6 +17,7 @@
 #define BOOT_POLL_MS 50
 
 static const char *TAG = "kvmctl_recovery";
+static SemaphoreHandle_t s_storage_gate;
 
 static const char *const kvmctl_namespaces[] = {
     "kvmctl_wifi",
@@ -58,12 +60,14 @@ static void recovery_task(void *arg)
             if (pressed_since == 0) pressed_since = esp_timer_get_time();
             if (esp_timer_get_time() - pressed_since >= BOOT_HOLD_US) {
                 ESP_LOGW(TAG, "factory reset requested after continuous BOOT hold");
+                xSemaphoreTake(s_storage_gate, portMAX_DELAY);
                 (void)transport_close();
                 esp_err_t err = erase_kvmctl_storage();
                 if (err == ESP_OK) {
                     ESP_LOGW(TAG, "factory reset complete; rebooting with fresh identity");
                     esp_restart();
                 }
+                xSemaphoreGive(s_storage_gate);
                 /* Allow a released-and-reheld button to retry after an erase error. */
                 pressed_since = 0;
             }
@@ -76,6 +80,8 @@ static void recovery_task(void *arg)
 
 esp_err_t recovery_start(void)
 {
+    s_storage_gate = xSemaphoreCreateMutex();
+    if (!s_storage_gate) return ESP_ERR_NO_MEM;
     const gpio_config_t config = {
         .pin_bit_mask = 1ULL << BOOT_GPIO,
         .mode = GPIO_MODE_INPUT,
@@ -87,4 +93,14 @@ esp_err_t recovery_start(void)
     if (err != ESP_OK) return err;
     return xTaskCreate(recovery_task, "kvmctl_recovery", 3072, NULL, 6, NULL) == pdPASS
         ? ESP_OK : ESP_ERR_NO_MEM;
+}
+
+void recovery_storage_write_lock(void)
+{
+    xSemaphoreTake(s_storage_gate, portMAX_DELAY);
+}
+
+void recovery_storage_write_unlock(void)
+{
+    xSemaphoreGive(s_storage_gate);
 }

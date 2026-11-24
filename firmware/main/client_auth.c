@@ -10,6 +10,7 @@
 #include "freertos/semphr.h"
 #include "transport.h"
 #include "signaling.h"
+#include "recovery.h"
 
 #define AUTH_NAMESPACE "kvmctl_auth"
 #define AUTH_KEY "clients"
@@ -126,6 +127,7 @@ esp_err_t client_auth_init(void)
 esp_err_t client_auth_enroll(const uint8_t *spki, size_t spki_len, uint8_t fingerprint[32])
 {
     if (!s_ready || !fingerprint || spki_len != CLIENT_AUTH_SPKI_BYTES) return ESP_ERR_INVALID_ARG;
+    recovery_storage_write_lock();
     xSemaphoreTake(s_lock, portMAX_DELAY);
     esp_err_t err = fingerprint_spki(spki, fingerprint);
     if (err != ESP_OK) goto done;
@@ -154,6 +156,7 @@ esp_err_t client_auth_enroll(const uint8_t *spki, size_t spki_len, uint8_t finge
     }
 done:
     xSemaphoreGive(s_lock);
+    recovery_storage_write_unlock();
     return err;
 }
 
@@ -250,6 +253,7 @@ esp_err_t client_auth_verify(const uint8_t fingerprint[32], const uint8_t *messa
 esp_err_t client_auth_revoke(const uint8_t fingerprint[32])
 {
     if (!s_ready || !fingerprint) return ESP_ERR_INVALID_STATE;
+    recovery_storage_write_lock();
     xSemaphoreTake(s_lock, portMAX_DELAY);
     size_t index = s_store.count;
     for (size_t i = 0; i < s_store.count; ++i) {
@@ -257,6 +261,7 @@ esp_err_t client_auth_revoke(const uint8_t fingerprint[32])
         esp_err_t err = fingerprint_spki(s_store.spki[i], current);
         if (err != ESP_OK) {
             xSemaphoreGive(s_lock);
+            recovery_storage_write_unlock();
             return err;
         }
         if (memcmp(current, fingerprint, sizeof(current)) == 0) {
@@ -271,6 +276,7 @@ esp_err_t client_auth_revoke(const uint8_t fingerprint[32])
             if (result == ESP_OK) s_revoke_persistence_pending = false;
         }
         xSemaphoreGive(s_lock);
+        recovery_storage_write_unlock();
         return result;
     }
     if (index + 1 < s_store.count) {
@@ -294,12 +300,14 @@ esp_err_t client_auth_revoke(const uint8_t fingerprint[32])
     }
     s_revoke_persistence_pending = result != ESP_OK;
     xSemaphoreGive(s_lock);
+    recovery_storage_write_unlock();
     return result;
 }
 
 esp_err_t client_auth_revoke_all(void)
 {
     if (!s_ready) return ESP_ERR_INVALID_STATE;
+    recovery_storage_write_lock();
     xSemaphoreTake(s_lock, portMAX_DELAY);
     memset(s_store.spki, 0, sizeof(s_store.spki));
     s_store.count = 0;
@@ -308,5 +316,6 @@ esp_err_t client_auth_revoke_all(void)
     esp_err_t result = persist();
     s_revoke_persistence_pending = result != ESP_OK;
     xSemaphoreGive(s_lock);
+    recovery_storage_write_unlock();
     return result;
 }

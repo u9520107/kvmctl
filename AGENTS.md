@@ -12,6 +12,13 @@
 - Do not build or deliver standalone `.exe` files, or place executable build output elsewhere for the user.
 - The user can run the Rust app from source with Cargo. If runtime behavior needs checking, tell the user what `cargo run` command to run; do not compile an `.exe` for them.
 
+## Repository hygiene
+
+- Keep generated firmware build trees, logs, binaries, caches, and temporary artifacts under `firmware/build/`, separated by purpose; do not create new `firmware/build-*` directories.
+- Keep source, scripts, tests, documentation, and intentional evidence outside generated build directories.
+- Add new artifact patterns to the relevant ignore file before running builds that create them.
+- Do not commit generated build output, local-path CMake caches, ELF files, static libraries, or standalone executable artifacts.
+
 ## Git
 
 - Never infer permission to commit from earlier commits or requests. Leave requested changes uncommitted unless the user explicitly asks to commit in the current turn.

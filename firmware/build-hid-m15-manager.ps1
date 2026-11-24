@@ -1,5 +1,5 @@
 param(
-    [string]$BuildDirectory = 'firmware/build-hid-m15',
+    [string]$BuildDirectory = 'firmware/build/hid-m15-online',
     [string]$IdfPath = (Join-Path $env:TEMP 'kvmctl-esp-idf-v6.1.1-online')
 )
 $ErrorActionPreference = 'Stop'

@@ -30,7 +30,7 @@ if [[ ${KVMCTL_LIBSRTP_SOURCE##*/} != espressif__esp_libsrtp ]]; then
 fi
 export KVMCTL_LIBSRTP_SOURCE
 
-build_dir="$firmware/build-wsl"
+build_dir="$firmware/build/wsl"
 if [[ ${KVMCTL_HID_BENCH:-0} == 1 ]]; then
     build_dir="$build_dir/hid-bench"
 fi

@@ -1,4 +1,4 @@
-param([string]$BuildDirectory = 'firmware/build-hid-m15')
+param([string]$BuildDirectory = 'firmware/build/hid-m15')
 $ErrorActionPreference = 'Stop'
 . 'C:\Espressif\tools\Microsoft.v6.1.1.PowerShell_profile.ps1'
 $env:IDF_COMPONENT_MANAGER = '0'

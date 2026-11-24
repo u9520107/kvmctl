@@ -807,7 +807,7 @@ isolation, signaling deadlines, and revoke persistence retry.
 
 The user ran the Windows CLI from clean checkout `a1b8ab5` in native PowerShell
 against Board 2 on `COM6` (ESP32-S3 N16R8 rev v0.2, GPIO48 RGB). The uncommitted
-WSL build at `firmware/build-wsl/kvmctl_firmware.bin` was 1,208,704 bytes.
+WSL build at `firmware/build/wsl/kvmctl_firmware.bin` was 1,208,704 bytes.
 The Windows copy matched SHA-256
 `1c3017532475ceaf6c3f12f87ff27a3b4d5ae4c86bee8e3f6a301dcf2faee72c`.
 
@@ -863,7 +863,7 @@ working-tree transport diagnostics, using ESP-IDF 6.1.1 and esp-webrtc-solution
 source ~/esp/esp-idf-v6.1.1/export.sh
 export KVMCTL_LIBSRTP_SOURCE="$HOME/esp/espressif__esp_libsrtp"
 bash firmware/build-transport.sh "$HOME/esp/esp-webrtc-v1.3.0" build
-cp firmware/build-wsl/kvmctl_firmware.bin "$windows/firmware/build/kvmctl_firmware-m14-diagnostic.bin"
+cp firmware/build/wsl/kvmctl_firmware.bin "$windows/firmware/build/kvmctl_firmware-m14-diagnostic.bin"
 sha256sum "$windows/firmware/build/kvmctl_firmware-m14-diagnostic.bin"
 ```
 
@@ -1008,7 +1008,7 @@ source ~/esp/esp-idf-v6.1.1/export.sh
 export KVMCTL_LIBSRTP_SOURCE="$HOME/esp/espressif__esp_libsrtp"
 export KVMCTL_HID_BENCH_COMPONENTS="$windows/verification/m0/usb-hid-uart/managed_components"
 KVMCTL_HID_BENCH=1 bash firmware/build-transport.sh "$HOME/esp/esp-webrtc-v1.3.0" reconfigure build
-cp firmware/build-wsl/hid-bench/kvmctl_firmware.bin "$windows/firmware/build/kvmctl_firmware-m14-hid-bench.bin"
+cp firmware/build/wsl/hid-bench/kvmctl_firmware.bin "$windows/firmware/build/kvmctl_firmware-m14-hid-bench.bin"
 sha256sum "$windows/firmware/build/kvmctl_firmware-m14-hid-bench.bin"
 ```
 
@@ -1398,7 +1398,7 @@ Native USB HID descriptor verification and restore (2026-11-24): the M1.5 HID
 bench image was built from the complete online ESP-IDF `v6.1.1` tree at
 `%TEMP%\kvmctl-esp-idf-v6.1.1-online`; the cached M0 tree lacked
 `gen_crt_bundle.py`. The native Windows build produced
-`firmware/build-hid-m15-final/kvmctl_firmware.bin`, 1,297,216 bytes, SHA-256
+`firmware/build/hid-m15-final/kvmctl_firmware.bin`, 1,297,216 bytes, SHA-256
 `87f5f6be51ad734a042285f9bfc6cc4e6e676bd89f2bbe967ca265f959b0da84`.
 The helper temporarily removed the stale dependency lock so the hardened peer
 override resolved, then restored it. No bootloader or partition-table write was

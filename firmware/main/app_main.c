@@ -105,14 +105,14 @@ void app_main(void)
     if (err != ESP_OK) {
         ESP_LOGE(TAG, "Pinned HTTPS/WSS signaling unavailable: %s", esp_err_to_name(err));
     }
-    err = usb_admin_start();
-    if (err != ESP_OK) {
-        ESP_LOGE(TAG, "USB administration initialization failed: %s", esp_err_to_name(err));
-        abort();
-    }
     err = recovery_start();
     if (err != ESP_OK) {
         ESP_LOGE(TAG, "Recovery watcher initialization failed: %s", esp_err_to_name(err));
+        abort();
+    }
+    err = usb_admin_start();
+    if (err != ESP_OK) {
+        ESP_LOGE(TAG, "USB administration initialization failed: %s", esp_err_to_name(err));
         abort();
     }
 }

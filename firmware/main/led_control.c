@@ -3,6 +3,7 @@
 #include "driver/gpio.h"
 #include "led_strip.h"
 #include "nvs.h"
+#include "recovery.h"
 #include <string.h>
 
 #define LED_NAMESPACE "kvmctl_cfg"
@@ -112,9 +113,13 @@ esp_err_t led_control_set(bool enabled, uint8_t brightness, const uint8_t rgb[3]
 {
     if (!s_supported) return ESP_ERR_NOT_SUPPORTED;
     if (rgb == NULL || brightness > 100) return ESP_ERR_INVALID_ARG;
+    recovery_storage_write_lock();
     const led_preferences_t next = { .enabled = enabled, .brightness = brightness, .rgb = {rgb[0], rgb[1], rgb[2]} };
     esp_err_t err = apply_preferences(&next);
-    if (err != ESP_OK) return err;
+    if (err != ESP_OK) {
+        recovery_storage_write_unlock();
+        return err;
+    }
 
     nvs_handle_t nvs;
     err = nvs_open(LED_NAMESPACE, NVS_READWRITE, &nvs);
@@ -127,8 +132,10 @@ esp_err_t led_control_set(bool enabled, uint8_t brightness, const uint8_t rgb[3]
     }
     if (err != ESP_OK) {
         apply_preferences(&s_preferences);
+        recovery_storage_write_unlock();
         return err;
     }
     s_preferences = next;
+    recovery_storage_write_unlock();
     return ESP_OK;
 }

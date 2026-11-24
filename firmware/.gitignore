@@ -1,5 +1,6 @@
 /build/
-/build-wsl/
+# Keep generated output in firmware/build/, never beside it.
+/build-*/
 /backups/
 /.component_cache/
 /managed_components/

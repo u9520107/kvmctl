@@ -1271,6 +1271,25 @@ mod serial {
             decode_client_list_response(&self.exchange(&encode_list_clients_request(&id))?, &id)
         }
 
+        pub fn reconcile_clients(&mut self) -> Result<Vec<[u8; 32]>, String> {
+            let mut last_error = String::new();
+            for attempt in 0..3 {
+                unsafe {
+                    PurgeComm(self.0, PURGE_RXCLEAR);
+                }
+                if attempt != 0 {
+                    std::thread::sleep(std::time::Duration::from_millis(250));
+                }
+                match self.list_clients() {
+                    Ok(clients) => return Ok(clients),
+                    Err(error) => last_error = error,
+                }
+            }
+            Err(format!(
+                "client list unavailable after enrollment reconciliation retries: {last_error}"
+            ))
+        }
+
         pub fn revoke_client(&mut self, fingerprint: &[u8; 32]) -> Result<(), String> {
             let id = random_id()?;
             let response = self.exchange(&encode_revoke_client_request(&id, fingerprint))?;
@@ -1972,7 +1991,20 @@ fn run() -> Result<(), String> {
             return Err("USB recovery cancelled; board and local key were not changed".into());
         }
         let credential = credentials::ClientCredential::generate()?;
-        let enrolled_fingerprint = port.enroll_client(&credential.spki)?;
+        let enrolled_fingerprint = match port.enroll_client(&credential.spki) {
+            Ok(fingerprint) => fingerprint,
+            Err(enrollment_error) => {
+                let clients = port.reconcile_clients().map_err(|reconcile_error| {
+                    format!(
+                        "enrollment response failed ({enrollment_error}); reconciliation failed ({reconcile_error}); enrollment outcome is unknown; do not retry until `clients` is checked"
+                    )
+                })?;
+                if !clients.contains(&credential.fingerprint) {
+                    return Err(enrollment_error);
+                }
+                credential.fingerprint
+            }
+        };
         if enrolled_fingerprint != credential.fingerprint {
             let _ = port.revoke_client(&enrolled_fingerprint);
             return Err("device returned a different recovery client fingerprint".into());
@@ -1988,14 +2020,23 @@ fn run() -> Result<(), String> {
                 ),
             });
         }
-        let after = port.status()?;
-        serial::remember_board(&selected, &after.identity_fingerprint);
-        println!(
-            "USB recovery complete: new client={} identity={} TLS pin={}.",
-            hex(&enrolled_fingerprint),
-            hex(&after.identity_fingerprint),
-            hex(&after.tls_spki_hash)
-        );
+        match port.status() {
+            Ok(after) => {
+                serial::remember_board(&selected, &after.identity_fingerprint);
+                println!(
+                    "USB recovery complete: new client={} identity={} TLS pin={}",
+                    hex(&enrolled_fingerprint),
+                    hex(&after.identity_fingerprint),
+                    hex(&after.tls_spki_hash)
+                );
+            }
+            Err(error) => {
+                eprintln!(
+                    "USB recovery committed: new client={}; post-recovery status unavailable: {error}",
+                    hex(&enrolled_fingerprint)
+                );
+            }
+        }
         return Ok(());
     }
     if command == "transport-test" {

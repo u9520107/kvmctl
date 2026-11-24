@@ -6,6 +6,7 @@
 #include "esp_wifi.h"
 #include "mbedtls/platform_util.h"
 #include "nvs.h"
+#include "recovery.h"
 #include <stdbool.h>
 #include <string.h>
 
@@ -230,16 +231,24 @@ esp_err_t wifi_setup_provision(const uint8_t *ssid, size_t ssid_len,
         !valid_utf8(ssid, ssid_len) || !valid_passphrase(passphrase, passphrase_len)) {
         return ESP_ERR_INVALID_ARG;
     }
+    recovery_storage_write_lock();
     nvs_handle_t nvs;
     esp_err_t err = nvs_open(WIFI_NAMESPACE, NVS_READWRITE, &nvs);
-    if (err != ESP_OK) return err;
+    if (err != ESP_OK) {
+        recovery_storage_write_unlock();
+        return err;
+    }
     err = nvs_set_blob(nvs, "ssid", ssid, ssid_len);
     if (err == ESP_OK) err = nvs_set_blob(nvs, "pass", passphrase, passphrase_len);
     if (err == ESP_OK) err = nvs_commit(nvs);
     nvs_close(nvs);
-    if (err != ESP_OK) return err;
+    if (err != ESP_OK) {
+        recovery_storage_write_unlock();
+        return err;
+    }
     s_state = 1;
     err = apply_credentials(ssid, ssid_len, passphrase, passphrase_len);
     if (err != ESP_OK) s_state = 3;
+    recovery_storage_write_unlock();
     return ESP_OK;
 }
