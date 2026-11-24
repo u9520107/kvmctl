@@ -12,6 +12,55 @@ CLI commands include `cargo run --locked -p kvmctl -- status [COMx]`,
 `cargo run --locked -p kvmctl -- led [COMx] on|off <brightness> <RRGGBB>`,
 and `cargo run --locked -p kvmctl -- ports`.
 
+### M2.1 standalone CLI and saved target acceptance
+
+Run these commands from Windows PowerShell in workspace root. Replace
+`COM6`, `esp32-main`, and `192.168.50.137` with detected board, target name,
+and board IPv4 address.
+
+```powershell
+cargo run --locked -p kvmctl -- ports
+cargo run --locked -p kvmctl -- enroll COM6
+cargo run --locked -p kvmctl -- clients COM6
+cargo run --locked -p kvmctl -- target save COM6 esp32-main 192.168.50.137
+cargo run --locked -p kvmctl -- targets
+cargo run --locked -p kvmctl -- discover COM6
+cargo run --locked -p kvmctl -- session esp32-main 192.168.50.137
+```
+
+Expected results: `ports` lists friendly Plug and Play CH343 board; `enroll`
+reports this Windows user's DPAPI-backed client fingerprint; `clients` lists
+it over USB; `target save` records endpoint identity and TLS pin under
+`%LOCALAPPDATA%\kvmctl\targets.tsv`; `targets` shows saved record; `discover`
+reports matching `_kvmctl._tcp.local` metadata when mDNS is available; and
+`session` reports `Connected/local`, keeps physical-input capture off, waits
+for Enter, releases lease, and reports `Session closed cleanly.`
+
+Use mDNS routing by omitting the IP:
+
+```powershell
+cargo run --locked -p kvmctl -- session esp32-main
+```
+
+If mDNS is unavailable, pass the current IPv4 address as shown above. Saved
+target remains keyed by endpoint identity, not address, so address changes do
+not create a new target. Saved last-known address is used only when discovery
+returns no matching service.
+
+Saved-target management and USB-only administration:
+
+```powershell
+cargo run --locked -p kvmctl -- target list
+cargo run --locked -p kvmctl -- target remove esp32-main
+cargo run --locked -p kvmctl -- clients COM6
+cargo run --locked -p kvmctl -- revoke COM6 <client-fingerprint>
+cargo run --locked -p kvmctl -- revoke COM6 all
+```
+
+`clients` and `revoke` open only selected USB Plug and Play board; they do not
+use mDNS, saved target addresses, or foreground session. After revocation,
+`session` fails until USB enrollment is performed again.
+
 ### Board 2 zero-HID takeover bench
 
 Run from native Windows PowerShell using the board's CH343 port and LAN IPv4.

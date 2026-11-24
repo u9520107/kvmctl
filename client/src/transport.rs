@@ -858,7 +858,7 @@ impl<P: PeerConnection> SignalingPeer<P> {
 
 async fn open_signaling_peer(
     runtime: Arc<dyn Runtime>,
-    monitor: &PortMonitor,
+    device_status: &AtomicU8,
     address: SocketAddr,
     hostname: &str,
     status: &crate::Status,
@@ -909,13 +909,12 @@ async fn open_signaling_peer(
         let offer_sdp = offer.sdp;
         let offer_exchange = session.send_offer(credential, &offer_sdp).map_err(anyhow::Error::msg)?;
         pc.set_remote_description(RTCSessionDescription::answer(offer_exchange.answer.clone())?).await?;
-        let device_status = monitor.device_status.clone();
         wait_open(
             &*runtime,
             &control,
             &motion,
             &peer_failed,
-            &device_status,
+            device_status,
             &connection_states,
             false,
         ).await?;
@@ -954,7 +953,7 @@ async fn exchange_signaling(
     let authorized_case = matches!(&proof_case, TranscriptProofCase::Valid { .. });
     let mut peer = open_signaling_peer(
         runtime.clone(),
-        monitor,
+        &monitor.device_status,
         address,
         hostname,
         status,
@@ -1066,6 +1065,135 @@ async fn exchange_signaling(
     Ok(proof)
 }
 
+pub(crate) fn run_foreground_session(
+    service: &crate::discovery::Service,
+    status: crate::Status,
+    credential: crate::credentials::ClientCredential,
+) -> Result<SocketAddr> {
+    install_certificate_log()?;
+    let address = crate::discovery::socket_address(service).map_err(anyhow::Error::msg)?;
+    let hostname = service.hostname.clone();
+    let runtime = default_runtime().context("no WebRTC runtime")?;
+    let device_status = AtomicU8::new(1);
+    let mut result: Option<Result<()>> = None;
+    runtime.block_on(Box::pin(async {
+        result = Some(
+            async {
+                let mut peer = open_signaling_peer(
+                    runtime.clone(),
+                    &device_status,
+                    address,
+                    &hostname,
+                    &status,
+                    &credential,
+                )
+                .await?;
+                let session_result = async {
+                    peer.session
+                        .send_transcript_proof(&peer.proof)
+                        .map_err(anyhow::Error::msg)
+                        .context("foreground session authorization")?;
+                    let mut responses = ResponseCursor::new(peer.session.session_id());
+                    send_hid_event(
+                        &peer.control,
+                        crate::hid_protocol::Envelope {
+                            message_type: crate::hid_protocol::LEASE_REQUEST,
+                            session_id: peer.session.session_id(),
+                            lease_epoch: 0,
+                            sequence: 0,
+                            event: crate::hid_protocol::Event::LeaseRequest,
+                        },
+                    )
+                    .await?;
+                    let (response, epoch) =
+                        receive_endpoint_response_any_epoch(
+                            &*runtime,
+                            &peer.control,
+                            &mut responses,
+                        )
+                        .await?;
+                    require_response(
+                        response,
+                        EndpointResponse::LeaseState {
+                            owner: Some(credential.fingerprint),
+                            state: 1,
+                        },
+                    )?;
+                    eprintln!(
+                        "M2.1 SESSION authenticated=true input_local=true physical_input_capture=off"
+                    );
+                    println!("Connected/local. Press Enter to disconnect.");
+                    let (done_tx, done_rx) = std::sync::mpsc::channel();
+                    std::thread::spawn(move || {
+                        let mut line = String::new();
+                        let _ = std::io::stdin().read_line(&mut line);
+                        let _ = done_tx.send(());
+                    });
+                    let mut sequence = 1;
+                    let mut heartbeat = Instant::now();
+                    loop {
+                        if done_rx.try_recv().is_ok() {
+                            send_hid_event(
+                                &peer.control,
+                                crate::hid_protocol::Envelope {
+                                    message_type: crate::hid_protocol::LEASE_RELEASE,
+                                    session_id: peer.session.session_id(),
+                                    lease_epoch: epoch,
+                                    sequence,
+                                    event: crate::hid_protocol::Event::LeaseRelease,
+                                },
+                            )
+                            .await?;
+                            require_response(
+                                receive_endpoint_response(
+                                    &*runtime,
+                                    &peer.control,
+                                    &mut responses,
+                                    next_lease_epoch(epoch),
+                                )
+                                .await?,
+                                EndpointResponse::LeaseState {
+                                    owner: None,
+                                    state: 0,
+                                },
+                            )?;
+                            break;
+                        }
+                        if heartbeat.elapsed() >= Duration::from_secs(1) {
+                            send_hid_event(
+                                &peer.control,
+                                crate::hid_protocol::Envelope {
+                                    message_type: crate::hid_protocol::HEARTBEAT,
+                                    session_id: peer.session.session_id(),
+                                    lease_epoch: epoch,
+                                    sequence,
+                                    event: crate::hid_protocol::Event::Heartbeat,
+                                },
+                            )
+                            .await?;
+                            sequence += 1;
+                            heartbeat = Instant::now();
+                        }
+                        if let Ok(Some(DataChannelEvent::OnClose)) =
+                            timeout(&*runtime, Duration::from_millis(100), peer.control.poll()).await
+                        {
+                            bail!("foreground control channel closed");
+                        }
+                        runtime.sleep(Duration::from_millis(50)).await;
+                    }
+                    Ok(())
+                }
+                .await;
+                peer.close(&*runtime).await;
+                session_result
+            }
+            .await,
+        );
+    }));
+    result.context("runtime did not execute")??;
+    Ok(address)
+}
+
 async fn echo_signaling(
     runtime: &dyn Runtime,
     channel: &Arc<dyn DataChannel>,
@@ -1144,6 +1272,25 @@ impl ResponseCursor {
     }
 
     fn decode(&mut self, data: &[u8], expected_epoch: u32) -> Result<EndpointResponse> {
+        let envelope = self.decode_envelope(data)?;
+        ensure!(
+            envelope.lease_epoch == expected_epoch,
+            "endpoint response lease epoch mismatch: expected {expected_epoch}, received {} ({:?})",
+            envelope.lease_epoch,
+            envelope.event
+        );
+        self.advance()?;
+        Self::response(envelope.event)
+    }
+
+    fn decode_any_epoch(&mut self, data: &[u8]) -> Result<(EndpointResponse, u32)> {
+        let envelope = self.decode_envelope(data)?;
+        let epoch = envelope.lease_epoch;
+        self.advance()?;
+        Ok((Self::response(envelope.event)?, epoch))
+    }
+
+    fn decode_envelope(&self, data: &[u8]) -> Result<crate::hid_protocol::Envelope> {
         let envelope = crate::hid_protocol::decode(data)
             .map_err(|error| anyhow::anyhow!("strict event decode failed: {error:?}"))?;
         ensure!(
@@ -1156,17 +1303,19 @@ impl ResponseCursor {
             self.next_sequence,
             envelope.sequence
         );
-        ensure!(
-            envelope.lease_epoch == expected_epoch,
-            "endpoint response lease epoch mismatch: expected {expected_epoch}, received {} ({:?})",
-            envelope.lease_epoch,
-            envelope.event
-        );
+        Ok(envelope)
+    }
+
+    fn advance(&mut self) -> Result<()> {
         self.next_sequence = self
             .next_sequence
             .checked_add(1)
             .context("endpoint response sequence exhausted")?;
-        Ok(match envelope.event {
+        Ok(())
+    }
+
+    fn response(event: crate::hid_protocol::Event) -> Result<EndpointResponse> {
+        Ok(match event {
             crate::hid_protocol::Event::LeaseState { owner, state } => {
                 EndpointResponse::LeaseState { owner, state }
             }
@@ -1212,6 +1361,22 @@ async fn receive_endpoint_response(
                 return cursor.decode(&message.data, expected_epoch);
             }
             Some(DataChannelEvent::OnClose) | None => bail!("scripted control channel closed"),
+            _ => {}
+        }
+    }
+}
+
+async fn receive_endpoint_response_any_epoch(
+    runtime: &dyn Runtime,
+    control: &Arc<dyn DataChannel>,
+    cursor: &mut ResponseCursor,
+) -> Result<(EndpointResponse, u32)> {
+    loop {
+        match timeout(runtime, Duration::from_secs(5), control.poll()).await? {
+            Some(DataChannelEvent::OnMessage(message)) => {
+                return cursor.decode_any_epoch(&message.data);
+            }
+            Some(DataChannelEvent::OnClose) | None => bail!("foreground control channel closed"),
             _ => {}
         }
     }
@@ -1975,7 +2140,7 @@ async fn run_takeover(
     let initial_hid_reports = monitor.fresh_snapshot()?.hid_reports;
     let mut a = open_signaling_peer(
         runtime.clone(),
-        monitor,
+        &monitor.device_status,
         address,
         hostname,
         status,
@@ -1986,7 +2151,7 @@ async fn run_takeover(
         a.session.send_transcript_proof(&a.proof).map_err(anyhow::Error::msg)
             .context("client A transcript authorization")?;
         eprintln!("M1.4 TAKEOVER client=A authorized=true");
-        let mut b = open_signaling_peer(runtime.clone(), monitor, address, hostname, status, credential_b).await
+        let mut b = open_signaling_peer(runtime.clone(), &monitor.device_status, address, hostname, status, credential_b).await
             .context("client B signaling setup")?;
         let result = async {
             b.session.send_transcript_proof(&b.proof).map_err(anyhow::Error::msg)
@@ -2062,7 +2227,7 @@ async fn run_cleanup_path(
 ) -> Result<()> {
     let mut peer = open_signaling_peer(
         runtime.clone(),
-        monitor,
+        &monitor.device_status,
         address,
         hostname,
         status,
@@ -2829,6 +2994,19 @@ mod tests {
             EndpointResponse::LeaseState {
                 owner: Some([8; 32]),
                 state: 1,
+            }
+        );
+        let mut dynamic_epoch = state.clone();
+        dynamic_epoch.lease_epoch = 3;
+        let (response, epoch) = ResponseCursor::new(session_id)
+            .decode_any_epoch(&crate::hid_protocol::encode(&dynamic_epoch))
+            .unwrap();
+        assert_eq!(epoch, 3);
+        assert_eq!(
+            response,
+            EndpointResponse::LeaseState {
+                owner: Some([8; 32]),
+                state: 1
             }
         );
 

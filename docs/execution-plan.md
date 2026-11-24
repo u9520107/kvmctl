@@ -96,15 +96,37 @@ M1 exit: the implemented vertical slice passes its security, scripted HID, owner
 
 ### M2: Native Windows client
 
-- Build standalone `kvmctl` CLI USB enumeration/enrollment, mDNS discovery, target management, and foreground KVM sessions without requiring the tray app.
-- Revisit cross-user DPAPI validation when multi-user Windows testing is available.
-- Revisit Surfshark-on DNS-SD only if VPN-routed automatic discovery becomes necessary; known-IP routing remains sufficient otherwise.
-- Expose the M1 identity storage and USB-only administration/revoke behavior through complete CLI workflows.
-- Build the resident Rust tray application with no-target, connected/local, and remote-control icons, plus visible connecting/recovery/unavailable/ownership states and target tooltips.
-- Share Rust session functionality, per-user settings, enrollment records, and multiple escape bindings between modes. Choose and verify a broadly usable default; require a working escape binding before remote capture.
-- Add Windows global hotkey, explicit remote activation, safe target switching, and short OSD notices. Local input retains the tray connection, ownership, and heartbeats; takeover prompts return local before interaction.
-- Implement the [control app interaction contract](design.md#control-app-interaction-contract). CLI escape disconnects/exits; tray escape returns local while staying connected. Reconnect restores only the connection, with input local.
-- No separate service, CLI-to-tray command broker, or special simultaneous-process detection is required initially. Prepare shared video-window behavior for video-capable adapters; verify actual video with M3 hardware.
+Build on the Windows Rust client and ESP32 protocol from M1. The CLI and tray share Rust session functionality, per-user settings, and enrollment records. Both follow the [control app interaction contract](design.md#control-app-interaction-contract).
+
+#### M2.1: Standalone CLI and saved targets
+
+- Reuse M1 USB Plug and Play enumeration, DPAPI-backed enrollment, USB-only list/revoke/revoke-all, mDNS discovery, and authenticated session code. Support known-IP routing when discovery is unavailable. Keep endpoint identity tied to enrollment across address changes.
+- Add per-user saved target management and a foreground session command that connects with input local and disconnects cleanly. Start with one saved ESP32 target from USB enrollment through authenticated connect and disconnect, then complete the remaining CLI workflows.
+
+Exit: From PowerShell, a user can identify a USB board, enroll and administer clients, save and manage a target, and open and cleanly close an authenticated foreground session using discovery or manual IP. The workflow runs independently of the tray and physical-input capture stays disabled.
+
+#### M2.2: Resident tray and session lifecycle
+
+- Reuse the CLI's session functionality, target settings, and enrollment records. Selecting a target connects with input local. Connected/local retains the lease and heartbeats. Takeover returns input local before showing an actionable prompt. Reconnect restores the connection with input local and requires explicit remote activation.
+- Show no-target and connected/local icons, target tooltips, and visible connecting, recovering, unavailable, and ownership states. Add short OSD notices for connection and recovery changes.
+
+Exit: A user can select a saved target from the tray, stay connected and owned with input local, handle takeover, and recover from a dropped connection with input still local.
+
+#### M2.3: Live input, emergency escape, and switching
+
+- Add Windows keyboard/mouse capture, explicit arming, and a global escape hotkey. Share multiple configurable escape bindings across both modes. Choose and verify a usable default and require a working binding before capture. Consume the escape combination locally.
+- CLI escape releases input, disconnects, and exits. Tray escape releases input and returns local while retaining the connection, lease, and heartbeats. Switching releases held input, relinquishes the old lease, and closes the old session before connecting the new target with input local. Show a distinct remote-control tray icon and OSD notices for input-destination changes.
+
+Exit: Verify arming, capture, escape, and switching together before enabling live physical input. Demonstrate both escape behaviors and confirm a switch leaves no held input on the old target and requires explicit activation on the new target.
+
+#### M2.4: Integrated Windows acceptance
+
+- Verify both workflows on Windows with ESP32 hardware. Cover shared settings and escape bindings, tray icons and OSD, ownership while local, takeover, revoke, and reconnect. Exercise disconnect and failure paths with held keys/buttons and confirm inactive targets receive no input.
+- Prepare shared video-window behavior for video-capable adapters. Verify actual video with M3 hardware.
+
+Exit: Record hardware evidence for the CLI and tray interaction contract, including release of held input and correct routing through escape, switching, revoke, and recovery.
+
+Cross-user DPAPI validation remains a follow-up when multi-user Windows testing is available. Revisit Surfshark-on DNS-SD if VPN-routed automatic discovery becomes necessary. Known-IP routing meets the current use case. The initial design uses independent CLI and tray processes with shared Rust functionality and per-user settings.
 
 M2 exit: standalone CLI and resident tray workflows, shared settings, status icons/OSD, ownership while local, arming, emergency escape, switching, revoke, and reconnect match the resolved design; no stuck input or unexpected routing to inactive targets.
 

@@ -17,6 +17,8 @@ mod raw_input;
 #[cfg(windows)]
 mod signaling;
 #[cfg(windows)]
+mod targets;
+#[cfg(windows)]
 mod transport;
 
 const MAX_FRAME: usize = 4096;
@@ -1638,6 +1640,190 @@ fn service_at_ipv4(address: std::net::Ipv4Addr, fingerprint: &[u8; 32]) -> disco
 }
 
 #[cfg(windows)]
+fn saved_status(target: &targets::Target) -> Status {
+    Status {
+        identity_fingerprint: target.endpoint_fingerprint,
+        tls_spki_hash: target.tls_spki_hash,
+        wifi_state: 2,
+        firmware_version: "saved target".into(),
+        led_supported: false,
+        led_enabled: false,
+        led_brightness: 0,
+        led_rgb: [0; 3],
+    }
+}
+
+#[cfg(windows)]
+fn target_service(
+    target: &targets::Target,
+    manual_address: Option<std::net::Ipv4Addr>,
+) -> Result<discovery::Service, String> {
+    if let Some(address) = manual_address {
+        println!(
+            "Using manual IPv4 {address} with pinned certificate name {}.",
+            discovery::endpoint_hostname(&target.endpoint_fingerprint)
+        );
+        return Ok(service_at_ipv4(address, &target.endpoint_fingerprint));
+    }
+    let services = discovery::browse().map_err(|error| {
+        format!("DNS-SD browse failed: {error}; pass an IPv4 address to use manual-IP fallback")
+    })?;
+    let mut matches = services
+        .into_iter()
+        .filter(|service| discovery::matches_endpoint(service, &target.endpoint_fingerprint));
+    if let Some(service) = matches.next() {
+        if matches.next().is_some() {
+            return Err("multiple DNS-SD services claim this saved target identity".into());
+        }
+        return Ok(service);
+    }
+    if let Some(address) = target.last_ipv4 {
+        println!("DNS-SD found no match; using saved last-known IPv4 {address}.");
+        return Ok(service_at_ipv4(address, &target.endpoint_fingerprint));
+    }
+    Err(format!(
+        "no DNS-SD service matches saved target identity {}; pass an IPv4 address for manual-IP fallback",
+        hex(&target.endpoint_fingerprint)
+    ))
+}
+
+#[cfg(windows)]
+fn run_target_command(args: &[String]) -> Result<(), String> {
+    let command = args.first().map(String::as_str).unwrap_or_default();
+    if command == "targets" || (command == "target" && args.get(1).is_some_and(|v| v == "list")) {
+        let saved = targets::load()?;
+        if saved.is_empty() {
+            println!("No saved targets.");
+        } else {
+            for target in saved {
+                println!(
+                    "{} identity={} client={} address={}",
+                    target.name,
+                    hex(&target.endpoint_fingerprint),
+                    hex(&target.client_fingerprint),
+                    target
+                        .last_ipv4
+                        .map_or_else(|| "discovery".into(), |address| address.to_string())
+                );
+            }
+        }
+        return Ok(());
+    }
+    if command == "target" && args.get(1).is_some_and(|v| v == "remove") {
+        let name = args.get(2).ok_or("usage: kvmctl target remove <name>")?;
+        if args.len() != 3 {
+            return Err("usage: kvmctl target remove <name>".into());
+        }
+        targets::remove(name)?;
+        println!("Removed saved target `{name}`.");
+        return Ok(());
+    }
+    if command == "session" {
+        if !(2..=3).contains(&args.len()) {
+            return Err("usage: kvmctl session <target> [IPv4]".into());
+        }
+        let target = targets::find(&args[1])?;
+        let credential = credentials::ClientCredential::load_existing(false).map_err(|error| {
+            format!("{error}; enroll this Windows user over USB before opening a session")
+        })?;
+        if credential.fingerprint != target.client_fingerprint {
+            return Err(
+                "saved target belongs to a different local enrollment; re-save it after USB enrollment"
+                    .into(),
+            );
+        }
+        let manual_address = args
+            .get(2)
+            .map(|value| {
+                value
+                    .parse::<std::net::Ipv4Addr>()
+                    .map_err(|_| "invalid IPv4 address".to_owned())
+            })
+            .transpose()?;
+        let service = target_service(&target, manual_address)?;
+        println!(
+            "Opening authenticated foreground session for `{}`. Input remains local; physical-input capture is off.",
+            target.name
+        );
+        let status = saved_status(&target);
+        let address = transport::run_foreground_session(&service, status, credential)
+            .map_err(|error| error.to_string())?;
+        if let std::net::SocketAddr::V4(address) = address {
+            targets::update_address(&target.name, *address.ip())?;
+        }
+        println!("Session closed cleanly.");
+        return Ok(());
+    }
+    if command == "target" && args.get(1).is_some_and(|v| v == "save") {
+        let tail = args.get(2..).unwrap_or(&[]);
+        let (requested_port, fields) = if tail.first().is_some_and(|value| value.starts_with("COM"))
+        {
+            (tail.first().map(String::as_str), &tail[1..])
+        } else {
+            (None, tail)
+        };
+        if !(1..=2).contains(&fields.len()) {
+            return Err("usage: kvmctl target save [COMx] <name> [IPv4]".into());
+        }
+        let address = fields
+            .get(1)
+            .map(|value| {
+                value
+                    .parse::<std::net::Ipv4Addr>()
+                    .map_err(|_| "invalid IPv4 address".to_owned())
+            })
+            .transpose()?;
+        let ports = serial::enumerate()?;
+        let selected = select_port(&ports, requested_port)?;
+        if !selected.recognized {
+            println!(
+                "{} has not been identified as a kvmctl board.",
+                selected.label
+            );
+            print!("Confirm this is your flashed board before sending data (yes/no): ");
+            io::stdout().flush().map_err(|error| error.to_string())?;
+            let mut answer = String::new();
+            io::stdin()
+                .read_line(&mut answer)
+                .map_err(|error| error.to_string())?;
+            if !answer.trim().eq_ignore_ascii_case("yes") {
+                return Err("device not confirmed; port was not opened".into());
+            }
+        }
+        let mut port = serial::Port::open(&selected.name)?;
+        let status = port.status()?;
+        serial::remember_board(&selected, &status.identity_fingerprint);
+        let credential = credentials::ClientCredential::load_existing(false).map_err(|error| {
+            format!(
+                "{error}; run `cargo run --locked -p kvmctl -- enroll {}` first",
+                selected.name
+            )
+        })?;
+        if !port.list_clients()?.contains(&credential.fingerprint) {
+            return Err(format!(
+                "this Windows user is not enrolled on the board; run `cargo run --locked -p kvmctl -- enroll {}` first",
+                selected.name
+            ));
+        }
+        let target = targets::Target::new(
+            fields[0].clone(),
+            status.identity_fingerprint,
+            status.tls_spki_hash,
+            credential.fingerprint,
+            address,
+        )?;
+        targets::save(&target)?;
+        println!(
+            "Saved target `{}` for endpoint identity {}.",
+            target.name,
+            hex(&target.endpoint_fingerprint)
+        );
+        return Ok(());
+    }
+    Err("usage: kvmctl targets | target list | target save [COMx] <name> [IPv4] | target remove <name> | session <target> [IPv4]".into())
+}
+
+#[cfg(windows)]
 fn run() -> Result<(), String> {
     let args: Vec<String> = std::env::args().skip(1).collect();
     if args.is_empty() {
@@ -1646,9 +1832,12 @@ fn run() -> Result<(), String> {
     let command = args.first().map(String::as_str).unwrap_or("status");
     if command == "--help" || command == "-h" {
         println!(
-            "kvmctl [status [COMx] | wifi [COMx] | enroll [COMx] [takeover] | recover [COMx] | clients [COMx] | revoke [COMx] <fingerprint|all> | discover [COMx] | signaling-test [COMx] [scenario [IPv4] | IPv4] | led [COMx] on|off <brightness> <RRGGBB> | transport-test [COMx] | flash [COMx] <firmware.bin> <backup.bin> | ports]; recover explicitly replaces this user's client key and enrolls it over direct USB; scripted and takeover scenarios use zero HID output"
+            "kvmctl [ports | status [COMx] | wifi [COMx] | enroll [COMx] [takeover] | clients [COMx] | revoke [COMx] <fingerprint|all> | discover [COMx] | targets | target list | target save [COMx] <name> [IPv4] | target remove <name> | session <target> [IPv4] | signaling-test [COMx] [scenario [IPv4] | IPv4] | led [COMx] on|off <brightness> <RRGGBB> | transport-test [COMx] | flash [COMx] <firmware.bin> <backup.bin>]; session keeps input local and closes on Enter; physical-input capture is off"
         );
         return Ok(());
+    }
+    if command == "targets" || command == "session" || command == "target" {
+        return run_target_command(&args);
     }
     let ports = serial::enumerate()?;
     if command == "ports" {
