@@ -322,7 +322,7 @@ fn decode_transport_status_response(
     }
     r.expect_uint(5)?;
     let (result_major, result_fields) = r.head()?;
-    if result_major != 5 || !matches!(result_fields, 12 | 22 | 23 | 26) {
+    if result_major != 5 || !matches!(result_fields, 12 | 22 | 23 | 25 | 26) {
         return Err("invalid transport telemetry field count".into());
     }
     let mut values = [0; 10];
@@ -341,14 +341,15 @@ fn decode_transport_status_response(
             *value = r.uint()?;
         }
     }
-    let hid_reports = if result_fields >= 23 {
+    let hid_reports = if matches!(result_fields, 23 | 26) {
         r.expect_uint(22)?;
         Some(u32::try_from(r.uint()?).map_err(|_| "invalid HID report count")?)
     } else {
         None
     };
     let (total_soc_cpu_us, event_processing_us, response_queue_residence_us) = if result_fields
-        == 26
+        == 25
+        || result_fields == 26
     {
         r.expect_uint(23)?;
         let cpu = u32::try_from(r.uint()?).map_err(|_| "invalid SoC CPU time")?;
@@ -2353,6 +2354,18 @@ mod tests {
             &metrics.tls_diagnostic[..metrics.tls_diagnostic_len],
             b"ESP-TLS: handshake_failure"
         );
+        let mut non_hid = response.clone();
+        non_hid[result_header] = 0xb8;
+        non_hid.insert(result_header + 1, 25);
+        for (key, value) in [(23, 456_u64), (24, 789_u64), (25, 123_u64)] {
+            put_uint(&mut non_hid, key);
+            put_uint(&mut non_hid, value);
+        }
+        let metrics = decode_transport_status_response(&non_hid, &id).unwrap();
+        assert_eq!(metrics.hid_reports, None);
+        assert_eq!(metrics.total_soc_cpu_us, 456);
+        assert_eq!(metrics.event_processing_us, 789);
+        assert_eq!(metrics.response_queue_residence_us, 123);
         response[result_header] = 0xb7;
         put_uint(&mut response, 22);
         put_uint(&mut response, 6);

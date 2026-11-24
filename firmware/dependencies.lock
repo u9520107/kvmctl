@@ -1,23 +1,39 @@
 dependencies:
   espressif/esp_libsrtp:
+    component_hash: 131560184c73ec09f77d8904a2db709307803f0f9f111898921b6966776eac15
     dependencies: []
     source:
-      path: ../../../AppData/Local/Temp/esp-peer-v1.3.0/components/esp_peer/examples/peer_demo/managed_components/espressif__esp_libsrtp
-      type: local
+      registry_url: https://components.espressif.com/
+      type: service
     version: 1.0.0
   espressif/esp_peer:
+    component_hash: 338746a4102dde1b6894c926e0413eae5e5b31b34847a4bd10197c934fecc00a
     dependencies:
     - name: espressif/esp_libsrtp
       version: ^1.0.0
     source:
-      path: ../verification/m0/peer-fingerprint/.vendor/69797030d58208f6ffb720aa6cc0f62a001a534283dd4501dacf5a6f12f823f0/components/esp_peer
-      type: local
+      registry_url: https://components.espressif.com/
+      type: service
     version: 1.5.3
   espressif/esp_tinyusb:
-    dependencies: []
+    component_hash: cfb066b239957ebfba5f7a7764e534b3000d3b400fd42d11bedb6ee5e6eaf3c9
+    dependencies:
+    - name: idf
+      require: private
+      version: '>=5.0'
+    - name: espressif/tinyusb
+      registry_url: https://components.espressif.com
+      require: public
+      version: '>=0.17.0~2'
     source:
-      path: ../verification/m0/usb-hid-uart/managed_components/espressif__esp_tinyusb
-      type: local
+      registry_url: https://components.espressif.com/
+      type: service
+    targets:
+    - esp32s2
+    - esp32s3
+    - esp32p4
+    - esp32h4
+    - esp32s31
     version: 2.4.0
   espressif/led_strip:
     component_hash: 28621486f77229aaf81c71f5e15d6fbf36c2949cf11094e07090593e659e7639
@@ -40,10 +56,17 @@ dependencies:
       type: service
     version: 1.14.1
   espressif/tinyusb:
+    component_hash: 95e10bf67a64897daadb95681c032cfbbdc77240931fc23f47709a254a3db290
     dependencies: []
     source:
-      path: ../verification/m0/usb-hid-uart/managed_components/espressif__tinyusb
-      type: local
+      registry_url: https://components.espressif.com
+      type: service
+    targets:
+    - esp32s2
+    - esp32s3
+    - esp32p4
+    - esp32h4
+    - esp32s31
     version: 0.21.0~6
   idf:
     source:

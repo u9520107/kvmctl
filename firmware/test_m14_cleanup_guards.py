@@ -29,6 +29,8 @@ assert "s_transfer_deadline_ms" in service
 assert "s_cleanup_deadline_ms" in service
 assert "s_cleanup_failed = true" in service
 assert "CLEANUP_RETRIES" in service
+failed_recovery = service[service.index("if (failed)"):service.index("if (!failed && s_releasing)")]
+assert failed_recovery.count("return false;") == 1
 assert "hid_bench_cleanup_complete" in hid
 assert "KVMCTL_HID_BENCH_FAIL_TRANSFER_ONCE" in hid
 

@@ -79,7 +79,7 @@ impl SendTiming {
 impl Observer {
     pub(crate) fn start_timed(vid: u16, pid: u16, serial: &str) -> Result<(Self, SendTiming)> {
         let timing = SendTiming::new();
-        let observer = Self::start_mode(vid, pid, serial, 0, false, Some(timing.clone()))?;
+        let observer = Self::start_mode(vid, pid, serial, 0, true, Some(timing.clone()))?;
         Ok((observer, timing))
     }
 
