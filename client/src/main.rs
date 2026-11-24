@@ -69,6 +69,9 @@ struct TransportMetrics {
     normalized_keys: u32,
     normalized_buttons: u32,
     hid_reports: Option<u32>,
+    total_soc_cpu_us: u32,
+    event_processing_us: u32,
+    response_queue_residence_us: u32,
 }
 
 impl Default for TransportMetrics {
@@ -98,6 +101,9 @@ impl Default for TransportMetrics {
             normalized_keys: 0,
             normalized_buttons: 0,
             hid_reports: None,
+            total_soc_cpu_us: 0,
+            event_processing_us: 0,
+            response_queue_residence_us: 0,
         }
     }
 }
@@ -316,7 +322,7 @@ fn decode_transport_status_response(
     }
     r.expect_uint(5)?;
     let (result_major, result_fields) = r.head()?;
-    if result_major != 5 || !matches!(result_fields, 12 | 22 | 23) {
+    if result_major != 5 || !matches!(result_fields, 12 | 22 | 23 | 26) {
         return Err("invalid transport telemetry field count".into());
     }
     let mut values = [0; 10];
@@ -335,11 +341,24 @@ fn decode_transport_status_response(
             *value = r.uint()?;
         }
     }
-    let hid_reports = if result_fields == 23 {
+    let hid_reports = if result_fields >= 23 {
         r.expect_uint(22)?;
         Some(u32::try_from(r.uint()?).map_err(|_| "invalid HID report count")?)
     } else {
         None
+    };
+    let (total_soc_cpu_us, event_processing_us, response_queue_residence_us) = if result_fields
+        == 26
+    {
+        r.expect_uint(23)?;
+        let cpu = u32::try_from(r.uint()?).map_err(|_| "invalid SoC CPU time")?;
+        r.expect_uint(24)?;
+        let processing = u32::try_from(r.uint()?).map_err(|_| "invalid event processing time")?;
+        r.expect_uint(25)?;
+        let residence = u32::try_from(r.uint()?).map_err(|_| "invalid response queue residence")?;
+        (cpu, processing, residence)
+    } else {
+        (0, 0, 0)
     };
     if values[0] > 4
         || values[1..].iter().any(|value| *value > u32::MAX as u64)
@@ -378,6 +397,9 @@ fn decode_transport_status_response(
         normalized_keys: telemetry[8] as u32,
         normalized_buttons: telemetry[9] as u32,
         hid_reports,
+        total_soc_cpu_us,
+        event_processing_us,
+        response_queue_residence_us,
     })
 }
 
@@ -1604,7 +1626,7 @@ fn run() -> Result<(), String> {
     let command = args.first().map(String::as_str).unwrap_or("status");
     if command == "--help" || command == "-h" {
         println!(
-            "kvmctl [status [COMx] | wifi [COMx] | enroll [COMx] [takeover] | clients [COMx] | revoke [COMx] <fingerprint|all> | discover [COMx] | signaling-test [COMx] [scenario [IPv4] | IPv4] | led [COMx] on|off <brightness> <RRGGBB> | transport-test [COMx] | flash [COMx] <firmware.bin> <backup.bin> | ports]; scripted and takeover scenarios use zero HID output"
+            "kvmctl [status [COMx] | wifi [COMx] | enroll [COMx] [takeover] | clients [COMx] | revoke [COMx] <fingerprint|all> | discover [COMx] | signaling-test [COMx] [scenario [IPv4] | IPv4] | led [COMx] on|off <brightness> <RRGGBB> | transport-test [COMx] | flash [COMx] <firmware.bin> <backup.bin> | ports]; scripted and takeover scenarios use zero HID output; cleanup-* scenarios verify physical release"
         );
         return Ok(());
     }
@@ -1686,7 +1708,14 @@ fn run() -> Result<(), String> {
                             | "revoke-active"
                             | "scripted"
                             | "takeover"
+                            | "takeover-zero"
                             | "hid-bench"
+                            | "hid-sustain"
+                            | "cleanup-disconnect"
+                            | "cleanup-expiry"
+                            | "cleanup-revoke"
+                            | "cleanup-restart"
+                            | "cleanup-transfer-failure"
                     )
             })
             || params
@@ -1818,7 +1847,7 @@ fn run() -> Result<(), String> {
         } else {
             params.first().map(String::as_str).unwrap_or("success")
         };
-        let takeover_peer = if scenario == "takeover" {
+        let takeover_peer = if matches!(scenario, "takeover" | "takeover-zero") {
             let credential =
                 credentials::ClientCredential::load_existing(true).map_err(|error| {
                     format!(
@@ -1888,10 +1917,16 @@ fn run() -> Result<(), String> {
                 ));
             }
         };
-        let hid_mode = if scenario == "hid-bench" {
-            "scripted HID"
-        } else {
-            "zero HID"
+        let hid_mode = match scenario {
+            "hid-bench" => "scripted HID",
+            "hid-sustain" => "sustained HID",
+            "takeover" => "physical HID takeover",
+            "cleanup-disconnect"
+            | "cleanup-expiry"
+            | "cleanup-revoke"
+            | "cleanup-restart"
+            | "cleanup-transfer-failure" => "physical HID cleanup",
+            _ => "zero HID",
         };
         println!(
             "Running signaling scenario `{scenario}` in {hid_mode} mode. Physical-input capture is off."
@@ -2327,6 +2362,16 @@ mod tests {
                 .hid_reports,
             Some(6)
         );
+        response[result_header] = 0xb8;
+        response.insert(result_header + 1, 26);
+        for (key, value) in [(23, 456_u64), (24, 789_u64), (25, 123_u64)] {
+            put_uint(&mut response, key);
+            put_uint(&mut response, value);
+        }
+        let metrics = decode_transport_status_response(&response, &id).unwrap();
+        assert_eq!(metrics.total_soc_cpu_us, 456);
+        assert_eq!(metrics.event_processing_us, 789);
+        assert_eq!(metrics.response_queue_residence_us, 123);
     }
 
     #[test]

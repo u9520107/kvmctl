@@ -12,6 +12,12 @@ if(hid_bench_dependency)
     target_compile_definitions(${COMPONENT_LIB} PRIVATE KVMCTL_HID_BENCH=1)
 endif()
 
+if("$ENV{KVMCTL_HID_BENCH_FAIL_TRANSFER_ONCE}" STREQUAL "1")
+    target_compile_definitions(${COMPONENT_LIB} PRIVATE KVMCTL_HID_BENCH_FAIL_TRANSFER_ONCE=1)
+    message(STATUS "kvmctl: HID bench will fail one report transfer")
+endif()
+
+
 if("$ENV{KVMCTL_TEST_REVOKE_PERSIST_FAIL_ONCE}" STREQUAL "1")
     target_compile_definitions(${COMPONENT_LIB} PRIVATE KVMCTL_TEST_REVOKE_PERSIST_FAIL_ONCE=1)
     message(STATUS "kvmctl: test build will fail the first per-client revoke persistence attempt")

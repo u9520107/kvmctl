@@ -6,6 +6,7 @@
 #include <stdarg.h>
 #include <stdio.h>
 #include <stdatomic.h>
+#include <stdlib.h>
 #include <string.h>
 
 #include "client_auth.h"
@@ -49,6 +50,7 @@ typedef struct {
 typedef struct {
     uint8_t data[RESPONSE_QUEUE_DEPTH][CONTROL_CAPACITY];
     uint16_t size[RESPONSE_QUEUE_DEPTH];
+    uint64_t queued_at_us[RESPONSE_QUEUE_DEPTH];
     uint8_t head;
     uint8_t count;
 } response_queue_t;
@@ -93,6 +95,10 @@ static atomic_uint s_open_channels;
 static atomic_uint s_channel_opens;
 static atomic_uint s_application_bytes_received;
 static atomic_uint s_peer_task_cpu_us;
+static atomic_uint s_total_soc_cpu_us;
+static atomic_uint s_event_processing_us;
+static atomic_uint s_response_queue_residence_us;
+static atomic_uint s_soc_cpu_start;
 static atomic_uint s_tls_rate_limited;
 static atomic_uint s_scripted_events;
 static atomic_uint s_scripted_rejections;
@@ -112,6 +118,7 @@ static uint8_t s_tls_diagnostic_priority;
 
 /* Endpoint-global lease: one owner, one pending requester. */
 static lease_state_t s_lease;
+static bool s_lease_cleanup_pending;
 #ifdef KVMCTL_HID_BENCH
 /* The USB worker must serialize report submission with lease transitions, but
  * must not call the USB driver with interrupts masked. */
@@ -127,6 +134,32 @@ static portMUX_TYPE s_lease_mux = portMUX_INITIALIZER_UNLOCKED;
 static portMUX_TYPE s_response_mux[MAX_TRANSPORT_PEERS] = {
     portMUX_INITIALIZER_UNLOCKED, portMUX_INITIALIZER_UNLOCKED,
 };
+
+static void note_max_u32(atomic_uint *target, uint32_t value)
+{
+    uint32_t current = atomic_load(target);
+    while (value > current &&
+           !atomic_compare_exchange_weak(target, &current, value)) {}
+}
+
+static uint32_t total_soc_cpu_counter(void)
+{
+    UBaseType_t count = uxTaskGetNumberOfTasks();
+    if (count == 0) return 0;
+    TaskStatus_t *tasks = heap_caps_malloc((size_t)count * sizeof(*tasks), MALLOC_CAP_INTERNAL);
+    if (!tasks) return 0;
+    configRUN_TIME_COUNTER_TYPE total = 0;
+    UBaseType_t reported = uxTaskGetSystemState(tasks, count, &total);
+    heap_caps_free(tasks);
+    return reported ? (uint32_t)total : 0;
+}
+
+static void finish_event_timing(uint64_t started_us)
+{
+    uint64_t elapsed = (uint64_t)esp_timer_get_time() - started_us;
+    note_max_u32(&s_event_processing_us,
+                 elapsed > UINT32_MAX ? UINT32_MAX : (uint32_t)elapsed);
+}
 
 static bool queue_response(transport_peer_t *slot, const kvmctl_hid_event_t *event);
 static bool queue_state_locked(transport_peer_t *slot);
@@ -162,14 +195,53 @@ static void bench_disarm_locked(void)
 }
 #endif
 
+static bool pending_requester_eligible_locked(void)
+{
+    if (!s_lease.pending) return false;
+    for (size_t i = 0; i < MAX_TRANSPORT_PEERS; ++i) {
+        transport_peer_t *slot = &s_peers[i];
+        if (!atomic_load(&slot->active) ||
+            !atomic_load(&slot->application_authorized) ||
+            atomic_load(&slot->close_requested) || atomic_load(&slot->failed) ||
+            memcmp(slot->client_fingerprint, s_lease.pending_requester, LEASE_ID_SIZE) != 0) continue;
+        return client_auth_is_enrolled(slot->client_fingerprint);
+    }
+    return false;
+}
+
+static void finish_lease_cleanup_locked(void)
+{
+    if (!s_lease_cleanup_pending) return;
+#ifdef KVMCTL_HID_BENCH
+    if (!hid_bench_cleanup_complete()) return;
+#endif
+    s_lease_cleanup_pending = false;
+    if (s_lease.pending) {
+        if (pending_requester_eligible_locked()) {
+            (void)lease_grant_pending(&s_lease, (uint64_t)esp_timer_get_time() / 1000ULL);
+        } else {
+            lease_clear_pending(&s_lease);
+        }
+    }
+    queue_state_to_peers_locked();
+}
+
+static void begin_lease_cleanup_locked(void)
+{
+#ifdef KVMCTL_HID_BENCH
+    bench_disarm_locked();
+#endif
+    s_lease_cleanup_pending = true;
+    finish_lease_cleanup_locked();
+}
+
 static void lease_tick_locked(uint64_t now_ms)
 {
     lease_result_t result = lease_tick(&s_lease, now_ms);
     if (result == LEASE_EXPIRED || result == LEASE_TAKEOVER_GRANTED) {
-#ifdef KVMCTL_HID_BENCH
-        bench_disarm_locked();
-#endif
-        queue_state_to_peers_locked();
+        begin_lease_cleanup_locked();
+    } else {
+        finish_lease_cleanup_locked();
     }
 }
 
@@ -187,6 +259,7 @@ static bool queue_response(transport_peer_t *slot, const kvmctl_hid_event_t *eve
         size_t length = kvmctl_hid_encode(&copy, slot->responses.data[index], CONTROL_CAPACITY);
         if (length) {
             slot->responses.size[index] = (uint16_t)length;
+            slot->responses.queued_at_us[index] = (uint64_t)esp_timer_get_time();
             ++slot->responses.count;
             queued = true;
         }
@@ -289,6 +362,7 @@ static int accept_scripted_event(int slot, const kvmctl_hid_event_t *event)
     }
     switch (event->type) {
     case KVMCTL_HID_LEASE_REQUEST:
+        if (s_lease_cleanup_pending) { queue_error_locked(&s_peers[slot], event, "busy"); result = 2; break; }
         if (event->lease_epoch != 0) { queue_error_locked(&s_peers[slot], event, "stale_epoch"); result = 2; break; }
         lease_result = lease_request(&s_lease, lease_slot_identity(slot), NULL, now);
         if (lease_result == LEASE_GRANTED) { queue_state_locked(&s_peers[slot]); result = 2; }
@@ -300,6 +374,7 @@ static int accept_scripted_event(int slot, const kvmctl_hid_event_t *event)
         else { queue_error_locked(&s_peers[slot], event, s_lease.active ? "stale_epoch" : "lease_expired"); result = 2; }
         break;
     case KVMCTL_HID_TAKEOVER_REQUEST:
+        if (s_lease_cleanup_pending) { queue_error_locked(&s_peers[slot], event, "busy"); result = 2; break; }
         lease_result = lease_request(&s_lease, lease_slot_identity(slot), event->request_id, now);
         if (lease_result == LEASE_TAKEOVER_PENDING) { queue_notice_locked(&s_peers[slot], event); queue_state_locked(&s_peers[slot]); result = 2; }
         else if (lease_result == LEASE_GRANTED) { queue_state_locked(&s_peers[slot]); result = 2; }
@@ -327,10 +402,7 @@ static int accept_scripted_event(int slot, const kvmctl_hid_event_t *event)
     case KVMCTL_HID_LEASE_RELEASE:
         lease_result = lease_release(&s_lease, lease_slot_identity(slot), event->lease_epoch, now);
         if (lease_result == LEASE_TAKEOVER_GRANTED || lease_result == LEASE_RELEASED) {
-#ifdef KVMCTL_HID_BENCH
-            bench_disarm_locked();
-#endif
-            queue_state_to_peers_locked();
+            begin_lease_cleanup_locked();
             result = 2;
         }
         else { queue_error_locked(&s_peers[slot], event, s_lease.active ? "stale_epoch" : "lease_expired"); result = 2; }
@@ -397,6 +469,8 @@ static void stop_heap_monitor_if_idle(void)
     atomic_store(&s_internal_free_end, heap_caps_get_free_size(MALLOC_CAP_INTERNAL));
     atomic_store(&s_psram_free_min, heap_caps_get_minimum_free_size(MALLOC_CAP_SPIRAM));
     atomic_store(&s_psram_free_end, heap_caps_get_free_size(MALLOC_CAP_SPIRAM));
+    uint32_t total = total_soc_cpu_counter();
+    atomic_store(&s_total_soc_cpu_us, total - atomic_load(&s_soc_cpu_start));
     heap_caps_monitor_local_minimum_free_size_stop();
     atomic_store(&s_heap_monitor, false);
 }
@@ -514,17 +588,21 @@ static int on_data(esp_peer_data_frame_t *frame, void *ctx)
     bool control_channel = slot->control.open && frame->stream_id == slot->control.stream;
     if (!control_channel && !motion_channel) { fail_session(slot); return -1; }
     if (frame->size > 0 && (frame->data[0] >> 5) == 5) {
+        uint64_t processing_started_us = (uint64_t)esp_timer_get_time();
         kvmctl_hid_event_t event;
         if (!kvmctl_hid_decode(frame->data, (size_t)frame->size, motion_channel, &event)) {
+            finish_event_timing(processing_started_us);
             atomic_fetch_add(&s_scripted_rejections, 1); fail_session(slot); return -1;
         }
         if ((control_channel && event.sequence != slot->control_sequence) ||
             (motion_channel && slot->motion_sequence_seen && event.sequence <= slot->motion_sequence)) {
+            finish_event_timing(processing_started_us);
             atomic_fetch_add(&s_scripted_drops, 1);
             atomic_fetch_add(&s_scripted_reorders, 1);
             return 0;
         }
         int accepted = accept_scripted_event((int)(slot - s_peers), &event);
+        finish_event_timing(processing_started_us);
         if (accepted < 0) { atomic_fetch_add(&s_scripted_rejections, 1); fail_session(slot); return -1; }
         if (accepted == 0) return 0;
         if (control_channel) ++slot->control_sequence;
@@ -580,6 +658,9 @@ static bool send_response(esp_peer_handle_t peer, transport_peer_t *slot)
     if (ret == ESP_PEER_ERR_WOULD_BLOCK) return true;
     if (ret != ESP_PEER_ERR_NONE) return false;
 
+    uint64_t residence_us = (uint64_t)esp_timer_get_time() - slot->responses.queued_at_us[index];
+    note_max_u32(&s_response_queue_residence_us,
+                 residence_us > UINT32_MAX ? UINT32_MAX : (uint32_t)residence_us);
     portENTER_CRITICAL(&s_response_mux[peer_index_value]);
     if (slot->responses.count && slot->responses.head == index &&
         slot->responses.size[index] == size) {
@@ -593,20 +674,25 @@ static bool send_response(esp_peer_handle_t peer, transport_peer_t *slot)
 static void peer_cleanup(transport_peer_t *slot)
 {
     lease_lock();
+    bool owner_match = s_lease.active &&
+                       memcmp(s_lease.owner, slot->client_fingerprint, LEASE_ID_SIZE) == 0;
+    bool pending_match = s_lease.pending &&
+                         memcmp(s_lease.pending_requester, slot->client_fingerprint, LEASE_ID_SIZE) == 0;
 #ifdef KVMCTL_HID_BENCH
     if (s_bench_owner == slot) bench_disarm_locked();
 #endif
     lease_result_t revoke_result = LEASE_NOOP;
-    if (s_lease.active && memcmp(s_lease.owner, slot->client_fingerprint, LEASE_ID_SIZE) == 0) {
+    if (owner_match) {
         revoke_result = lease_revoke(&s_lease, slot->client_fingerprint,
                                      (uint64_t)esp_timer_get_time() / 1000ULL);
-    } else if (s_lease.pending &&
-               memcmp(s_lease.pending_requester, slot->client_fingerprint, LEASE_ID_SIZE) == 0) {
+    } else if (pending_match) {
         revoke_result = lease_revoke(&s_lease, slot->client_fingerprint,
                                      (uint64_t)esp_timer_get_time() / 1000ULL);
     }
-    if (revoke_result == LEASE_TAKEOVER_GRANTED || revoke_result == LEASE_REVOKED) {
-        queue_state_to_peers_locked();
+    if (owner_match && revoke_result == LEASE_REVOKED) {
+        begin_lease_cleanup_locked();
+    } else if (pending_match && revoke_result == LEASE_REVOKED) {
+        if (!s_lease_cleanup_pending) queue_state_to_peers_locked();
     }
     lease_unlock();
     atomic_fetch_sub(&s_open_channels, slot->open_channels);
@@ -715,7 +801,17 @@ static void hid_bench_task(void *arg)
             }
             lease_tick_locked((uint64_t)esp_timer_get_time() / 1000ULL);
         }
-        if (!hid_bench_service()) bench_disarm_locked();
+        if (!hid_bench_service()) {
+            transport_peer_t *failed_owner = s_bench_owner;
+            bench_disarm_locked();
+            if (failed_owner && s_lease.active &&
+                memcmp(s_lease.owner, failed_owner->client_fingerprint, LEASE_ID_SIZE) == 0) {
+                (void)lease_revoke(&s_lease, failed_owner->client_fingerprint,
+                                   (uint64_t)esp_timer_get_time() / 1000ULL);
+                begin_lease_cleanup_locked();
+            }
+        }
+        finish_lease_cleanup_locked();
         lease_unlock();
         vTaskDelay(pdMS_TO_TICKS(10));
     }
@@ -840,6 +936,11 @@ static esp_err_t transport_offer_internal(const uint8_t *client_fingerprint,
         atomic_store(&s_psram_free_end, 0);
         atomic_store(&s_channel_opens, 0);
         atomic_store(&s_application_bytes_received, 0);
+        atomic_store(&s_peer_task_cpu_us, 0);
+        atomic_store(&s_total_soc_cpu_us, 0);
+        atomic_store(&s_event_processing_us, 0);
+        atomic_store(&s_response_queue_residence_us, 0);
+        atomic_store(&s_soc_cpu_start, total_soc_cpu_counter());
         atomic_store(&s_scripted_events, 0);
         atomic_store(&s_scripted_rejections, 0);
         atomic_store(&s_scripted_drops, 0);
@@ -906,6 +1007,10 @@ esp_err_t transport_offer_for_client(const uint8_t fingerprint[32], const uint8_
 esp_err_t transport_close(void)
 {
     esp_err_t result = ESP_OK;
+    lease_lock();
+    (void)lease_restart(&s_lease);
+    begin_lease_cleanup_locked();
+    lease_unlock();
     for (size_t i = 0; i < MAX_TRANSPORT_PEERS; ++i) {
         if (!atomic_load(&s_peers[i].active)) continue;
         atomic_store(&s_peers[i].close_requested, true);
@@ -1033,6 +1138,12 @@ void transport_get_metrics(transport_metrics_t *metrics)
 #else
     metrics->hid_reports = 0;
 #endif
+    metrics->total_soc_cpu_us = atomic_load(&s_total_soc_cpu_us);
+    if (monitoring) {
+        metrics->total_soc_cpu_us = total_soc_cpu_counter() - atomic_load(&s_soc_cpu_start);
+    }
+    metrics->event_processing_us = atomic_load(&s_event_processing_us);
+    metrics->response_queue_residence_us = atomic_load(&s_response_queue_residence_us);
     portENTER_CRITICAL(&s_tls_diagnostic_mux);
     memcpy(metrics->tls_diagnostic, s_tls_diagnostic, sizeof(metrics->tls_diagnostic));
     portEXIT_CRITICAL(&s_tls_diagnostic_mux);

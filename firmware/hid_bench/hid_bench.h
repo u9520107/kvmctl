@@ -10,4 +10,5 @@ bool hid_bench_can_arm(void);
 const char *hid_bench_enqueue(const kvmctl_hid_event_t *event);
 void hid_bench_disarm(void);
 bool hid_bench_service(void);
+bool hid_bench_cleanup_complete(void);
 uint32_t hid_bench_reports(void);

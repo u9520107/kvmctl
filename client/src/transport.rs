@@ -381,7 +381,7 @@ async fn exchange(
     let mut port = cleanup?;
     let metrics = port.transport_status().map_err(anyhow::Error::msg)?;
     eprintln!(
-        "M1.2 RESOURCE stage={stage} device_state={} internal_free_start_bytes={} internal_free_min_bytes={} internal_free_after_bytes={} psram_free_start_bytes={} psram_free_min_bytes={} psram_free_after_bytes={} device_channel_opens={} device_application_bytes_received={} device_peer_task_cpu_us={}",
+        "M1.2 RESOURCE stage={stage} device_state={} internal_free_start_bytes={} internal_free_min_bytes={} internal_free_after_bytes={} psram_free_start_bytes={} psram_free_min_bytes={} psram_free_after_bytes={} device_channel_opens={} device_application_bytes_received={} device_peer_task_cpu_us={} device_total_soc_cpu_us={} device_event_processing_us={} device_response_queue_residence_us={}",
         metrics.state,
         metrics.internal_free_start,
         metrics.internal_free_min,
@@ -392,6 +392,9 @@ async fn exchange(
         metrics.channel_opens,
         metrics.application_bytes_received,
         metrics.peer_task_cpu_us,
+        metrics.total_soc_cpu_us,
+        metrics.event_processing_us,
+        metrics.response_queue_residence_us,
     );
     result?;
     let invalidation = if stage == "initial" {
@@ -539,6 +542,7 @@ pub(crate) fn run_test(mut port: crate::serial::Port) -> Result<()> {
 enum MonitorCommand {
     Snapshot(std::sync::mpsc::Sender<Result<crate::TransportMetrics, String>>),
     RevokeClient([u8; 32], std::sync::mpsc::Sender<Result<(), String>>),
+    RestartEndpoint(std::sync::mpsc::Sender<Result<(), String>>),
     Stop,
 }
 
@@ -599,6 +603,9 @@ impl PortMonitor {
                     Ok(MonitorCommand::RevokeClient(fingerprint, reply)) => {
                         let _ = reply.send(port.revoke_client(&fingerprint));
                     }
+                    Ok(MonitorCommand::RestartEndpoint(reply)) => {
+                        let _ = reply.send(port.transport_close());
+                    }
                     Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {}
                 }
             }
@@ -641,6 +648,19 @@ impl PortMonitor {
             .map_err(anyhow::Error::msg)
     }
 
+    fn restart_endpoint(&self) -> Result<()> {
+        let (reply, receiver) = std::sync::mpsc::channel();
+        self.stop
+            .send(MonitorCommand::RestartEndpoint(reply))
+            .map_err(|_| {
+                anyhow::anyhow!("USB transport monitor stopped before endpoint restart")
+            })?;
+        receiver
+            .recv_timeout(Duration::from_secs(5))
+            .map_err(|_| anyhow::anyhow!("USB endpoint restart timed out"))?
+            .map_err(anyhow::Error::msg)
+    }
+
     fn finish(self) -> Result<(crate::serial::Port, crate::TransportMetrics, bool)> {
         let _ = self.stop.send(MonitorCommand::Stop);
         let port = self
@@ -665,8 +685,12 @@ impl Drop for PortMonitor {
 enum ScriptMode {
     Transport,
     HidBench,
+    HidSustain,
 }
 const SCRIPTED_HID_REPORTS: u32 = 7;
+const SUSTAIN_REPEAT_COUNT: u32 = 100;
+const SUSTAIN_DURATION_MS: u64 = 10_000;
+const SUSTAIN_HID_REPORTS: u32 = SUSTAIN_REPEAT_COUNT * 5 + 2;
 
 enum TranscriptProofCase<'a> {
     Valid {
@@ -1202,6 +1226,21 @@ async fn send_hid_event(
     Ok(())
 }
 
+async fn send_timed_hid_event(
+    channel: &Arc<dyn DataChannel>,
+    event: crate::hid_protocol::Envelope,
+    timing: Option<&crate::raw_input::SendTiming>,
+) -> Result<()> {
+    if let Some(timing) = timing {
+        timing.begin();
+    }
+    let result = send_hid_event(channel, event).await;
+    if let Some(timing) = timing {
+        timing.finish();
+    }
+    result
+}
+
 fn wait_for_scripted_telemetry(
     monitor: &PortMonitor,
     baseline: &crate::TransportMetrics,
@@ -1236,6 +1275,35 @@ fn wait_for_scripted_telemetry(
                 expected_sequence
             );
         }
+        std::thread::sleep(Duration::from_millis(25));
+    }
+}
+
+fn wait_for_scripted_count(
+    monitor: &PortMonitor,
+    baseline: &crate::TransportMetrics,
+    expected_events: u32,
+) -> Result<()> {
+    let target = baseline
+        .scripted_events
+        .checked_add(expected_events)
+        .context("scripted telemetry event count overflowed")?;
+    let deadline = Instant::now() + Duration::from_secs(5);
+    loop {
+        let metrics = monitor.fresh_snapshot()?;
+        ensure!(
+            metrics.scripted_rejections == baseline.scripted_rejections
+                && metrics.scripted_drops == baseline.scripted_drops
+                && metrics.scripted_reorders == baseline.scripted_reorders,
+            "sustained HID event was rejected, dropped, or reordered"
+        );
+        if metrics.scripted_events >= target {
+            return Ok(());
+        }
+        ensure!(
+            Instant::now() < deadline,
+            "sustained HID telemetry barrier timed out"
+        );
         std::thread::sleep(Duration::from_millis(25));
     }
 }
@@ -1275,16 +1343,20 @@ async fn scripted_transport(
         },
     )
     .context("lease request response")?;
-    let hid_bench = mode == ScriptMode::HidBench;
+    let hid_bench = matches!(mode, ScriptMode::HidBench | ScriptMode::HidSustain);
+    let capture_hid = mode == ScriptMode::HidBench;
     let offset = u64::from(hid_bench);
     let hid_baseline = monitor.fresh_snapshot()?.hid_reports;
-    let observer = if hid_bench {
+    let mut hid_timing = None;
+    let observer = if capture_hid {
         ensure!(
             hid_baseline.is_some(),
             "firmware did not expose HID bench telemetry"
         );
         let serial = crate::hex(&endpoint_fingerprint[..12]);
-        Some(crate::raw_input::Observer::start(0x303a, 0x4004, &serial)?)
+        let (observer, timing) = crate::raw_input::Observer::start_timed(0x303a, 0x4004, &serial)?;
+        hid_timing = Some(timing);
+        Some(observer)
     } else {
         None
     };
@@ -1310,12 +1382,124 @@ async fn scripted_transport(
         .fresh_snapshot()
         .context("scripted telemetry baseline")?;
 
+    if mode == ScriptMode::HidSustain {
+        let started = Instant::now();
+        for repeat in 0..SUSTAIN_REPEAT_COUNT {
+            let control_sequence = 2 + u64::from(repeat) * 4;
+            send_hid_event(
+                control,
+                event(
+                    hid_protocol::HEARTBEAT,
+                    epoch,
+                    control_sequence,
+                    Event::Heartbeat,
+                ),
+            )
+            .await?;
+            send_hid_event(
+                control,
+                event(
+                    hid_protocol::KEYBOARD_STATE,
+                    epoch,
+                    control_sequence + 1,
+                    Event::KeyboardState {
+                        modifiers: 2,
+                        keys: vec![(7, 4)],
+                    },
+                ),
+            )
+            .await?;
+            send_hid_event(
+                control,
+                event(
+                    hid_protocol::MOUSE_BUTTONS,
+                    epoch,
+                    control_sequence + 2,
+                    Event::MouseButtons { mask: 1 },
+                ),
+            )
+            .await?;
+            send_hid_event(
+                control,
+                event(
+                    hid_protocol::WHEEL,
+                    epoch,
+                    control_sequence + 3,
+                    Event::Wheel {
+                        vertical: 1,
+                        horizontal: -1,
+                    },
+                ),
+            )
+            .await?;
+            send_hid_event(
+                motion,
+                event(
+                    hid_protocol::MOTION,
+                    epoch,
+                    u64::from(repeat),
+                    Event::Motion { dx: 12, dy: -4 },
+                ),
+            )
+            .await?;
+            // Motion uses the production unordered/zero-retransmit channel.  Let
+            // each sample reach the board before sending the next sequence so
+            // this sustained-path measurement fails on loss, not avoidable
+            // test-induced reordering.
+            wait_for_scripted_count(monitor, &telemetry_baseline, (repeat + 1) * 5)?;
+            let target = started
+                + Duration::from_millis(
+                    SUSTAIN_DURATION_MS * u64::from(repeat + 1) / u64::from(SUSTAIN_REPEAT_COUNT),
+                );
+            let delay = target.saturating_duration_since(Instant::now());
+            if !delay.is_zero() {
+                runtime.sleep(delay).await;
+            }
+        }
+        wait_for_scripted_count(monitor, &telemetry_baseline, SUSTAIN_REPEAT_COUNT * 5)?;
+        send_hid_event(
+            control,
+            event(
+                hid_protocol::LEASE_RELEASE,
+                epoch,
+                2 + u64::from(SUSTAIN_REPEAT_COUNT) * 4,
+                Event::LeaseRelease,
+            ),
+        )
+        .await?;
+        require_response(
+            receive_endpoint_response(runtime, control, &mut responses, next_lease_epoch(epoch))
+                .await?,
+            EndpointResponse::LeaseState {
+                owner: None,
+                state: 0,
+            },
+        )?;
+        let final_metrics = wait_for_hid_reports(
+            monitor,
+            hid_baseline.context("missing report count")?,
+            SUSTAIN_HID_REPORTS,
+        )?;
+        ensure!(
+            final_metrics.normalized_keys == 0 && final_metrics.normalized_buttons == 0,
+            "sustained HID bench left held state"
+        );
+        eprintln!(
+            "M1.4 SUSTAINED_HID repeat_count={} duration_ms={} scripted_events={} hid_reports_delta={} physical_input_capture=off",
+            SUSTAIN_REPEAT_COUNT,
+            SUSTAIN_DURATION_MS,
+            SUSTAIN_REPEAT_COUNT * 5,
+            SUSTAIN_HID_REPORTS,
+        );
+        return Ok(());
+    }
+
     send_hid_event(
         control,
         event(hid_protocol::HEARTBEAT, epoch, 1 + offset, Event::Heartbeat),
     )
     .await?;
-    send_hid_event(
+    send_timed_hid_event(
         control,
         event(
             hid_protocol::KEYBOARD_STATE,
@@ -1326,12 +1510,13 @@ async fn scripted_transport(
                 keys: vec![(7, 4)],
             },
         ),
+        hid_timing.as_ref(),
     )
     .await?;
     if let Some(observer) = &observer {
         observer.check_focus()?;
     }
-    send_hid_event(
+    send_timed_hid_event(
         control,
         event(
             hid_protocol::MOUSE_BUTTONS,
@@ -1339,9 +1524,10 @@ async fn scripted_transport(
             3 + offset,
             Event::MouseButtons { mask: 1 },
         ),
+        hid_timing.as_ref(),
     )
     .await?;
-    send_hid_event(
+    send_timed_hid_event(
         control,
         event(
             hid_protocol::WHEEL,
@@ -1352,6 +1538,7 @@ async fn scripted_transport(
                 horizontal: -1,
             },
         ),
+        hid_timing.as_ref(),
     )
     .await?;
     wait_for_scripted_telemetry(monitor, &telemetry_baseline, 4, 4 + offset)
@@ -1362,7 +1549,7 @@ async fn scripted_transport(
     if let Some(observer) = &observer {
         observer.check_focus()?;
     }
-    send_hid_event(
+    send_timed_hid_event(
         motion,
         event(
             hid_protocol::MOTION,
@@ -1370,6 +1557,7 @@ async fn scripted_transport(
             0,
             Event::Motion { dx: 12, dy: -4 },
         ),
+        hid_timing.as_ref(),
     )
     .await?;
     wait_for_scripted_telemetry(monitor, &telemetry_baseline, 5, 0)
@@ -1537,6 +1725,8 @@ async fn exercise_takeover(
     mut b: TakeoverClient<'_>,
     owner_a: [u8; 32],
     owner_b: [u8; 32],
+    endpoint_fingerprint: [u8; 32],
+    physical_hid: bool,
 ) -> Result<u32> {
     use crate::hid_protocol::{self as hid, Event};
 
@@ -1562,13 +1752,33 @@ async fn exercise_takeover(
     };
     let button = || Event::MouseButtons { mask: 1 };
     let baseline = monitor.fresh_snapshot()?;
+    let hid_baseline = physical_hid.then_some(baseline.hid_reports).flatten();
+    let observer = if hid_baseline.is_some() {
+        Some(crate::raw_input::Observer::start_takeover(
+            0x303a,
+            0x4004,
+            &crate::hex(&endpoint_fingerprint[..12]),
+        )?)
+    } else {
+        None
+    };
     let a_epoch = next_lease_epoch(baseline.lease_epoch);
     let b_epoch = next_lease_epoch(next_lease_epoch(a_epoch));
     a.send(hid::LEASE_REQUEST, 0, Event::LeaseRequest).await?;
     a.expect(a_epoch, owned(owner_a)).await?;
+    if hid_baseline.is_some() {
+        a.send(hid::HID_BENCH_ARM, a_epoch, Event::HidBenchArm)
+            .await?;
+        a.expect(a_epoch, owned(owner_a)).await?;
+    }
     a.send(hid::KEYBOARD_STATE, a_epoch, key()).await?;
     a.send(hid::MOUSE_BUTTONS, a_epoch, button()).await?;
-    wait_for_scripted_telemetry(monitor, &baseline, 3, 2)?;
+    wait_for_scripted_telemetry(
+        monitor,
+        &baseline,
+        3 + u32::from(hid_baseline.is_some()),
+        a.sequence - 1,
+    )?;
     let held = monitor.fresh_snapshot()?;
     ensure!(
         held.normalized_keys == 1 && held.normalized_buttons == 1,
@@ -1667,6 +1877,10 @@ async fn exercise_takeover(
         "M1.4 TAKEOVER A-still-held epoch={a_epoch} board_timestamp_ms={} last_heartbeat_sequence={}",
         last_heartbeat.board_timestamp_ms, last_heartbeat.last_event_sequence,
     );
+    if let Some(before) = hid_baseline {
+        wait_for_hid_reports(monitor, before, 4)?;
+        eprintln!("M1.4 TAKEOVER A-neutral-reports=2 before=B-grant");
+    }
     b.expect(b_epoch, owned(owner_b)).await?;
     let elapsed = requested.elapsed();
     ensure!(
@@ -1685,6 +1899,14 @@ async fn exercise_takeover(
         "M1.4 TAKEOVER timeout_ms={} B-owned epoch={b_epoch} keys=0 buttons=0",
         elapsed.as_millis()
     );
+    let heartbeat_baseline = monitor.fresh_snapshot()?;
+    b.send(hid::HEARTBEAT, b_epoch, Event::Heartbeat).await?;
+    wait_for_scripted_telemetry(monitor, &heartbeat_baseline, 1, b.sequence - 1)?;
+    if hid_baseline.is_some() {
+        b.send(hid::HID_BENCH_ARM, b_epoch, Event::HidBenchArm)
+            .await?;
+        b.expect(b_epoch, owned(owner_b)).await?;
+    }
     a.send(hid::KEYBOARD_STATE, a_epoch, key()).await?;
     a.expect(b_epoch, stale()).await?;
     let before_b = monitor.fresh_snapshot()?;
@@ -1722,6 +1944,12 @@ async fn exercise_takeover(
         },
     )
     .await?;
+    if let Some(before) = hid_baseline {
+        wait_for_hid_reports(monitor, before, 8)?;
+    }
+    if let Some(observer) = observer {
+        observer.verify_takeover()?;
+    }
     Ok(idle_epoch)
 }
 
@@ -1733,6 +1961,7 @@ async fn run_takeover(
     status: &crate::Status,
     credential_a: &crate::credentials::ClientCredential,
     credential_b: &crate::credentials::ClientCredential,
+    physical_hid: bool,
 ) -> Result<()> {
     ensure!(
         credential_a.fingerprint != credential_b.fingerprint,
@@ -1743,6 +1972,7 @@ async fn run_takeover(
         crate::hex(&credential_a.fingerprint),
         crate::hex(&credential_b.fingerprint)
     );
+    let initial_hid_reports = monitor.fresh_snapshot()?.hid_reports;
     let mut a = open_signaling_peer(
         runtime.clone(),
         monitor,
@@ -1768,6 +1998,8 @@ async fn run_takeover(
                 TakeoverClient::new("B", &*runtime, &b),
                 credential_a.fingerprint,
                 credential_b.fingerprint,
+                status.identity_fingerprint,
+                physical_hid,
             ).await
         }.await;
         b.close(&*runtime).await;
@@ -1792,8 +2024,200 @@ async fn run_takeover(
             && final_status.scripted_drops == 2,
         "expected exactly two stale input drops and no parser rejections or reorders"
     );
+    if let Some(before) = initial_hid_reports {
+        let expected = if physical_hid { 8 } else { 0 };
+        let observed = final_status
+            .hid_reports
+            .context("missing HID report count")?
+            .wrapping_sub(before);
+        ensure!(
+            observed == expected,
+            "takeover HID report delta {observed}, expected {expected}"
+        );
+    }
     eprintln!(
-        "M1.4 TAKEOVER sessions=closed lease=idle epoch={idle_epoch} keys=0 buttons=0 hid_reports=0"
+        "M1.4 TAKEOVER sessions=closed lease=idle epoch={idle_epoch} keys=0 buttons=0 hid_reports_delta={} physical_input_capture=off",
+        if physical_hid { 8 } else { 0 }
+    );
+    Ok(())
+}
+
+#[derive(Clone, Copy)]
+enum CleanupPath {
+    Disconnect,
+    HeartbeatExpiry,
+    UsbRevoke,
+    EndpointRestart,
+    TransferFailure,
+}
+
+async fn run_cleanup_path(
+    runtime: Arc<dyn Runtime>,
+    monitor: &PortMonitor,
+    address: SocketAddr,
+    hostname: &str,
+    status: &crate::Status,
+    credential: &crate::credentials::ClientCredential,
+    path: CleanupPath,
+) -> Result<()> {
+    let mut peer = open_signaling_peer(
+        runtime.clone(),
+        monitor,
+        address,
+        hostname,
+        status,
+        credential,
+    )
+    .await?;
+    peer.session
+        .send_transcript_proof(&peer.proof)
+        .map_err(anyhow::Error::msg)?;
+    let before = monitor.fresh_snapshot()?;
+    let observer = if before.hid_reports.is_some() && !matches!(path, CleanupPath::TransferFailure)
+    {
+        Some(crate::raw_input::Observer::start_cleanup(
+            0x303a,
+            0x4004,
+            &crate::hex(&status.identity_fingerprint[..12]),
+        )?)
+    } else {
+        None
+    };
+    let epoch = next_lease_epoch(before.lease_epoch);
+    {
+        let mut client = TakeoverClient::new("cleanup", &*runtime, &peer);
+        client
+            .send(
+                crate::hid_protocol::LEASE_REQUEST,
+                0,
+                crate::hid_protocol::Event::LeaseRequest,
+            )
+            .await?;
+        client
+            .expect(
+                epoch,
+                EndpointResponse::LeaseState {
+                    owner: Some(credential.fingerprint),
+                    state: 1,
+                },
+            )
+            .await?;
+        let arm = before.hid_reports.is_some();
+        if arm {
+            client
+                .send(
+                    crate::hid_protocol::HID_BENCH_ARM,
+                    epoch,
+                    crate::hid_protocol::Event::HidBenchArm,
+                )
+                .await?;
+            client
+                .expect(
+                    epoch,
+                    EndpointResponse::LeaseState {
+                        owner: Some(credential.fingerprint),
+                        state: 1,
+                    },
+                )
+                .await?;
+        }
+        client
+            .send(
+                crate::hid_protocol::KEYBOARD_STATE,
+                epoch,
+                crate::hid_protocol::Event::KeyboardState {
+                    modifiers: 2,
+                    keys: vec![(7, 4)],
+                },
+            )
+            .await?;
+        client
+            .send(
+                crate::hid_protocol::MOUSE_BUTTONS,
+                epoch,
+                crate::hid_protocol::Event::MouseButtons { mask: 1 },
+            )
+            .await?;
+    }
+    wait_for_scripted_telemetry(
+        monitor,
+        &before,
+        3 + u32::from(before.hid_reports.is_some()),
+        2 + u64::from(before.hid_reports.is_some()),
+    )?;
+    match path {
+        CleanupPath::Disconnect => peer.close(&*runtime).await,
+        CleanupPath::HeartbeatExpiry => {
+            runtime.sleep(Duration::from_millis(3_500)).await;
+            if let Some(before_reports) = before.hid_reports {
+                wait_for_hid_reports(monitor, before_reports, 4)?;
+            }
+            wait_for_held_cleanup(monitor)?;
+            peer.close(&*runtime).await;
+        }
+        CleanupPath::UsbRevoke => {
+            monitor.revoke_client(credential.fingerprint)?;
+            wait_device_closed(&monitor.device_status).await?;
+            peer.close(&*runtime).await;
+        }
+        CleanupPath::EndpointRestart => {
+            monitor.restart_endpoint()?;
+            wait_device_closed(&monitor.device_status).await?;
+            peer.close(&*runtime).await;
+        }
+        CleanupPath::TransferFailure => {
+            wait_for_held_cleanup(monitor)?;
+            peer.close(&*runtime).await;
+        }
+    }
+    let expected_hid_delta = if matches!(path, CleanupPath::TransferFailure) {
+        // One injected transfer fails; bounded neutral cleanup still completes
+        // the remaining recovery reports before the lease is released.
+        3
+    } else {
+        4
+    };
+    wait_device_closed(&monitor.device_status).await?;
+    let final_status = if let Some(before_reports) = before.hid_reports {
+        wait_for_hid_reports(monitor, before_reports, expected_hid_delta)?
+    } else {
+        let metrics = monitor.fresh_snapshot()?;
+        ensure!(
+            metrics.hid_reports == None,
+            "zero-HID telemetry disappeared"
+        );
+        metrics
+    };
+    ensure!(
+        final_status.state == 0
+            && final_status.normalized_keys == 0
+            && final_status.normalized_buttons == 0
+            && final_status.response_queue_depth == 0,
+        "cleanup path left endpoint active or held input"
+    );
+    if let Some(observer) = observer {
+        observer.verify_cleanup(match path {
+            CleanupPath::Disconnect => "disconnect",
+            CleanupPath::HeartbeatExpiry => "heartbeat-expiry",
+            CleanupPath::UsbRevoke => "usb-revoke",
+            CleanupPath::EndpointRestart => "endpoint-restart",
+            CleanupPath::TransferFailure => "transfer-failure",
+        })?;
+    }
+    eprintln!(
+        "M1.4 CLEANUP path={} released=true held_keys=0 held_buttons=0 hid_reports_delta={}",
+        match path {
+            CleanupPath::Disconnect => "disconnect",
+            CleanupPath::HeartbeatExpiry => "heartbeat-expiry",
+            CleanupPath::UsbRevoke => "usb-revoke",
+            CleanupPath::EndpointRestart => "endpoint-restart",
+            CleanupPath::TransferFailure => "transfer-failure",
+        },
+        if before.hid_reports.is_some() {
+            expected_hid_delta
+        } else {
+            0
+        },
     );
     Ok(())
 }
@@ -1810,6 +2234,27 @@ async fn wait_device_closed(device_status: &AtomicU8) -> Result<()> {
         "ESP32 transport did not return to idle after WSS close (state={})",
         device_status.load(Ordering::Acquire)
     );
+}
+
+fn wait_for_held_cleanup(monitor: &PortMonitor) -> Result<()> {
+    let deadline = Instant::now() + Duration::from_secs(5);
+    loop {
+        let metrics = monitor.fresh_snapshot()?;
+        if metrics.normalized_keys == 0
+            && metrics.normalized_buttons == 0
+            && metrics.response_queue_depth == 0
+        {
+            return Ok(());
+        }
+        ensure!(
+            Instant::now() < deadline,
+            "heartbeat expiry left held input: keys={} buttons={} queue={}",
+            metrics.normalized_keys,
+            metrics.normalized_buttons,
+            metrics.response_queue_depth
+        );
+        std::thread::sleep(Duration::from_millis(100));
+    }
 }
 
 fn read_until_closed(stream: &mut TcpStream, deadline: Instant, label: &str) -> Result<()> {
@@ -2015,7 +2460,14 @@ pub(crate) fn run_signaling_test(
                 | "revoke-active"
                 | "scripted"
                 | "takeover"
+                | "takeover-zero"
                 | "hid-bench"
+                | "hid-sustain"
+                | "cleanup-disconnect"
+                | "cleanup-expiry"
+                | "cleanup-revoke"
+                | "cleanup-restart"
+                | "cleanup-transfer-failure"
         ),
         "unknown signaling-test scenario"
     );
@@ -2030,7 +2482,7 @@ pub(crate) fn run_signaling_test(
         result = Some(
             async {
                 match scenario {
-                    "takeover" => {
+                    "takeover" | "takeover-zero" => {
                         let peer = takeover_peer
                             .as_ref()
                             .context("missing takeover identity")?;
@@ -2042,10 +2494,34 @@ pub(crate) fn run_signaling_test(
                             &status,
                             &credential,
                             peer,
+                            scenario == "takeover",
                         )
                         .await?;
                     }
-                    "scripted" | "hid-bench" => {
+                    "cleanup-disconnect"
+                    | "cleanup-expiry"
+                    | "cleanup-revoke"
+                    | "cleanup-restart"
+                    | "cleanup-transfer-failure" => {
+                        let path = match scenario {
+                            "cleanup-disconnect" => CleanupPath::Disconnect,
+                            "cleanup-expiry" => CleanupPath::HeartbeatExpiry,
+                            "cleanup-revoke" => CleanupPath::UsbRevoke,
+                            "cleanup-restart" => CleanupPath::EndpointRestart,
+                            _ => CleanupPath::TransferFailure,
+                        };
+                        run_cleanup_path(
+                            runtime.clone(),
+                            &monitor,
+                            address,
+                            &hostname,
+                            &status,
+                            &credential,
+                            path,
+                        )
+                        .await?;
+                    }
+                    "scripted" | "hid-bench" | "hid-sustain" => {
                         let _proof = exchange_signaling(
                             runtime.clone(),
                             &monitor,
@@ -2056,6 +2532,8 @@ pub(crate) fn run_signaling_test(
                             TranscriptProofCase::Valid {
                                 scripted: Some(if scenario == "hid-bench" {
                                     ScriptMode::HidBench
+                                } else if scenario == "hid-sustain" {
+                                    ScriptMode::HidSustain
                                 } else {
                                     ScriptMode::Transport
                                 }),
@@ -2214,11 +2692,14 @@ pub(crate) fn run_signaling_test(
         metrics.application_bytes_received,
     );
     eprintln!(
-        "M1.4 TELEMETRY board_timestamp_ms={} lease_epoch={} last_event_sequence={} response_queue_depth={} scripted_events={} scripted_rejections={} scripted_drops={} scripted_reorders={} normalized_keys={} normalized_buttons={}",
+        "M1.4 TELEMETRY board_timestamp_ms={} lease_epoch={} last_event_sequence={} response_queue_depth={} response_queue_residence_us={} event_processing_us={} total_soc_cpu_us={} scripted_events={} scripted_rejections={} scripted_drops={} scripted_reorders={} normalized_keys={} normalized_buttons={}",
         metrics.board_timestamp_ms,
         metrics.lease_epoch,
         metrics.last_event_sequence,
         metrics.response_queue_depth,
+        metrics.response_queue_residence_us,
+        metrics.event_processing_us,
+        metrics.total_soc_cpu_us,
         metrics.scripted_events,
         metrics.scripted_rejections,
         metrics.scripted_drops,
@@ -2226,20 +2707,33 @@ pub(crate) fn run_signaling_test(
         metrics.normalized_keys,
         metrics.normalized_buttons,
     );
+    let expected_hid_reports = match scenario {
+        "hid-bench" => Some(SCRIPTED_HID_REPORTS),
+        "hid-sustain" => Some(SUSTAIN_HID_REPORTS),
+        "takeover" => Some(8),
+        "cleanup-disconnect" | "cleanup-expiry" | "cleanup-revoke" | "cleanup-restart" => Some(4),
+        // One injected transfer fails; three bounded recovery reports complete.
+        "cleanup-transfer-failure" => Some(3),
+        _ => None,
+    };
     let mut hid_reports = 0;
-    if scenario == "hid-bench" {
+    if let Some(expected) = expected_hid_reports {
         hid_reports = metrics
             .hid_reports
-            .context("missing final bench report count")?
-            .wrapping_sub(initial_hid_reports.context("missing initial bench report count")?);
+            .context("missing final HID report count")?
+            .wrapping_sub(initial_hid_reports.context("missing initial HID report count")?);
         ensure!(
-            hid_reports == SCRIPTED_HID_REPORTS,
-            "expected {SCRIPTED_HID_REPORTS} HID reports, observed {hid_reports}"
+            hid_reports == expected,
+            "expected {expected} HID reports, observed {hid_reports}"
         );
-        ensure!(
-            metrics.state == 0 && metrics.normalized_keys == 0 && metrics.normalized_buttons == 0,
-            "bench left active transport or held input"
-        );
+        if scenario == "hid-bench" {
+            ensure!(
+                metrics.state == 0
+                    && metrics.normalized_keys == 0
+                    && metrics.normalized_buttons == 0,
+                "bench left active transport or held input"
+            );
+        }
     } else {
         ensure!(
             metrics.hid_reports == initial_hid_reports,

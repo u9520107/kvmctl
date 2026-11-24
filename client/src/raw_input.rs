@@ -1,10 +1,12 @@
 use anyhow::{Context, Result, bail, ensure};
+use std::collections::VecDeque;
 use std::io;
 use std::mem::size_of;
 use std::ptr::{null, null_mut};
 use std::sync::mpsc::{self, Receiver, Sender};
+use std::sync::{Arc, Mutex};
 use std::thread::{self, JoinHandle};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 use windows_sys::Win32::Devices::DeviceAndDriverInstallation::{
     CM_Get_Device_IDW, CM_Get_Parent, CR_SUCCESS, HDEVINFO, MAX_DEVICE_ID_LEN,
     SP_DEVICE_INTERFACE_DATA, SP_DEVINFO_DATA, SetupDiCreateDeviceInfoList,
@@ -36,18 +38,82 @@ const WINDOW_CLASS: *const u16 = windows_sys::core::w!("KvmCtlHidBenchWindow");
 
 pub(crate) struct Observer {
     window: usize,
+    focus_required: bool,
     complete: Receiver<()>,
     worker: Option<JoinHandle<Result<Report>>>,
 }
 
+#[derive(Clone)]
+pub(crate) struct SendTiming(Arc<Mutex<VecDeque<SendStamp>>>);
+
+struct SendStamp {
+    started: Instant,
+    finished: Option<Instant>,
+}
+
+impl SendTiming {
+    fn new() -> Self {
+        Self(Arc::new(Mutex::new(VecDeque::new())))
+    }
+
+    pub(crate) fn begin(&self) {
+        self.0.lock().unwrap().push_back(SendStamp {
+            started: Instant::now(),
+            finished: None,
+        });
+    }
+
+    pub(crate) fn finish(&self) {
+        if let Some(stamp) = self.0.lock().unwrap().back_mut() {
+            if stamp.finished.is_none() {
+                stamp.finished = Some(Instant::now());
+            }
+        }
+    }
+
+    fn take(&self) -> Option<SendStamp> {
+        self.0.lock().unwrap().pop_front()
+    }
+}
+
 impl Observer {
-    pub(crate) fn start(vid: u16, pid: u16, serial: &str) -> Result<Self> {
+    pub(crate) fn start_timed(vid: u16, pid: u16, serial: &str) -> Result<(Self, SendTiming)> {
+        let timing = SendTiming::new();
+        let observer = Self::start_mode(vid, pid, serial, 0, false, Some(timing.clone()))?;
+        Ok((observer, timing))
+    }
+
+    pub(crate) fn start_cleanup(vid: u16, pid: u16, serial: &str) -> Result<Self> {
+        Self::start_mode(vid, pid, serial, 4, false, None)
+    }
+
+    pub(crate) fn start_takeover(vid: u16, pid: u16, serial: &str) -> Result<Self> {
+        Self::start_mode(vid, pid, serial, 8, false, None)
+    }
+
+    fn start_mode(
+        vid: u16,
+        pid: u16,
+        serial: &str,
+        expected_events: usize,
+        focus_required: bool,
+        timing: Option<SendTiming>,
+    ) -> Result<Self> {
         let identity = format!("USB\\VID_{vid:04X}&PID_{pid:04X}\\{serial}");
         let (ready_sender, ready) = mpsc::channel();
         let (complete_sender, complete) = mpsc::channel();
         let worker = thread::Builder::new()
             .name("kvmctl-raw-input".into())
-            .spawn(move || observe(&identity, ready_sender, complete_sender))?;
+            .spawn(move || {
+                observe(
+                    &identity,
+                    ready_sender,
+                    complete_sender,
+                    expected_events,
+                    focus_required,
+                    timing.map(|value| value.0),
+                )
+            })?;
         let window = match ready.recv() {
             Ok(window) => window,
             Err(_) => {
@@ -59,6 +125,7 @@ impl Observer {
         };
         Ok(Self {
             window,
+            focus_required,
             complete,
             worker: Some(worker),
         })
@@ -75,10 +142,52 @@ impl Observer {
             "M1.4 RAW INPUT shift=make-break key_a=make-break left_button=down-up vertical={} horizontal={} relative=({},{}) release=true",
             report.vertical, report.horizontal, report.motion.0, report.motion.1,
         );
+        if !report.latencies.is_empty() {
+            let min = report.latencies.iter().map(|(min, _)| *min).min().unwrap();
+            let max = report.latencies.iter().map(|(_, max)| *max).max().unwrap();
+            let uncertainty = report
+                .latencies
+                .iter()
+                .map(|(min, max)| max - min)
+                .max()
+                .unwrap();
+            eprintln!(
+                "M1.4 SAME_HOST_SEND_TO_RAW_INPUT samples={} min_us={} max_us={} uncertainty_us={} clock=Windows_Instant network_one_way=not_measured",
+                report.latencies.len(),
+                min,
+                max,
+                uncertainty
+            );
+        }
+        Ok(())
+    }
+
+    pub(crate) fn verify_takeover(mut self) -> Result<()> {
+        let _ = self.complete.recv_timeout(Duration::from_secs(5));
+        let report = self.stop()?.context("Raw Input observer already stopped")?;
+        ensure!(
+            report.sequence_complete(),
+            "incomplete takeover Raw Input script: {report:?}"
+        );
+        eprintln!("M1.4 RAW INPUT takeover=a-neutral-before-b input=true release=true");
+        Ok(())
+    }
+
+    pub(crate) fn verify_cleanup(mut self, label: &str) -> Result<()> {
+        let _ = self.complete.recv_timeout(Duration::from_secs(5));
+        let report = self.stop()?.context("Raw Input observer already stopped")?;
+        ensure!(
+            report.sequence_complete(),
+            "incomplete {label} Raw Input cleanup: {report:?}"
+        );
+        eprintln!("M1.4 RAW INPUT cleanup={label} neutral=true");
         Ok(())
     }
 
     pub(crate) fn check_focus(&self) -> Result<()> {
+        if !self.focus_required {
+            return Ok(());
+        }
         check_focus(self.window as HWND)
     }
 
@@ -115,7 +224,9 @@ struct Window {
 
 impl Window {
     fn create() -> Result<Self> {
-        let cursor = cursor_position()?;
+        // Cleanup/takeover observers run headlessly; pointer placement is only
+        // a convenience for the interactive scripted HID bench.
+        let cursor = cursor_position().unwrap_or_default();
         let instance = unsafe { GetModuleHandleW(null()) };
         ensure!(
             !instance.is_null(),
@@ -187,18 +298,31 @@ fn register(window: HWND, flags: u32) -> Result<()> {
     Ok(())
 }
 
-fn observe(identity: &str, ready: Sender<usize>, complete: Sender<()>) -> Result<Report> {
+fn observe(
+    identity: &str,
+    ready: Sender<usize>,
+    complete: Sender<()>,
+    expected_events: usize,
+    focus_required: bool,
+    timing: Option<Arc<Mutex<VecDeque<SendStamp>>>>,
+) -> Result<Report> {
     let window = Window::create()?;
     register(window.handle, RIDEV_INPUTSINK | RIDEV_DEVNOTIFY)?;
     let (keyboard, mouse) = board_collections(identity)?;
-    unsafe { SetForegroundWindow(window.handle) };
-    check_focus(window.handle)?;
+    let enforce_focus = focus_required && expected_events == 0;
+    if enforce_focus {
+        unsafe { SetForegroundWindow(window.handle) };
+        wait_for_focus(window.handle)?;
+    }
     eprintln!("M1.4 RAW INPUT device={identity} keyboard=matched mouse=matched");
     ready
         .send(window.handle as usize)
         .context("Raw Input startup receiver closed")?;
     drop(ready);
-    let mut report = Report::default();
+    let mut report = Report {
+        expected_events,
+        ..Default::default()
+    };
     let mut complete = Some(complete);
     let mut message = MSG::default();
     loop {
@@ -218,11 +342,15 @@ fn observe(identity: &str, ready: Sender<usize>, complete: Sender<()>) -> Result
                 );
             }
             WM_INPUT => {
+                let before_events = report.hid_events;
+                let received_at = Instant::now();
                 let result = collect(
                     message.lParam as HRAWINPUT,
                     keyboard,
                     mouse,
                     window.handle,
+                    expected_events,
+                    enforce_focus,
                     &mut report,
                 );
                 // Required for foreground WM_INPUT, including ignored packets.
@@ -235,6 +363,18 @@ fn observe(identity: &str, ready: Sender<usize>, complete: Sender<()>) -> Result
                     )
                 };
                 result?;
+                if report.hid_events > before_events {
+                    if let Some(timing) = &timing {
+                        if let Some(stamp) = SendTiming(timing.clone()).take() {
+                            let started = received_at.saturating_duration_since(stamp.started);
+                            let finished = received_at
+                                .saturating_duration_since(stamp.finished.unwrap_or(stamp.started));
+                            report
+                                .latencies
+                                .push((finished.as_micros(), started.as_micros()));
+                        }
+                    }
+                }
                 if report.complete()
                     && let Some(sender) = complete.take()
                 {
@@ -270,6 +410,21 @@ fn check_focus(window: HWND) -> Result<()> {
         "the pointer is outside the HID bench window"
     );
     Ok(())
+}
+
+fn wait_for_focus(window: HWND) -> Result<()> {
+    let deadline = Instant::now() + Duration::from_secs(3);
+    loop {
+        match check_focus(window) {
+            Ok(()) => return Ok(()),
+            Err(error) if Instant::now() < deadline => {
+                thread::sleep(Duration::from_millis(50));
+                let _ = unsafe { SetForegroundWindow(window) };
+                let _ = error;
+            }
+            Err(error) => return Err(error),
+        }
+    }
 }
 
 struct DeviceInfo(HDEVINFO);
@@ -391,6 +546,8 @@ fn collect(
     keyboard: HANDLE,
     mouse: HANDLE,
     window: HWND,
+    expected_events: usize,
+    enforce_focus: bool,
     report: &mut Report,
 ) -> Result<()> {
     let header_size = size_of::<RAWINPUTHEADER>() as u32;
@@ -412,7 +569,9 @@ fn collect(
     if header.hDevice != keyboard && header.hDevice != mouse {
         return Ok(());
     }
-    check_focus(window)?;
+    if enforce_focus {
+        check_focus(window)?;
+    }
     let mut raw = RAWINPUT::default();
     bytes = size_of::<RAWINPUT>() as u32;
     let read = unsafe {
@@ -434,19 +593,44 @@ fn collect(
     );
     match header.dwType {
         RIM_TYPEKEYBOARD if header.hDevice == keyboard => {
+            report.hid_events += 1;
             let key = unsafe { raw.data.keyboard };
             ensure!(
                 key.Flags as u32 & (RI_KEY_E0 | RI_KEY_E1) == 0,
                 "unexpected extended board key"
             );
             let pressed = key.Flags as u32 & RI_KEY_BREAK == 0;
+            let repeated_make = expected_events != 0
+                && pressed
+                && ((key.MakeCode == 0x2a && report.shift % 2 == 1)
+                    || (key.MakeCode == 0x1e && report.key_a % 2 == 1));
+            if expected_events != 0 && key.MakeCode == 0x1e && !repeated_make {
+                report.takeover_events.push(if pressed {
+                    TakeoverEvent::KeyDown
+                } else {
+                    TakeoverEvent::KeyUp
+                });
+            }
             match key.MakeCode {
-                0x2a => transition(&mut report.shift, pressed, "left Shift"),
-                0x1e => transition(&mut report.key_a, pressed, "A"),
+                0x2a => transition(
+                    &mut report.shift,
+                    pressed,
+                    "left Shift",
+                    if expected_events == 8 { 4 } else { 2 },
+                    expected_events != 0,
+                ),
+                0x1e => transition(
+                    &mut report.key_a,
+                    pressed,
+                    "A",
+                    if expected_events == 8 { 4 } else { 2 },
+                    expected_events != 0,
+                ),
                 _ => bail!("unexpected board key scan code {:#x}", key.MakeCode),
             }
         }
         RIM_TYPEMOUSE if header.hDevice == mouse => {
+            report.hid_events += 1;
             let mouse = unsafe { raw.data.mouse };
             ensure!(
                 mouse.usFlags & MOUSE_MOVE_ABSOLUTE == 0,
@@ -464,7 +648,16 @@ fn collect(
                 "unexpected board mouse flags {flags:#x}",
             );
             if flags & RI_MOUSE_LEFT_BUTTON_DOWN != 0 {
-                transition(&mut report.left_button, true, "left button")?;
+                if expected_events != 0 {
+                    report.takeover_events.push(TakeoverEvent::ButtonDown);
+                }
+                transition(
+                    &mut report.left_button,
+                    true,
+                    "left button",
+                    if expected_events == 8 { 4 } else { 2 },
+                    false,
+                )?;
             }
             let delta = buttons.usButtonData as i16 as i32;
             if flags & RI_MOUSE_WHEEL != 0 {
@@ -490,7 +683,16 @@ fn collect(
                 report.motion = motion;
             }
             if flags & RI_MOUSE_LEFT_BUTTON_UP != 0 {
-                transition(&mut report.left_button, false, "left button")?;
+                if expected_events != 0 {
+                    report.takeover_events.push(TakeoverEvent::ButtonUp);
+                }
+                transition(
+                    &mut report.left_button,
+                    false,
+                    "left button",
+                    if expected_events == 8 { 4 } else { 2 },
+                    false,
+                )?;
             }
             Ok(())
         }
@@ -500,16 +702,23 @@ fn collect(
 
 #[derive(Debug, Default)]
 struct Report {
+    expected_events: usize,
+    takeover_events: Vec<TakeoverEvent>,
     shift: u8,
     key_a: u8,
     left_button: u8,
     vertical: i32,
     horizontal: i32,
     motion: (i32, i32),
+    hid_events: usize,
+    latencies: Vec<(u128, u128)>,
 }
 
 impl Report {
     fn complete(&self) -> bool {
+        if self.expected_events != 0 {
+            return self.sequence_complete();
+        }
         self.shift == 2
             && self.key_a == 2
             && self.left_button == 2
@@ -517,13 +726,78 @@ impl Report {
             && self.horizontal == -(WHEEL_DELTA as i32)
             && self.motion == (12, -4)
     }
+
+    fn sequence_complete(&self) -> bool {
+        if self.expected_events == 4 {
+            return self.takeover_events.len() == 4
+                && self.takeover_events[..2]
+                    == [TakeoverEvent::KeyDown, TakeoverEvent::ButtonDown]
+                && (self.takeover_events[2..] == [TakeoverEvent::KeyUp, TakeoverEvent::ButtonUp]
+                    || self.takeover_events[2..]
+                        == [TakeoverEvent::ButtonUp, TakeoverEvent::KeyUp]);
+        }
+        const EXPECTED: [TakeoverEvent; 8] = [
+            TakeoverEvent::KeyDown,
+            TakeoverEvent::ButtonDown,
+            TakeoverEvent::KeyUp,
+            TakeoverEvent::ButtonUp,
+            TakeoverEvent::KeyDown,
+            TakeoverEvent::ButtonDown,
+            TakeoverEvent::KeyUp,
+            TakeoverEvent::ButtonUp,
+        ];
+        self.takeover_events == EXPECTED[..self.expected_events]
+    }
 }
 
-fn transition(stage: &mut u8, pressed: bool, label: &str) -> Result<()> {
+#[derive(Debug, PartialEq, Eq)]
+enum TakeoverEvent {
+    KeyDown,
+    ButtonDown,
+    KeyUp,
+    ButtonUp,
+}
+
+fn transition(
+    stage: &mut u8,
+    pressed: bool,
+    label: &str,
+    max_stage: u8,
+    allow_repeat_make: bool,
+) -> Result<()> {
+    if allow_repeat_make && *stage < max_stage && *stage % 2 == 1 && pressed {
+        return Ok(());
+    }
     ensure!(
-        matches!((*stage, pressed), (0, true) | (1, false)),
+        *stage < max_stage && pressed == (*stage % 2 == 0),
         "unexpected board {label} transition (stage={stage}, pressed={pressed})",
     );
     *stage += 1;
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::transition;
+
+    #[test]
+    fn cleanup_ignores_repeat_make_but_requires_break() {
+        let mut stage = 0;
+        transition(&mut stage, true, "left Shift", 2, true).unwrap();
+        transition(&mut stage, true, "left Shift", 2, true).unwrap();
+        assert_eq!(stage, 1);
+        transition(&mut stage, false, "left Shift", 2, true).unwrap();
+        assert!(transition(&mut stage, false, "left Shift", 2, true).is_err());
+    }
+
+    #[test]
+    fn takeover_accepts_second_press_after_release() {
+        let mut stage = 0;
+        transition(&mut stage, true, "A", 4, true).unwrap();
+        transition(&mut stage, true, "A", 4, true).unwrap();
+        transition(&mut stage, false, "A", 4, true).unwrap();
+        transition(&mut stage, true, "A", 4, true).unwrap();
+        transition(&mut stage, false, "A", 4, true).unwrap();
+        assert_eq!(stage, 4);
+    }
 }

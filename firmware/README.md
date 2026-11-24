@@ -135,9 +135,10 @@ warning so an identity failure is explicit even though peer state stays
 printed. HID output and physical-input capture stay disabled.
 
 `transport-test` also reports session-local internal/PSRAM heap lows, channel
-opens and received bytes, and `webrtc_peer` worker CPU time from the FreeRTOS
-ESP Timer runtime clock. The CPU value covers that task only, not Wi-Fi or
-other system tasks.
+opens and received bytes, peer-task CPU time, total SoC FreeRTOS runtime,
+maximum board event-processing time, and maximum response-queue residence.
+These CPU and timing values use the ESP Timer runtime clock and are local to
+the measured transport session.
 
 Fixture mode is available only through `transport-test`. These public test
 keys remain on the Windows host and must never be installed on a device or used

@@ -54,6 +54,9 @@ lease_result_t lease_revoke(lease_state_t *lease, const uint8_t *identity,
                             uint64_t now_ms);
 lease_result_t lease_restart(lease_state_t *lease);
 lease_result_t lease_tick(lease_state_t *lease, uint64_t now_ms);
+bool lease_pending_matches(const lease_state_t *lease, const uint8_t *requester);
+void lease_clear_pending(lease_state_t *lease);
+lease_result_t lease_grant_pending(lease_state_t *lease, uint64_t now_ms);
 
 bool lease_can_emit(const lease_state_t *lease, const uint8_t *owner,
                     uint32_t epoch);

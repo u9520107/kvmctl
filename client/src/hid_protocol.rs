@@ -726,15 +726,24 @@ impl LeaseState {
             LeaseResult::Stale
         }
     }
-    pub fn release(&mut self, owner: [u8; 32], epoch: u32, now_ms: u64) -> LeaseResult {
+    pub fn release(&mut self, owner: [u8; 32], epoch: u32, _now_ms: u64) -> LeaseResult {
         if self.owner != Some(owner) || self.epoch != epoch {
             return LeaseResult::Stale;
         }
         self.invalidate();
-        if let Some(pending) = self.pending.take() {
-            self.grant(pending.requester, now_ms);
-        };
         LeaseResult::Released
+    }
+
+    pub fn grant_pending(&mut self, requester_authorized: bool, now_ms: u64) -> LeaseResult {
+        if !requester_authorized {
+            self.pending = None;
+            return LeaseResult::Rejected;
+        }
+        let Some(pending) = self.pending.take() else {
+            return LeaseResult::Rejected;
+        };
+        self.grant(pending.requester, now_ms);
+        LeaseResult::Granted
     }
     pub fn revoke(&mut self, client: [u8; 32]) {
         if self.owner == Some(client) {
@@ -763,17 +772,15 @@ impl LeaseState {
         }
         if now_ms.saturating_sub(self.last_heartbeat_ms.unwrap_or(0)) >= HEARTBEAT_EXPIRY_MS {
             self.invalidate();
-            if let Some(pending) = self.pending.take() {
-                self.grant(pending.requester, now_ms);
-                return LeaseResult::Granted;
-            }
-            return LeaseResult::Expired;
+            return if self.pending.is_some() {
+                LeaseResult::Granted
+            } else {
+                LeaseResult::Expired
+            };
         }
         if let Some(pending) = self.pending.as_ref() {
             if now_ms.saturating_sub(pending.requested_at_ms) >= TAKEOVER_WINDOW_MS {
-                let requester = pending.requester;
                 self.invalidate();
-                self.grant(requester, now_ms);
                 return LeaseResult::Granted;
             }
         }
@@ -840,6 +847,7 @@ mod tests {
         assert_eq!(state.owner, Some(a));
         assert_eq!(state.takeover(a, b, id, 4), LeaseResult::AcceptedPending);
         assert_eq!(state.tick(10_004), LeaseResult::Granted);
+        assert_eq!(state.grant_pending(true, 10_004), LeaseResult::Granted);
         assert_eq!(state.owner, Some(b));
         assert_eq!(state.held, HeldState::default());
     }
@@ -853,6 +861,7 @@ mod tests {
         state.held.buttons = 1;
         state.takeover(a, b, [1; 16], 1);
         assert_eq!(state.tick(3_001), LeaseResult::Granted);
+        assert_eq!(state.grant_pending(true, 3_001), LeaseResult::Granted);
         assert_eq!(state.owner, Some(b));
         assert_eq!(state.held, HeldState::default());
     }
@@ -956,6 +965,7 @@ mod tests {
             LeaseResult::AcceptedPending
         );
         assert_eq!(state.release(enrolled_a, epoch_a, 5), LeaseResult::Released);
+        assert_eq!(state.grant_pending(true, 5), LeaseResult::Granted);
         assert_eq!(state.owner, Some(enrolled_b));
         assert_eq!(state.held, HeldState::default());
 
@@ -967,6 +977,7 @@ mod tests {
             LeaseResult::AcceptedPending
         );
         assert_eq!(state.tick(3_006), LeaseResult::Granted);
+        assert_eq!(state.grant_pending(true, 3_006), LeaseResult::Granted);
         assert_eq!(state.owner, Some(enrolled_a));
         assert_eq!(state.held, HeldState::default());
 
@@ -1003,6 +1014,7 @@ mod tests {
             LeaseResult::Granted
         );
         assert_eq!(state.tick(17_001), LeaseResult::Granted);
+        assert_eq!(state.grant_pending(true, 17_001), LeaseResult::Granted);
         assert_eq!(state.owner, Some(enrolled_b));
         assert_eq!(state.held, HeldState::default());
 
@@ -1025,5 +1037,30 @@ mod tests {
             LeaseResult::Stale
         );
         assert!(epoch_b < state.epoch);
+    }
+
+    #[test]
+    fn pending_requester_race_cannot_grant_after_release_or_expiry() {
+        let a = [1; 32];
+        let b = [2; 32];
+        let mut state = LeaseState::default();
+        assert_eq!(state.request(a, 0), LeaseResult::Granted);
+        let epoch = state.epoch;
+        assert_eq!(
+            state.takeover(a, b, [3; 16], 1),
+            LeaseResult::AcceptedPending
+        );
+        assert_eq!(state.release(a, epoch, 2), LeaseResult::Released);
+        assert_eq!(state.grant_pending(false, 2), LeaseResult::Rejected);
+        assert!(state.owner.is_none() && state.pending.is_none());
+
+        assert_eq!(state.request(a, 3), LeaseResult::Granted);
+        assert_eq!(
+            state.takeover(a, b, [4; 16], 4),
+            LeaseResult::AcceptedPending
+        );
+        assert_eq!(state.tick(3_004), LeaseResult::Granted);
+        assert_eq!(state.grant_pending(false, 3_004), LeaseResult::Rejected);
+        assert!(state.owner.is_none() && state.pending.is_none());
     }
 }

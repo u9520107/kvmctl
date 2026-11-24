@@ -38,6 +38,9 @@ typedef struct {
     uint32_t normalized_keys;
     uint32_t normalized_buttons;
     uint32_t hid_reports;
+    uint32_t total_soc_cpu_us;
+    uint32_t event_processing_us;
+    uint32_t response_queue_residence_us;
     char tls_diagnostic[TRANSPORT_DIAGNOSTIC_CAPACITY];
 } transport_metrics_t;
 

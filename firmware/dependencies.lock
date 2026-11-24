@@ -1,4 +1,24 @@
 dependencies:
+  espressif/esp_libsrtp:
+    dependencies: []
+    source:
+      path: ../../../AppData/Local/Temp/esp-peer-v1.3.0/components/esp_peer/examples/peer_demo/managed_components/espressif__esp_libsrtp
+      type: local
+    version: 1.0.0
+  espressif/esp_peer:
+    dependencies:
+    - name: espressif/esp_libsrtp
+      version: ^1.0.0
+    source:
+      path: ../verification/m0/peer-fingerprint/.vendor/69797030d58208f6ffb720aa6cc0f62a001a534283dd4501dacf5a6f12f823f0/components/esp_peer
+      type: local
+    version: 1.5.3
+  espressif/esp_tinyusb:
+    dependencies: []
+    source:
+      path: ../verification/m0/usb-hid-uart/managed_components/espressif__esp_tinyusb
+      type: local
+    version: 2.4.0
   espressif/led_strip:
     component_hash: 28621486f77229aaf81c71f5e15d6fbf36c2949cf11094e07090593e659e7639
     dependencies:
@@ -9,12 +29,34 @@ dependencies:
       registry_url: https://components.espressif.com/
       type: service
     version: 3.0.3
+  espressif/mdns:
+    component_hash: ef0766474b37459f6ad22461e453a8713e780e831a7c993b16919d817988dff6
+    dependencies:
+    - name: idf
+      require: private
+      version: '>=5.0'
+    source:
+      registry_url: https://components.espressif.com/
+      type: service
+    version: 1.14.1
+  espressif/tinyusb:
+    dependencies: []
+    source:
+      path: ../verification/m0/usb-hid-uart/managed_components/espressif__tinyusb
+      type: local
+    version: 0.21.0~6
   idf:
     source:
       type: idf
     version: 6.1.1
 direct_dependencies:
+- espressif/esp_libsrtp
+- espressif/esp_peer
+- espressif/esp_tinyusb
 - espressif/led_strip
-manifest_hash: 0da90a932eb4083ee007bf3cb8119e4430b83da37e6fe4f31ece8d1447659de6
+- espressif/mdns
+- espressif/tinyusb
+- idf
+manifest_hash: bcabb0da33375daa90daf36def593ceb450d5c2c49c0a49ce0d86644e1a66753
 target: esp32s3
 version: 3.0.0

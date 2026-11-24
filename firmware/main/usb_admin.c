@@ -331,11 +331,7 @@ static size_t encode_transport_status_response(const admin_request_t *request)
     size_t pos;
     transport_metrics_t metrics;
     transport_get_metrics(&metrics);
-#ifdef KVMCTL_HID_BENCH
-    const size_t fields = 23;
-#else
-    const size_t fields = 22;
-#endif
+    const size_t fields = 26;
     if (!begin_response(request, 0, true, &pos) ||
         !put_head(s_response, sizeof(s_response), &pos, 5, fields) ||
         !put_uint(s_response, sizeof(s_response), &pos, 0) || !put_uint(s_response, sizeof(s_response), &pos, metrics.state) ||
@@ -360,10 +356,14 @@ static size_t encode_transport_status_response(const admin_request_t *request)
         !put_uint(s_response, sizeof(s_response), &pos, 19) || !put_uint(s_response, sizeof(s_response), &pos, metrics.scripted_reorders) ||
         !put_uint(s_response, sizeof(s_response), &pos, 20) || !put_uint(s_response, sizeof(s_response), &pos, metrics.normalized_keys) ||
         !put_uint(s_response, sizeof(s_response), &pos, 21) || !put_uint(s_response, sizeof(s_response), &pos, metrics.normalized_buttons)) return 0;
-#ifdef KVMCTL_HID_BENCH
     if (!put_uint(s_response, sizeof(s_response), &pos, 22) ||
-        !put_uint(s_response, sizeof(s_response), &pos, metrics.hid_reports)) return 0;
-#endif
+        !put_uint(s_response, sizeof(s_response), &pos, metrics.hid_reports) ||
+        !put_uint(s_response, sizeof(s_response), &pos, 23) ||
+        !put_uint(s_response, sizeof(s_response), &pos, metrics.total_soc_cpu_us) ||
+        !put_uint(s_response, sizeof(s_response), &pos, 24) ||
+        !put_uint(s_response, sizeof(s_response), &pos, metrics.event_processing_us) ||
+        !put_uint(s_response, sizeof(s_response), &pos, 25) ||
+        !put_uint(s_response, sizeof(s_response), &pos, metrics.response_queue_residence_us)) return 0;
     return pos;
 }
 

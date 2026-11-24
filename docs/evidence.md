@@ -1091,3 +1091,246 @@ on disconnect, heartbeat expiry, takeover, revoke, restart, and USB
 transfer failure was not separately exercised. Sustained load, total SoC
 CPU, and send-to-HID timing remain unmeasured. Firmware images and verified
 factory-app backups are in ignored build and backup directories.
+
+### M1.4 closure attempt: cleanup-gated ownership and bench extensions (2026-11-24)
+
+Implementation revision is `c8170bb677e5f5c891e6044deca44d8258196938` plus the
+uncommitted working-tree changes listed below. No new firmware image was built
+or flashed in this run, so no new image SHA-256 is claimed. The last verified
+Board 2 HID image remains `346b273a211f99b0e55af204211891cd603b5d0906d61cd8ca43e875cb0d4f4d`
+(1,240,608 bytes); it predates the cleanup-gating patch and cannot serve as
+M1.4 closure evidence for the new firmware.
+
+Code changes:
+
+- `firmware/main/lease.c` and `firmware/main/transport.c` invalidate the old
+  lease before cleanup, defer pending grants until cleanup completes, reject
+  pending peers that are not active, authorized, enrolled, and open, and keep
+  new lease requests busy during unresolved cleanup.
+- `firmware/hid_bench/hid_bench.c` bounds each report transfer at 100 ms,
+  bounds cleanup at 250 ms with two neutral attempts, and latches unresolved
+  failure as disarmed. `KVMCTL_HID_BENCH_FAIL_TRANSFER_ONCE=1` provides a
+  deterministic transfer-failure regression image.
+- `client/src/transport.rs` adds `cleanup-disconnect`, `cleanup-expiry`,
+  `cleanup-revoke`, and `cleanup-transfer-failure` scenarios. The HID takeover
+  path arms A and B, waits for two A neutral reports before accepting B's grant,
+  then verifies B input and final neutral reports. `client/src/raw_input.rs`
+  continues filtering by the exact USB VID/PID/serial parent.
+
+Permitted checks passed from the current worktree:
+
+```powershell
+cargo test --workspace --offline                 # 42 passed
+cargo fmt --all -- --check                       # passed after formatting
+python firmware/test_m14_cleanup_guards.py       # passed
+git diff --check                                 # passed
+```
+
+Existing C guard checks could not run here: neither `cc` nor `clang` is on the
+native PATH. `wsl.exe -l -q` returned `Wsl/EnumerateDistros/Service/E_ACCESSDENIED`,
+so the pinned ESP-IDF build could not run. Read-only PnP inventory did confirm
+COM6 and the expected HID parent `USB\VID_303A&PID_4004\e299faff8cb8d99166647efa`.
+`cargo run --offline -p kvmctl -- status COM6` succeeded and reported Board 2
+firmware `5d123b1-dirty`, Wi-Fi connected, and the same endpoint fingerprint.
+The first native-profile signaling attempt stopped before transport because the
+sandboxed process could not use the enrolled DPAPI credential:
+
+```text
+cargo run --offline -p kvmctl -- signaling-test COM6 scripted 192.168.50.137
+kvmctl: Windows DPAPI operation failed; run `cargo run --offline -p kvmctl -- enroll COM6` first
+```
+
+No live physical-input capture was enabled by this run. No new Board 2 cleanup
+result is therefore recorded. M1.4 remains open.
+
+Native Windows profile commands required for closure, after building and
+flashing a new image, are:
+
+```powershell
+cargo run --offline -p kvmctl -- enroll COM6
+cargo run --offline -p kvmctl -- enroll COM6 takeover
+cargo run --offline -p kvmctl -- signaling-test COM6 hid-bench 192.168.50.137
+cargo run --offline -p kvmctl -- signaling-test COM6 takeover 192.168.50.137
+cargo run --offline -p kvmctl -- signaling-test COM6 cleanup-disconnect 192.168.50.137
+cargo run --offline -p kvmctl -- signaling-test COM6 cleanup-expiry 192.168.50.137
+cargo run --offline -p kvmctl -- signaling-test COM6 cleanup-revoke 192.168.50.137
+cargo run --offline -p kvmctl -- signaling-test COM6 cleanup-transfer-failure 192.168.50.137
+cargo run --offline -p kvmctl -- transport-test COM6
+cargo run --offline -p kvmctl -- signaling-test COM6 scripted 192.168.50.137
+cargo run --offline -p kvmctl -- signaling-test COM6 takeover-zero 192.168.50.137
+```
+
+Capture for each physical cleanup command: image SHA-256, selected HID parent,
+Raw Input event sequence, HID report-count delta, cleanup elapsed time,
+`state=0`, held keys/buttons `0/0`, response queue `0`, and zero parser,
+drop, or reorder errors. `hid-bench` and `takeover` must show A neutral reports
+before B's grant and B input afterward. The three zero-HID repeats must show
+`hid_reports` unchanged from the pre-run count. Flash/reset the same image,
+then repeat the cleanup suite after endpoint restart. For transfer failure,
+build with `KVMCTL_HID_BENCH=1 KVMCTL_HID_BENCH_FAIL_TRANSFER_ONCE=1`, run
+`cleanup-transfer-failure`, and capture failure, disarmed state, zero grant,
+and recovery after reinstalling the normal image.
+
+Integrated baseline still missing: final image size/hash, TLS/WSS/DataChannel
+setup and reconnect on this revision, internal-heap and PSRAM minima on this
+revision, total SoC CPU, sustained HID-path traffic, board-local processing and
+queue time, RTT under repeat load, and same-host send-to-HID latency. Any
+one-way result must include clock mapping and uncertainty; existing RTT values
+are round-trip only. These gaps block M1.4 closure.
+
+### M1.4 Board 2 closure-gate results (2026-11-24)
+
+The tested revision is `c8170bb677e5f5c891e6044deca44d8258196938` plus the
+uncommitted working tree. Board 2 was on COM6, endpoint
+`kvmctl-e299faff8cb8d991.local`, manual IPv4 `192.168.50.137`, and the exact
+Raw Input parent was
+`USB\VID_303A&PID_4004\e299faff8cb8d99166647efa`. Physical-input capture stayed
+off in every run.
+
+The normal HID image is 1,290,608 bytes,
+SHA-256 `f5e97d6e35cb3257a1481a5033149c7be157bc1f4f729b114dff23a4b8040cd6`.
+The deterministic fail-once image is 1,290,656 bytes,
+SHA-256 `5334a0a5df047a48db878236882b1f702149498ed246b2eb6862cabd56546a35`.
+The normal image was restored before the final endpoint and zero-HID runs.
+Final `cargo run --offline -p kvmctl -- status COM6` reported firmware
+`c8170bb-dirty`, Wi-Fi connected, and the same endpoint identity.
+The build/flash and bench commands were:
+
+```powershell
+.\firmware\build-m14-hid.ps1
+certutil -hashfile .\firmware\build\kvmctl_firmware.bin SHA256
+cargo run --offline -p kvmctl -- flash COM6 .\firmware\build\kvmctl_firmware.bin .\firmware\backups\before-m14-COM6-20261124.bin
+cargo run --offline -p kvmctl -- enroll COM6
+cargo run --offline -p kvmctl -- enroll COM6 takeover
+cargo run --offline -p kvmctl -- signaling-test COM6 hid-bench 192.168.50.137
+cargo run --offline -p kvmctl -- signaling-test COM6 takeover 192.168.50.137
+cargo run --offline -p kvmctl -- signaling-test COM6 cleanup-disconnect 192.168.50.137
+cargo run --offline -p kvmctl -- signaling-test COM6 cleanup-expiry 192.168.50.137
+cargo run --offline -p kvmctl -- signaling-test COM6 cleanup-revoke 192.168.50.137
+cargo run --offline -p kvmctl -- signaling-test COM6 cleanup-restart 192.168.50.137
+cargo run --offline -p kvmctl -- signaling-test COM6 cleanup-transfer-failure 192.168.50.137
+cargo run --offline -p kvmctl -- transport-test COM6
+cargo run --offline -p kvmctl -- signaling-test COM6 scripted 192.168.50.137
+cargo run --offline -p kvmctl -- signaling-test COM6 takeover-zero 192.168.50.137
+```
+
+For the fail-once image, the same build was run with
+`$env:KVMCTL_HID_BENCH_FAIL_TRANSFER_ONCE='1'`; after that bench, the normal
+image was written directly with `esptool` at `0x10000` and Board 2 was reset.
+
+Observed physical cleanup gates:
+
+| Path | Raw Input / release result | HID delta | Final board result |
+| --- | --- | ---: | --- |
+| Disconnect | `cleanup=disconnect neutral=true` | 4 | `state=0`, held `0/0`, queue `0` |
+| Heartbeat expiry | `cleanup=heartbeat-expiry neutral=true` after the 3,500 ms wait | 4 | `state=0`, held `0/0`, queue `0` |
+| USB revoke | `cleanup=usb-revoke neutral=true` | 4 | `state=0`, held `0/0`, queue `0` |
+| Endpoint restart | `cleanup=endpoint-restart neutral=true` | 4 | `state=0`, held `0/0`, queue `0` |
+| USB transfer failure | bounded fail-once recovery, no observer capture | 3 | `state=0`, held `0/0`, queue `0`; input disarmed |
+
+The transfer-failure result is intentionally three completed recovery reports:
+one report was injected as failed, then bounded neutral cleanup completed. No
+grant occurred during unresolved cleanup. The source guard check passed:
+
+```text
+python firmware/test_m14_cleanup_guards.py
+M1.4 cleanup ordering and transfer-failure guards passed
+```
+
+The physical takeover run used two enrolled identities on one board. A held
+one key and one button; B received the explicit rejection, then a second
+pending request. The 10-second no-response window elapsed in 10,278 ms. Raw
+Input observed `A-neutral-reports=2 before=B-grant`; B then produced accepted
+input; final HID delta was 8 and both sessions ended idle at epoch 28. The
+corresponding zero-HID repeat ended idle at epoch 17 with `hid_reports=0`.
+
+The zero-HID repeats on the restored normal image all passed: `transport-test`
+opened two sessions and reconnected cleanly with `hid_reports=0`; `scripted`
+reported `hid_reports=0`, control RTT 14,752–30,275 microseconds and motion
+RTT 16,148–37,062 microseconds; `takeover-zero` reported `hid_reports=0`,
+two intentional stale-input drops, and no parser rejections or reorders.
+
+Resource and setup samples from this image included internal heap
+194,383/133,651/167,895 bytes and PSRAM 8,292,172/7,851,436/8,292,172 bytes
+for scripted signaling, and internal heap 198,195/137,923/173,315 bytes and
+PSRAM 8,338,828/7,901,120/8,338,828 bytes for the two-session transport test.
+The scripted DTLS opens took 3,890 ms; pinned WSS, endpoint transcript,
+client proof, and DTLS identity checks passed. The transport repeat reported
+peer-task CPU samples of 970,300 and 970,331 microseconds. HID-path traffic
+was 783 application bytes for the finite scripted HID bench and 943 bytes for
+the physical takeover run; cleanup paths each received 137 bytes.
+
+Closure decision: the ownership, ordering, race, cleanup, transfer-failure,
+physical Raw Input, two-identity, and zero-HID gates pass on the tested images.
+M1.4 remains open because the integrated baseline is not complete. Existing
+telemetry does not record total SoC CPU, sustained HID-path traffic over a
+defined repeat interval, board-local processing time or queue residence time,
+or same-host send-to-HID latency with clock mapping and uncertainty. RTT is
+available and recorded above, but it does not substitute for those one-way
+measurements. No one-way timing claim is made.
+
+### M1.4 integrated closure rerun (2026-11-24)
+
+The telemetry implementation appends transport-status keys `23` through `25`:
+total SoC CPU delta, maximum board-local event-processing time, and maximum
+response-queue residence time. Rust remains backward-compatible with result
+sizes `12`, `22`, and `23`, and accepts the new 26-field response. The timed
+Raw Input observer uses the Windows `Instant` clock and reports a send-call
+interval plus uncertainty; it explicitly does not claim one-way network time.
+
+The online ESP-IDF v6.1.1 build completed after the cached-tool failure. The
+normal image was flashed, tested, restored after the HID image, and verified:
+
+| image | bytes | SHA-256 | use |
+| --- | ---: | --- | --- |
+| normal | 1,259,840 | `8dd949a85fd8512db9b7f24c3269f402068ce527cb798551f6c3099c38f6de2b` | final restored image |
+| HID bench | 1,291,520 | `aa007db2a05ac31c8422cd86dc85706db1bce621dffd7cbf3dd374ffbba9dae7` | physical HID evidence |
+
+Both were built from `c8170bb677e5f5c891e6044deca44d8258196938` with the
+working tree dirty. Board 2 was COM6, IPv4 `192.168.50.137`, with physical
+input capture off throughout.
+
+The integrated results on the HID image were:
+
+- `hid-bench`: secure DTLS/WebRTC path authorized; 7 HID reports; Raw Input
+  matched the expected keyboard, button, wheel, motion, and release sequence.
+  Same-host send-to-Raw-Input intervals were 43,261--103,094 microseconds
+  across 4 samples, with 78 microseconds measured uncertainty. The clock was
+  `Windows_Instant`; `network_one_way=not_measured`.
+- `hid-sustain`: 100 repeats over 10,000 ms, 500 scripted events, 502 HID
+  reports, zero scripted rejections/drops/reorders, and final normalized
+  key/button state zero. The 502 count is expected: each repeat splits the
+  two-axis wheel into two HID reports, followed by two neutral cleanup reports.
+  Peak integrated telemetry: total SoC CPU `19,180,309` microseconds, event
+  processing `2,334` microseconds, response-queue residence `205,162`
+  microseconds; internal heap `194,411/133,643/169,855` bytes and PSRAM
+  `8,292,172/7,852,736/8,292,172` bytes (start/minimum/after).
+- The finite HID run reported total SoC CPU `5,396,174` microseconds, event
+  processing `279` microseconds, response-queue residence `204,809`
+  microseconds, and internal heap `194,387/132,011/167,939` bytes.
+
+Final-image regression gates were already rerun on the same normal image hash
+before the HID image was flashed: transport reconnect completed cleanly;
+scripted signaling and takeover-zero completed with zero HID reports; and the
+source guard plus 44 Rust tests passed. After the HID run, the normal image was
+flashed again with full app backup/write/verify and the board reported Wi-Fi
+connected and the expected identity and TLS pin.
+
+Commands and checks:
+
+```powershell
+cargo fmt --all -- --check
+cargo test --workspace --offline                 # 44 passed
+python firmware/test_m14_cleanup_guards.py      # passed
+cargo run --offline -p kvmctl -- signaling-test COM6 hid-bench 192.168.50.137
+cargo run --offline -p kvmctl -- signaling-test COM6 hid-sustain 192.168.50.137
+cargo run --offline -p kvmctl -- transport-test COM6
+cargo run --offline -p kvmctl -- signaling-test COM6 scripted 192.168.50.137
+cargo run --offline -p kvmctl -- signaling-test COM6 takeover-zero 192.168.50.137
+```
+
+Closure decision: M1.4 is closed for the defined acceptance fields. The
+cleanup deadlines and repeat interval are justified by the passing integrated
+baseline above; physical-input capture remains disabled by policy. No
+standalone Windows executable was built or delivered. All working-tree changes
+remain uncommitted.
