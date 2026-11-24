@@ -1269,6 +1269,227 @@ or same-host send-to-HID latency with clock mapping and uncertainty. RTT is
 available and recorded above, but it does not substitute for those one-way
 measurements. No one-way timing claim is made.
 
+### M1.5 recovery implementation record (2026-11-24)
+
+Implementation is present in the uncommitted working tree on local `main` at
+baseline `0947601` plus the M1.5 changes. Native Windows firmware compilation
+passes. App-only flash, reboot preservation, short-hold cancellation, factory
+reset, fresh-identity bring-up, USB enrollment, and explicit key recovery were
+exercised on COM6. Physical-input capture remains disabled.
+
+Implemented behavior:
+
+- `firmware/main/recovery.c` watches active-low BOOT GPIO0 while the app runs.
+  It requires a continuous 10,000 ms hold, cancels timing on release, erases
+  `kvmctl_wifi`, `kvmctl_id`, `kvmctl_auth`, and `kvmctl_cfg`, then restarts.
+  `RST` has no application erase path and remains reboot-only.
+- `client/src/main.rs` adds direct USB `recover COMx`. It prints the selected
+  endpoint identity/TLS pin and enrolled-client count, requires explicit
+  confirmation, replaces the local DPAPI client key, enrolls it over USB, and
+  prints the new client fingerprint plus post-enrollment identity/TLS pin.
+- Existing `status`, `clients`, `enroll`, and app-only `flash` flows remain the
+  verification and rollback path. The flash flow never writes bootloader,
+  partition table, NVS, PHY, or VFS.
+
+Local checks run:
+
+```powershell
+python .\firmware\test_m15_recovery_guards.py
+cargo fmt --all -- --check
+cargo test --workspace --offline
+git diff --check
+```
+
+Native Windows firmware build:
+
+```powershell
+$env:PYTHONUTF8 = '1'
+powershell.exe -NoProfile -ExecutionPolicy Bypass -File .\firmware\build-transport.ps1 -WebrtcSource "$env:TEMP\esp-peer-v1.3.0-clean"
+certutil -hashfile .\firmware\build\kvmctl_firmware.bin SHA256
+```
+
+Observed baseline result: ESP-IDF `v6.1.1`, esptool `v5.6.0`, target `esp32s3`,
+patched-peer tree `69797030d58208f6ffb720aa6cc0f62a001a534283dd4501dacf5a6f12f823f0`,
+image `firmware/build/kvmctl_firmware.bin`, 1,265,616 bytes (`0x134fd0`),
+SHA-256 `85ccb0e8768d23aa41094e8987049ab99f74b1b896c258b464ea10bd3d48fef5`.
+The first dependency-resolution attempt required the ESP Component Registry;
+the completed build used the native Windows PowerShell toolchain.
+
+M1.5 app-only flash and post-reset bring-up (2026-11-24):
+
+```powershell
+cargo run --locked -p kvmctl -- ports
+cargo run --locked -p kvmctl -- flash COM6 .\firmware\build\kvmctl_firmware.bin .\firmware\backups\m15-preflash-COM6-20261124.bin
+cargo run --locked -p kvmctl -- status COM6
+cargo run --locked -p kvmctl -- clients COM6
+```
+
+The detected board was `USB-Enhanced-SERIAL CH343 (COM6)`, ESP32-S3 QFN56
+revision 0.2, 16 MB flash, 8 MB PSRAM, MAC
+`7c:4f:ad:bc:c5:4c`. The live partition table selected the factory app at
+`0x10000` with size `0x1f0000` (2,031,616 bytes). The verified backup is
+`firmware/backups/m15-preflash-COM6-20261124.bin`, 2,031,616 bytes, SHA-256
+`77abc3b9cd3c06be88e59f21395396a6483f6e031d28d15fcbef3cf3f6cd7b37`.
+Only the factory app was written; bootloader, partition table, NVS, PHY, and
+VFS were not written. The new 1,265,616-byte image was verified by esptool
+digest and the board was hard-reset via RTS.
+
+Post-reset USB status reported Wi-Fi connected, identity
+`e299faff8cb8d99166647efa72a1a2354a4b5271c8f3369e70ef584088926fe0`, TLS SPKI
+SHA-256 `de97023d354e8a2bb7daa7d0ebd5fac8625fa5710cc9a6b27256c0e9e55ff56d`,
+and RGB LED supported/off at 10% `#222222`. `clients COM6` listed four enrolled
+fingerprints, including the two M1.3 fixture clients. RST-only preservation,
+including a follow-up RTS hard-reset check, preserved identity, TLS pin, Wi-Fi,
+LED settings, and all four enrolled fingerprints. This passes the reboot-only
+preservation check; the initial check used RTS because the physical button had
+not yet been actuated.
+The corrected-image recovery results below supersede the first-image status
+failure.
+
+Short BOOT hold verification (2026-11-24): the user held BOOT for
+approximately 5 seconds and released it. Follow-up `status COM6` reported the
+same Wi-Fi state, identity, TLS pin, and LED settings; `clients COM6` listed the
+same four fingerprints. No reset or state change was observed.
+
+Physical RST verification (2026-11-24): the user actuated the board's RST
+button. Windows briefly reported a USB re-enumeration warning, then COM6
+returned; `status COM6` and `clients COM6` showed the same Wi-Fi, identity, TLS
+pin, LED settings, and authorized client. This confirms RST is reboot-only and
+does not erase managed state.
+
+Factory-reset verification and correction (2026-11-24): the user approved the
+destructive test and held BOOT continuously for 10 seconds. The first M1.5
+image erased the four managed namespaces, but fresh-boot status initially
+failed because the application opened HTTPS sockets before initializing lwIP
+when Wi-Fi credentials were absent. UART captured repeated
+`tcpip_send_msg_wait_sem ... Invalid mbox` assertions and software resets.
+The backtrace resolved to `signaling_init`/`httpd_ssl_start`, not BOOT timing or
+storage erase.
+
+`firmware/main/wifi_setup.c` now initializes the netif/event-loop/Wi-Fi stack
+even when `kvmctl_wifi` is absent, without starting a connection. The rebuilt
+native Windows image is 1,265,648 bytes (`0x134ff0`), SHA-256
+`5f9d2734bde46f415b9d7724953c84f21e8b17aa2eabfe14bdc8de2321dc4dc8`.
+It was flashed app-only with the same live partition checks. The second
+verified backup of the boot-loop image is
+`firmware/backups/m15-bootloop-app-COM6-20261124.bin`, 2,031,616 bytes, SHA-256
+`a23b0242a13905145d981f2a0ae30b1cfcbbd4789f87313916346773674ff1d8`.
+
+The corrected image booted cleanly. USB status reported Wi-Fi `unconfigured`,
+fresh identity
+`e145e029a9e55c19aef9df09d59c0d2c31b8fd32e42d884a940fce35fdb543f`, fresh TLS
+SPKI pin `24ed2c3f35447b69ab7e12887392815ea1d11bae5fe80e4239aa8f031273d8b6`,
+and LED defaults `off`, 25%, `#FFFFFF`. `clients COM6` returned `No clients
+enrolled`, so all four pre-reset fingerprints were absent.
+
+Using isolated DPAPI profile `%TEMP%\\kvmctl-m15-profile` because the sandbox
+cannot use the normal user profile, explicit USB enrollment succeeded with
+client `f9618f7d9f706da3343a4999b9dd7e62c744671ba3f4fa91930cf43210a0805e`.
+The explicit `recover COM6` confirmation then replaced the local key and
+enrolled client
+`57b88ebfdb2d5e72af963d1d7491fd0788d6da0d02045d9059a59b473b2bd6f2`, while
+identity and TLS pin remained unchanged. The old re-enrolled client remains
+listed until explicitly revoked; it was then revoked over USB, leaving only the
+recovered client. This was intentional USB administration state, not a
+factory-reset survivor. LAN stale-client rejection was exercised below with a
+deliberately revoked client key.
+
+Native USB HID descriptor verification and restore (2026-11-24): the M1.5 HID
+bench image was built from the complete online ESP-IDF `v6.1.1` tree at
+`%TEMP%\kvmctl-esp-idf-v6.1.1-online`; the cached M0 tree lacked
+`gen_crt_bundle.py`. The native Windows build produced
+`firmware/build-hid-m15-final/kvmctl_firmware.bin`, 1,297,216 bytes, SHA-256
+`87f5f6be51ad734a042285f9bfc6cc4e6e676bd89f2bbe967ca265f959b0da84`.
+The helper temporarily removed the stale dependency lock so the hardened peer
+override resolved, then restored it. No bootloader or partition-table write was
+used.
+
+The HID image was flashed app-only after an approved backup. The saved current
+app was `firmware/backups/m15-before-hid-bench-COM6-20261124.bin`, 2,031,616
+bytes, SHA-256
+`6301b55b25d8ea74dcd6a6bd4f84903f250a06cb8cd33a5b88fbe00c81c81c6f`.
+USB status remained Wi-Fi connected with identity `e145…543f`, TLS pin
+`24ed…d8b6`, and LED on at 37% `#123456`.
+
+Windows PnP verified the native descriptor directly when the native USB cable
+was connected to a root USB port: parent `USB\VID_303A&PID_4004` was started,
+with started children `Col01` `HID Keyboard Device` and `Col02`
+`HID-compliant mouse`. No physical-input capture or HID reports were enabled.
+Behind dock hub `USB\VID_2188&PID_0617`, the same parent received Problem Code
+10 and exposed no child collections; this is a separate dock-topology finding,
+not a descriptor failure.
+
+The normal M1.5 image was then restored app-only and verified. The restore
+backup was `firmware/backups/m15-before-normal-restore-COM6-20261124.bin`,
+2,031,616 bytes, SHA-256
+`288ee22ca9c42cd17495f381373e46b5ac483c92440935350134fb7e7869a57e`.
+The restored image was `firmware/build/kvmctl_firmware-m15-normal-preserved.bin`,
+1,265,648 bytes, SHA-256
+`5f9d2734bde46f415b9d7724953c84f21e8b17aa2eabfe14bdc8de2321dc4dc8`.
+Final status reported Wi-Fi connected, identity
+`e145e029a9e55c19aef9df09d59c0d2c31b8fd32e42d884a940fce35fdb543f`, TLS pin
+`24ed2c3f35447b69ab7e12887392815ea1d11bae5fe80e4239aa8f031273d8b6`, and LED
+on at 37% `#123456`; `clients COM6` listed only the recovered client
+`57b88ebfdb2d5e72af963d1d7491fd0788d6da0d02045d9059a59b473b2bd6f2`.
+
+LAN stale-client rejection (2026-11-24): the existing `revoke-active` scenario
+was run with disposable elevated-profile client
+`fb4125df026e752d59280ecd162db9936a969abcd63bfbcaa3a643d87efdabb6`. It
+completed an authenticated WSS/WebRTC session, revoked that client over USB,
+closed the active session, and retried with the same old private key. The
+reconnect was rejected as `unauthorized`; the command exited successfully with
+`M1.3 REVOCATION usb_revoke=active_session_closed reconnect=unauthorized` and
+`physical_input_capture=off`. The board was left with only replacement client
+`480fd3dd9d809734341c0122754d76b0bfa9d1a562e0cfcf720d58973318775a` enrolled.
+This verifies that a client using stale credentials cannot reopen a LAN session
+after revocation. The test used the already-connected Wi-Fi association; no
+separate credential re-entry cycle was needed for the stale-key assertion.
+The exact LAN command was:
+
+```powershell
+$env:LOCALAPPDATA = "$env:TEMP\kvmctl-m15-elevated-profile"
+cargo run --locked -p kvmctl -- signaling-test COM6 revoke-active 192.168.50.137
+```
+
+Final M1.5 gate record:
+
+```text
+Revision: local `main` `0947601` plus uncommitted M1.5 changes
+Firmware image path / bytes / SHA-256: `firmware/build/kvmctl_firmware-m15-normal-preserved.bin`,
+1,265,648, `5f9d2734bde46f415b9d7724953c84f21e8b17aa2eabfe14bdc8de2321dc4dc8`
+ESP-IDF / esptool versions: `v6.1.1` / `v5.6.0`
+Board / COM port / detected chip / flash / PSRAM: CH343 / COM6 / ESP32-S3 rev
+0.2 / 16 MB / 8 MB
+Partition table and factory-app range: `0x10000..0x20ffff`, `0x1f0000` bytes
+Destructive-operation approval and exact scope: user approved app-only flash and
+10-second BOOT factory reset; no bootloader or partition-table write
+Verified app backup path / bytes / SHA-256: `firmware/backups/m15-before-normal-restore-COM6-20261124.bin`,
+2,031,616, `288ee22ca9c42cd17495f381373e46b5ac483c92440935350134fb7e7869a57e`
+
+Seeded status: Wi-Fi connected, LED `off`/10%/`#222222`, identity `e299…26fe0`,
+TLS pin `de9702…ff56d`, four enrolled clients.
+RST-only result: status and all four clients preserved after RTS hard reset and
+physical RST actuation.
+Short BOOT-hold result: approximately 5 seconds preserved all state; no reset.
+10-second BOOT result: all four namespaces erased; fresh identity/TLS pin,
+Wi-Fi unconfigured, LED defaults, and empty USB client list observed.
+USB re-enrollment result: client `f961…0805e` enrolled successfully.
+Lost-key result: explicit `recover COM6` authorization enrolled `57b8…f2bd6`.
+Detected-capability bring-up / fresh-identity fixture result: COM6 capabilities
+detected and corrected image booted cleanly. Direct native HID descriptor gate:
+passed on root USB port; dock-topology code-10 finding recorded separately.
+LAN stale-client rejection with the old revoked credential: passed; final
+enrolled client was `480f…8775`.
+```
+
+Board 2's bootloader SHA mismatch remains a separate device finding. Existing
+read-only evidence records calculated SHA
+`cbd95a816bf0b42be96621cc70ea54ca844ad51f007c6baddbfea1444d8f0913`, stored
+SHA `48304bcd6dd6bd250bc1ad011a0549e9b13e819f8aa98e34f1df27c016a39ae9`, and
+bootregion snapshot SHA
+`a16c10210c2d08d89c8b8e0867aa8b38924723de9053813e32adfabba2fe107c`.
+No bootloader write is authorized by this record.
+
 ### M1.4 integrated closure rerun (2026-11-24)
 
 The telemetry implementation appends transport-status keys `23` through `25`:

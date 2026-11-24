@@ -1627,7 +1627,7 @@ fn run() -> Result<(), String> {
     let command = args.first().map(String::as_str).unwrap_or("status");
     if command == "--help" || command == "-h" {
         println!(
-            "kvmctl [status [COMx] | wifi [COMx] | enroll [COMx] [takeover] | clients [COMx] | revoke [COMx] <fingerprint|all> | discover [COMx] | signaling-test [COMx] [scenario [IPv4] | IPv4] | led [COMx] on|off <brightness> <RRGGBB> | transport-test [COMx] | flash [COMx] <firmware.bin> <backup.bin> | ports]; scripted and takeover scenarios use zero HID output; cleanup-* scenarios verify physical release"
+            "kvmctl [status [COMx] | wifi [COMx] | enroll [COMx] [takeover] | recover [COMx] | clients [COMx] | revoke [COMx] <fingerprint|all> | discover [COMx] | signaling-test [COMx] [scenario [IPv4] | IPv4] | led [COMx] on|off <brightness> <RRGGBB> | transport-test [COMx] | flash [COMx] <firmware.bin> <backup.bin> | ports]; recover explicitly replaces this user's client key and enrolls it over direct USB; scripted and takeover scenarios use zero HID output"
         );
         return Ok(());
     }
@@ -1672,6 +1672,7 @@ fn run() -> Result<(), String> {
         "status"
             | "wifi"
             | "enroll"
+            | "recover"
             | "clients"
             | "revoke"
             | "discover"
@@ -1687,7 +1688,7 @@ fn run() -> Result<(), String> {
     }
     if matches!(
         command,
-        "status" | "wifi" | "clients" | "discover" | "transport-test"
+        "status" | "wifi" | "recover" | "clients" | "discover" | "transport-test"
     ) && !params.is_empty()
     {
         return Err("this command takes only an optional COM port".into());
@@ -1949,6 +1950,52 @@ fn run() -> Result<(), String> {
             )?;
             println!("Remembered last-known IPv4 {address}.");
         }
+        return Ok(());
+    }
+    if command == "recover" {
+        let before = port.status()?;
+        serial::remember_board(&selected, &before.identity_fingerprint);
+        let enrolled = port.list_clients()?;
+        println!(
+            "Direct USB recovery target: identity={} TLS pin={} enrolled_clients={}",
+            hex(&before.identity_fingerprint),
+            hex(&before.tls_spki_hash),
+            enrolled.len()
+        );
+        print!("Authorize replacement of this user's local key and USB enrollment (yes/no)? ");
+        io::stdout().flush().map_err(|error| error.to_string())?;
+        let mut answer = String::new();
+        io::stdin()
+            .read_line(&mut answer)
+            .map_err(|error| error.to_string())?;
+        if !answer.trim().eq_ignore_ascii_case("yes") {
+            return Err("USB recovery cancelled; board and local key were not changed".into());
+        }
+        let credential = credentials::ClientCredential::generate()?;
+        let enrolled_fingerprint = port.enroll_client(&credential.spki)?;
+        if enrolled_fingerprint != credential.fingerprint {
+            let _ = port.revoke_client(&enrolled_fingerprint);
+            return Err("device returned a different recovery client fingerprint".into());
+        }
+        if let Err(error) = credential.install_replacement(false) {
+            let rollback = port.revoke_client(&enrolled_fingerprint);
+            return Err(match rollback {
+                Ok(()) => {
+                    format!("USB recovery key save failed; new enrollment rolled back: {error}")
+                }
+                Err(rollback_error) => format!(
+                    "USB recovery key save failed ({error}); new enrollment rollback failed ({rollback_error})"
+                ),
+            });
+        }
+        let after = port.status()?;
+        serial::remember_board(&selected, &after.identity_fingerprint);
+        println!(
+            "USB recovery complete: new client={} identity={} TLS pin={}.",
+            hex(&enrolled_fingerprint),
+            hex(&after.identity_fingerprint),
+            hex(&after.tls_spki_hash)
+        );
         return Ok(());
     }
     if command == "transport-test" {

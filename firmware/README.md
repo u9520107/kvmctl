@@ -3,68 +3,52 @@
 First product firmware increment clears the onboard addressable RGB LED at the
 start of `app_main`; it has no startup animation and defaults to off.
 
-## WSL build
+## Windows build (primary)
 
-Install native ESP-IDF 6.1.1 for `esp32s3` using the
-[Espressif Linux setup guide](https://docs.espressif.com/projects/esp-idf/en/v6.1.1/esp32s3/get-started/linux-setup.html).
-For the Git-based setup, run the following once in WSL:
+Build from the repository root in Windows PowerShell. Install ESP-IDF 6.1.1
+for `esp32s3` with Espressif Installation Manager, including CMake, Ninja, and
+the ESP-IDF Python environment. The repository build script loads the installed
+profile from `C:\Espressif\tools\Microsoft.v6.1.1.PowerShell_profile.ps1`.
 
-```sh
-mkdir -p ~/esp
-git clone --branch v6.1.1 --depth 1 --recurse-submodules --shallow-submodules \
-    https://github.com/espressif/esp-idf.git ~/esp/esp-idf-v6.1.1
-~/esp/esp-idf-v6.1.1/install.sh esp32s3
-git clone --branch v1.3.0 --depth 1 \
-    https://github.com/espressif/esp-webrtc-solution.git ~/esp/esp-webrtc-v1.3.0
+The pinned `esp-webrtc-solution` checkout must be at
+`$env:TEMP\esp-peer-v1.3.0`, or pass `-WebrtcSource` with its path. It must
+contain the cached `esp_libsrtp` 1.0.0 component at
+`components\esp_peer\examples\peer_demo\managed_components\espressif__esp_libsrtp`.
+
+```powershell
+$env:PYTHONUTF8 = '1'
+powershell.exe -NoProfile -ExecutionPolicy Bypass -File .\firmware\build-transport.ps1
+certutil -hashfile .\firmware\build\kvmctl_firmware.bin SHA256
 ```
 
-Install CMake and Ninja through Ubuntu or run
-`python3 ~/esp/esp-idf-v6.1.1/tools/idf_tools.py install cmake ninja`.
-Extract the [esp_libsrtp 1.0.0 registry archive](https://components.espressif.com/components/espressif/esp_libsrtp/versions/1.0.0/readme)
-into `~/esp/espressif__esp_libsrtp` so that directory contains the component’s
-`CMakeLists.txt`. An existing copy of the same component also works.
-
-From the repository root in WSL:
-
-```sh
-source ~/esp/esp-idf-v6.1.1/export.sh
-export KVMCTL_LIBSRTP_SOURCE="$HOME/esp/espressif__esp_libsrtp"
-bash firmware/build-transport.sh "$HOME/esp/esp-webrtc-v1.3.0"
-```
-
-The script exports the committed peer source, applies the fingerprint patch,
-and builds `firmware/build-wsl/kvmctl_firmware.bin`. The first build can fetch
-pinned components from the ESP Component Registry. Append `menuconfig` to the
-script invocation to edit the WSL build configuration. For Windows flashing,
-copy the resulting app image to a Windows-accessible path and use that path
-with the `kvmctl flash` command below.
+The script verifies the pinned peer revision, applies the fingerprint patch,
+and builds `firmware\build\kvmctl_firmware.bin`. The first build may fetch
+pinned components from the ESP Component Registry. The build does not flash a
+board.
 
 ## Scripted USB HID bench
 
-Use the same WSL setup with an explicit bench build. Its build directory is
-separate from the default firmware.
+Use the same Windows setup with an explicit bench build. Copy the normal image
+first if it must be retained; the bench build reuses `firmware\build`.
 
-```sh
-KVMCTL_HID_BENCH=1 bash firmware/build-transport.sh "$HOME/esp/esp-webrtc-v1.3.0"
-sha256sum firmware/build-wsl/hid-bench/kvmctl_firmware.bin
+```powershell
+Copy-Item .\firmware\build\kvmctl_firmware.bin .\firmware\build\kvmctl_firmware-normal.bin
+$env:PYTHONUTF8 = '1'
+$env:KVMCTL_HID_BENCH = '1'
+try {
+    powershell.exe -NoProfile -ExecutionPolicy Bypass -File .\firmware\build-transport.ps1
+} finally {
+    Remove-Item Env:KVMCTL_HID_BENCH -ErrorAction SilentlyContinue
+}
+certutil -hashfile .\firmware\build\kvmctl_firmware.bin SHA256
 ```
 
-For an offline build, set `KVMCTL_HID_BENCH_COMPONENTS` to a directory containing
+For a build without registry access, set `KVMCTL_HID_BENCH_COMPONENTS` to a directory containing
 the pinned `espressif__esp_tinyusb` and `espressif__tinyusb` components from the
 M0 HID probe. Copy the bench app to the Windows build directory and use
 `kvmctl flash` with a fresh backup path. The bench image enumerates a USB
 keyboard and mouse. It emits script reports only for the current authenticated
 lease after an explicit arm request. See the [Windows client bench command](../client/README.md#scripted-usb-hid-bench).
-
-## Windows build
-
-From `firmware/` in Windows PowerShell, build with ESP-IDF 6.1.1 and the pinned
-peer source described below. The build script loads the ESP-IDF PowerShell
-profile from `C:\Espressif\tools\Microsoft.v6.1.1.PowerShell_profile.ps1`.
-
-```powershell
-powershell.exe -NoProfile -ExecutionPolicy Bypass -File .\build-transport.ps1
-```
 
 Select the LED wiring under **kvmctl hardware profile** in `idf.py menuconfig`.
 GPIO48 is the default. Espressif documents GPIO48 for ESP32-S3-DevKitC-1 v1.0
@@ -119,6 +103,40 @@ data partitions such as NVS. The backup path must not already exist, and its
 directory must exist. If writing or verification fails, the CLI attempts to
 restore and verify the backup. Keep that backup until the new firmware has
 booted and passed its runtime check.
+
+## Recovery and rollback
+
+Use the app-only `flash` flow for firmware recovery. It reads and validates the
+live partition table, backs up and verifies the complete factory app partition,
+writes only the factory app, verifies the new image, and attempts an automatic
+restore from the verified backup if write or verification fails. Record the
+image path, byte count, SHA-256, backup path, byte count, SHA-256, board
+capabilities, COM port, and post-reset `status` output. Keep the verified
+backup until bring-up passes; rollback is the same `flash` command with the
+verified backup as the image and a new backup destination.
+
+Do not erase the whole flash during normal bring-up. Do not write the
+bootloader or partition table without separate explicit approval and a
+manufacturer-matched image, backup, and rollback plan. Board 2's existing
+bootloader validation-SHA mismatch is a separate device finding; readback is
+not a pre-flash backup and is not permission to replace it.
+
+The running firmware watches BOOT on GPIO0. A continuous 10-second hold erases
+all kvmctl-managed NVS (`kvmctl_wifi`, `kvmctl_id`, `kvmctl_auth`, and
+`kvmctl_cfg`) and reboots. A shorter hold preserves state. RST only reboots.
+Verify reset through USB `status`, `clients`, and deliberate `enroll` output.
+For a lost Windows client key, use direct USB with explicit confirmation:
+
+```powershell
+cargo run --offline -p kvmctl -- ports
+cargo run --offline -p kvmctl -- status COMx
+cargo run --offline -p kvmctl -- recover COMx
+cargo run --offline -p kvmctl -- clients COMx
+```
+
+`recover` replaces this user's DPAPI-protected client key, enrolls it through
+the selected COM port, and prints the identity, TLS pin, and new client
+fingerprint. It does not erase endpoint state or revoke other clients.
 
 The command uses `IDF_PYTHON_ENV_PATH`, `IDF_TOOLS_PATH`, a standard ESP-IDF
 Python installation, or Python from `PATH` to find esptool. To select another
@@ -184,16 +202,7 @@ the harness stubs ESP-IDF services and injects persistence failures. It checks
 two-peer transport isolation, signaling deadlines, and revocation retry.
 ESP-IDF compatibility and real NVS behavior require on-device checks.
 
-### WSL or Linux (recommended if available)
-
-Install Python 3, Clang, and the system linker as described in the
-[WSL prerequisites](../README.md#wsl-development). From the repository root, run:
-
-```sh
-python3 firmware/test_signaling_guards.py
-```
-
-### Native Windows (alternative)
+### Native Windows
 
 Install Python 3 and either LLVM (Clang plus LLD) or the Visual Studio C++ Build
 Tools. For LLVM, use the [official releases](https://github.com/llvm/llvm-project/releases)

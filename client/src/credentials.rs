@@ -132,6 +132,30 @@ impl ClientCredential {
         Ok(credential)
     }
 
+    pub fn install_replacement(&self, takeover_peer: bool) -> Result<(), String> {
+        let path = credential_path(takeover_peer)?;
+        let nonce = crate::random_id()?
+            .iter()
+            .map(|byte| format!("{byte:02x}"))
+            .collect::<String>();
+        let replacement = path.with_extension(format!("recovery-{nonce}"));
+        Self::store_to(&replacement, self)?;
+
+        let old = path.with_extension(format!("old-{nonce}"));
+        if path.exists() {
+            std::fs::rename(&path, &old).map_err(|_| "could not stage old client key")?;
+        }
+        if let Err(error) = std::fs::rename(&replacement, &path) {
+            if old.exists() {
+                let _ = std::fs::rename(&old, &path);
+            }
+            let _ = std::fs::remove_file(&replacement);
+            return Err(format!("could not install replacement client key: {error}"));
+        }
+        let _ = std::fs::remove_file(old);
+        Ok(())
+    }
+
     fn store_to(path: &std::path::Path, credential: &Self) -> Result<(), String> {
         let protected = Secret::new(protect(credential.private_blob.as_slice())?);
         let parent = path.parent().ok_or("invalid client key path")?;

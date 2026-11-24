@@ -190,8 +190,15 @@ uint8_t wifi_setup_state(void)
 
 esp_err_t wifi_setup_init(void)
 {
+    /* The HTTPS server opens lwIP sockets even before Wi-Fi is provisioned. */
+    esp_err_t err = wifi_stack_init();
+    if (err != ESP_OK) {
+        s_state = 3;
+        return err;
+    }
+
     nvs_handle_t nvs;
-    esp_err_t err = nvs_open(WIFI_NAMESPACE, NVS_READONLY, &nvs);
+    err = nvs_open(WIFI_NAMESPACE, NVS_READONLY, &nvs);
     if (err == ESP_ERR_NVS_NOT_FOUND) return ESP_OK;
     if (err != ESP_OK) { s_state = 3; return err; }
 
