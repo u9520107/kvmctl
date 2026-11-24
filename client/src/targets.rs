@@ -132,10 +132,10 @@ pub fn save(target: &Target) -> Result<(), String> {
         targets.push(target.clone());
     }
     targets.sort_by_key(|target| target.name.to_ascii_lowercase());
-    write_targets(&path, &targets)
+    write_targets(&path, &targets, &TEMP_COUNTER)
 }
 
-fn write_targets(path: &Path, targets: &[Target]) -> Result<(), String> {
+fn write_targets(path: &Path, targets: &[Target], temp_counter: &AtomicU64) -> Result<(), String> {
     let contents = targets
         .iter()
         .map(|target| {
@@ -158,20 +158,26 @@ fn write_targets(path: &Path, targets: &[Target]) -> Result<(), String> {
         .file_name()
         .and_then(|name| name.to_str())
         .ok_or("saved target path has no file name")?;
-    let temporary = parent.join(format!(
-        ".{file_name}.{}.{}.tmp",
-        std::process::id(),
-        TEMP_COUNTER.fetch_add(1, Ordering::Relaxed)
-    ));
-    let write_result = (|| {
-        let mut file = OpenOptions::new()
+    let (temporary, mut file) = loop {
+        let sequence = temp_counter.fetch_add(1, Ordering::Relaxed);
+        let temporary = temporary_path(parent, file_name, sequence);
+        match OpenOptions::new()
             .write(true)
             .create_new(true)
             .open(&temporary)
-            .map_err(|error| format!("cannot create saved targets temporary file: {error}"))?;
-        file.write_all(contents.as_bytes())
-            .map_err(|error| format!("cannot write saved targets: {error}"))
-    })();
+        {
+            Ok(file) => break (temporary, file),
+            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => continue,
+            Err(error) => {
+                return Err(format!(
+                    "cannot create saved targets temporary file: {error}"
+                ));
+            }
+        }
+    };
+    let write_result = file
+        .write_all(contents.as_bytes())
+        .map_err(|error| format!("cannot write saved targets: {error}"));
     if let Err(error) = write_result {
         let _ = fs::remove_file(&temporary);
         return Err(error);
@@ -192,6 +198,13 @@ fn write_targets(path: &Path, targets: &[Target]) -> Result<(), String> {
     Ok(())
 }
 
+fn temporary_path(parent: &Path, file_name: &str, sequence: u64) -> PathBuf {
+    parent.join(format!(
+        ".{file_name}.{}.{sequence}.tmp",
+        std::process::id()
+    ))
+}
+
 pub fn find(name: &str) -> Result<Target, String> {
     load()?
         .into_iter()
@@ -208,7 +221,7 @@ pub fn remove(name: &str) -> Result<(), String> {
     if targets.len() == before {
         return Err(format!("saved target `{name}` was not found"));
     }
-    write_targets(&path, &targets)
+    write_targets(&path, &targets, &TEMP_COUNTER)
 }
 
 pub fn update_address(name: &str, address: Ipv4Addr) -> Result<(), String> {
@@ -220,7 +233,7 @@ pub fn update_address(name: &str, address: Ipv4Addr) -> Result<(), String> {
         .find(|target| target.name.eq_ignore_ascii_case(name))
         .ok_or_else(|| format!("saved target `{name}` was not found"))?;
     target.last_ipv4 = Some(address);
-    write_targets(&path, &targets)
+    write_targets(&path, &targets, &TEMP_COUNTER)
 }
 
 #[cfg(test)]
@@ -233,5 +246,25 @@ mod tests {
         assert!(Target::new("board\n1".into(), [0; 32], [0; 32], [0; 32], None).is_err());
         assert!(Target::new("board".into(), [0; 32], [0; 32], [0; 32], None).is_ok());
         assert!(Target::new("COMPUTER".into(), [0; 32], [0; 32], [0; 32], None).is_ok());
+    }
+
+    #[test]
+    fn write_targets_retries_existing_temporary_file() {
+        let parent = std::env::temp_dir().join(format!(
+            "kvmctl-targets-test-{}-{}",
+            std::process::id(),
+            TEMP_COUNTER.fetch_add(1, Ordering::Relaxed)
+        ));
+        fs::create_dir_all(&parent).unwrap();
+        let path = parent.join("targets.tsv");
+        let temp_counter = AtomicU64::new(0);
+        let stale = temporary_path(&parent, "targets.tsv", 0);
+        fs::write(&stale, b"stale").unwrap();
+
+        write_targets(&path, &[], &temp_counter).unwrap();
+
+        assert_eq!(fs::read(&stale).unwrap(), b"stale");
+        assert!(fs::read_to_string(path).unwrap().is_empty());
+        fs::remove_dir_all(parent).unwrap();
     }
 }
