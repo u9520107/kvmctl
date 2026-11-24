@@ -1274,11 +1274,11 @@ mod serial {
         pub fn reconcile_clients(&mut self) -> Result<Vec<[u8; 32]>, String> {
             let mut last_error = String::new();
             for attempt in 0..3 {
-                unsafe {
-                    PurgeComm(self.0, PURGE_RXCLEAR);
-                }
                 if attempt != 0 {
                     std::thread::sleep(std::time::Duration::from_millis(250));
+                }
+                unsafe {
+                    PurgeComm(self.0, PURGE_RXCLEAR);
                 }
                 match self.list_clients() {
                     Ok(clients) => return Ok(clients),
