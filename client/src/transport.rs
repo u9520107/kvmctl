@@ -1174,8 +1174,8 @@ pub(crate) fn run_foreground_session(
                             sequence += 1;
                             heartbeat = Instant::now();
                         }
-                        match timeout(&*runtime, Duration::from_millis(100), peer.control.poll()).await? {
-                            Some(DataChannelEvent::OnMessage(message)) => {
+                        match timeout(&*runtime, Duration::from_millis(100), peer.control.poll()).await {
+                            Ok(Some(DataChannelEvent::OnMessage(message))) => {
                                 let (response, response_epoch) =
                                     responses.decode_any_epoch(&message.data)?;
                                 match response {
@@ -1202,10 +1202,11 @@ pub(crate) fn run_foreground_session(
                                     }
                                 }
                             }
-                            Some(DataChannelEvent::OnClose) | None => {
+                            Ok(Some(DataChannelEvent::OnClose)) | Ok(None) => {
                                 bail!("foreground control channel closed")
                             }
-                            _ => {}
+                            Ok(_) => {}
+                            Err(_) => {}
                         }
                         runtime.sleep(Duration::from_millis(50)).await;
                     }
