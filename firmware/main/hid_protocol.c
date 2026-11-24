@@ -99,7 +99,7 @@ static bool payload(reader_t *r, uint64_t type, kvmctl_hid_event_t *event)
         if (!map(r, 3) || !uint_value(r, 0) || !bytes(r, event->request_id, 16) ||
             !uint_value(r, 1) || !bytes(r, event->requester, 32) ||
             !uint_value(r, 2) || !head(r, 0, &event->response_window_ms) ||
-            event->response_window_ms > 10000) return false;
+            event->response_window_ms > 30000) return false;
         return true;
     case KVMCTL_HID_ERROR: {
         uint64_t length = 0;
@@ -215,7 +215,7 @@ size_t kvmctl_hid_encode(const kvmctl_hid_event_t *event, uint8_t *data,
     for (size_t i = 0; i < sizeof(event->session_id); ++i) any_session_byte |= event->session_id[i];
     if (any_session_byte == 0) return 0;
     if (event->type == KVMCTL_HID_LEASE_STATE && (!event->owner_present && event->state > 2)) return 0;
-    if (event->type == KVMCTL_HID_TAKEOVER_NOTICE && event->response_window_ms > 10000) return 0;
+    if (event->type == KVMCTL_HID_TAKEOVER_NOTICE && event->response_window_ms > 30000) return 0;
     if (event->type == KVMCTL_HID_ERROR &&
         (strlen(event->error_code) > 32 ||
          (strcmp(event->error_code, "busy") != 0 && strcmp(event->error_code, "stale_epoch") != 0 &&

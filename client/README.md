@@ -36,6 +36,18 @@ reports matching `_kvmctl._tcp.local` metadata when mDNS is available; and
 `session` reports `Connected/local`, keeps physical-input capture off, waits
 for Enter, releases lease, and reports `Session closed cleanly.`
 
+  Diagnostics:
+
+  ```powershell
+  $env:KVMCTL_LOG = "debug"
+  cargo run --offline -p kvmctl -- session m22-esp32 192.168.50.137
+  Get-Content "$env:LOCALAPPDATA\kvmctl\kvmctl.log" -Wait
+  cargo run --offline -p kvmctl -- telemetry COM6
+  ```
+
+  `KVMCTL_LOG` accepts `off`, `error`, `warn`, `info`, `debug`, or `trace`.
+  Set `KVMCTL_LOG_FILE` to override the log path.
+
 Use mDNS routing by omitting the IP:
 
 ```powershell
@@ -71,7 +83,12 @@ Windows user. The regular client keeps its existing credential.
 cargo run --offline -p kvmctl -- enroll COM6
 cargo run --offline -p kvmctl -- enroll COM6 takeover
 cargo run --offline -p kvmctl -- signaling-test COM6 takeover 192.168.50.137
+  cargo run --offline -p kvmctl -- signaling-test COM6 takeover-request 192.168.50.137
 ```
+
+  `takeover-request` uses the takeover identity only and waits up to 30 seconds
+  for the active local owner to reject or accept the request. Use it while tray
+  owns target.
 
 The test keeps both pinned WSS/WebRTC sessions open. On a HID-capable image it
 also proves A's two neutral reports arrive before B's grant response, then

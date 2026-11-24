@@ -1836,7 +1836,7 @@ fn run() -> Result<(), String> {
     let command = args.first().map(String::as_str).unwrap_or("status");
     if command == "--help" || command == "-h" {
         println!(
-            "kvmctl [ports | status [COMx] | wifi [COMx] | enroll [COMx] [takeover] | clients [COMx] | revoke [COMx] <fingerprint|all> | discover [COMx] | targets | target list | target save [COMx] <name> [IPv4] | target remove <name> | session <target> [IPv4] | signaling-test [COMx] [scenario [IPv4] | IPv4] | led [COMx] on|off <brightness> <RRGGBB> | transport-test [COMx] | flash [COMx] <firmware.bin> <backup.bin>]; session keeps input local and closes on Enter; physical-input capture is off"
+            "kvmctl [ports | status [COMx] | telemetry [COMx] | wifi [COMx] | enroll [COMx] [takeover] | clients [COMx] | revoke [COMx] <fingerprint|all> | discover [COMx] | targets | target list | target save [COMx] <name> [IPv4] | target remove <name> | session <target> [IPv4] | signaling-test [COMx] [scenario [IPv4] | IPv4] | led [COMx] on|off <brightness> <RRGGBB> | transport-test [COMx] | flash [COMx] <firmware.bin> <backup.bin>]; signaling-test takeover-request uses takeover identity; KVMCTL_LOG=debug enables diagnostics; log file defaults to %LOCALAPPDATA%\\kvmctl\\kvmctl.log"
         );
         return Ok(());
     }
@@ -1882,6 +1882,7 @@ fn run() -> Result<(), String> {
     if !matches!(
         command,
         "status"
+            | "telemetry"
             | "wifi"
             | "enroll"
             | "recover"
@@ -1900,7 +1901,7 @@ fn run() -> Result<(), String> {
     }
     if matches!(
         command,
-        "status" | "wifi" | "recover" | "clients" | "discover" | "transport-test"
+        "status" | "telemetry" | "wifi" | "recover" | "clients" | "discover" | "transport-test"
     ) && !params.is_empty()
     {
         return Err("this command takes only an optional COM port".into());
@@ -1923,6 +1924,7 @@ fn run() -> Result<(), String> {
                             | "scripted"
                             | "takeover"
                             | "takeover-zero"
+                            | "takeover-request"
                             | "hid-bench"
                             | "hid-sustain"
                             | "cleanup-disconnect"
@@ -2061,7 +2063,8 @@ fn run() -> Result<(), String> {
         } else {
             params.first().map(String::as_str).unwrap_or("success")
         };
-        let takeover_peer = if matches!(scenario, "takeover" | "takeover-zero") {
+        let takeover_peer = if matches!(scenario, "takeover" | "takeover-zero" | "takeover-request")
+        {
             let credential =
                 credentials::ClientCredential::load_existing(true).map_err(|error| {
                     format!(
@@ -2145,6 +2148,13 @@ fn run() -> Result<(), String> {
         println!(
             "Running signaling scenario `{scenario}` in {hid_mode} mode. Physical-input capture is off."
         );
+        if scenario == "takeover-request" {
+            let requester = takeover_peer
+                .as_ref()
+                .ok_or_else(|| "takeover requester credential is unavailable".to_owned())?;
+            return transport::run_takeover_request(&service, status, requester)
+                .map_err(|error| error.to_string());
+        }
         let endpoint_fingerprint = status.identity_fingerprint;
         let address = transport::run_signaling_test(
             port,
@@ -2274,6 +2284,30 @@ fn run() -> Result<(), String> {
                 status.led_rgb[0],
                 status.led_rgb[1],
                 status.led_rgb[2]
+            );
+            Ok(())
+        }
+        "telemetry" => {
+            let metrics = port.transport_status()?;
+            println!("state={}", metrics.state);
+            println!("lease_epoch={}", metrics.lease_epoch);
+            println!("last_event_sequence={}", metrics.last_event_sequence);
+            println!("response_queue_depth={}", metrics.response_queue_depth);
+            println!("scripted_events={}", metrics.scripted_events);
+            println!("scripted_rejections={}", metrics.scripted_rejections);
+            println!("scripted_drops={}", metrics.scripted_drops);
+            println!("scripted_reorders={}", metrics.scripted_reorders);
+            println!("normalized_keys={}", metrics.normalized_keys);
+            println!("normalized_buttons={}", metrics.normalized_buttons);
+            println!(
+                "hid_reports={}",
+                metrics
+                    .hid_reports
+                    .map_or_else(|| "n/a".into(), |value| value.to_string())
+            );
+            println!(
+                "tls_diagnostic={}",
+                String::from_utf8_lossy(&metrics.tls_diagnostic[..metrics.tls_diagnostic_len])
             );
             Ok(())
         }

@@ -255,32 +255,42 @@ bool lease_check_vectors(void)
         lease_heartbeat(&lease, owner_a, epoch, 6000) != LEASE_HEARTBEAT_ACCEPTED ||
         lease_heartbeat(&lease, owner_a, epoch, 8000) != LEASE_HEARTBEAT_ACCEPTED ||
         lease_heartbeat(&lease, owner_a, epoch, 10000) != LEASE_HEARTBEAT_ACCEPTED ||
-        lease_tick(&lease, 10999) != LEASE_NOOP ||
-         lease_tick(&lease, 11000) != LEASE_TAKEOVER_GRANTED ||
-         lease_grant_pending(&lease, 11000) != LEASE_TAKEOVER_GRANTED ||
+        lease_heartbeat(&lease, owner_a, epoch, 12000) != LEASE_HEARTBEAT_ACCEPTED ||
+        lease_heartbeat(&lease, owner_a, epoch, 14000) != LEASE_HEARTBEAT_ACCEPTED ||
+        lease_heartbeat(&lease, owner_a, epoch, 16000) != LEASE_HEARTBEAT_ACCEPTED ||
+        lease_heartbeat(&lease, owner_a, epoch, 18000) != LEASE_HEARTBEAT_ACCEPTED ||
+        lease_heartbeat(&lease, owner_a, epoch, 20000) != LEASE_HEARTBEAT_ACCEPTED ||
+        lease_heartbeat(&lease, owner_a, epoch, 22000) != LEASE_HEARTBEAT_ACCEPTED ||
+        lease_heartbeat(&lease, owner_a, epoch, 24000) != LEASE_HEARTBEAT_ACCEPTED ||
+        lease_heartbeat(&lease, owner_a, epoch, 26000) != LEASE_HEARTBEAT_ACCEPTED ||
+        lease_heartbeat(&lease, owner_a, epoch, 28000) != LEASE_HEARTBEAT_ACCEPTED ||
+        lease_heartbeat(&lease, owner_a, epoch, 30000) != LEASE_HEARTBEAT_ACCEPTED ||
+        lease_tick(&lease, 30999) != LEASE_NOOP ||
+         lease_tick(&lease, 31000) != LEASE_TAKEOVER_GRANTED ||
+         lease_grant_pending(&lease, 31000) != LEASE_TAKEOVER_GRANTED ||
         lease.active == false || !same_identity(lease.owner, owner_b) ||
         lease.epoch != 3 || !lease_held_empty(&lease) ||
         lease_can_emit(&lease, owner_a, epoch)) return false;
 
     epoch = lease.epoch;
-    if (lease_request(&lease, owner_a, request_c, 12000) != LEASE_TAKEOVER_PENDING ||
-         lease_release(&lease, owner_b, epoch, 12000) != LEASE_RELEASED ||
-         lease_grant_pending(&lease, 12000) != LEASE_TAKEOVER_GRANTED ||
+    if (lease_request(&lease, owner_a, request_c, 32000) != LEASE_TAKEOVER_PENDING ||
+         lease_release(&lease, owner_b, epoch, 32000) != LEASE_RELEASED ||
+         lease_grant_pending(&lease, 32000) != LEASE_TAKEOVER_GRANTED ||
         !same_identity(lease.owner, owner_a) || lease.epoch != 5 ||
         !lease_held_empty(&lease)) return false;
 
     epoch = lease.epoch;
     if (!lease_set_held(&lease, owner_a, epoch, true, true) ||
-        lease_request(&lease, owner_b, request_b, 13000) != LEASE_TAKEOVER_PENDING ||
-         lease_tick(&lease, 16000) != LEASE_TAKEOVER_GRANTED ||
-         lease_grant_pending(&lease, 16000) != LEASE_TAKEOVER_GRANTED ||
+        lease_request(&lease, owner_b, request_b, 33000) != LEASE_TAKEOVER_PENDING ||
+         lease_tick(&lease, 36000) != LEASE_TAKEOVER_GRANTED ||
+         lease_grant_pending(&lease, 36000) != LEASE_TAKEOVER_GRANTED ||
         !same_identity(lease.owner, owner_b) || lease.epoch != 7 ||
         !lease_held_empty(&lease)) return false;
 
     if (!lease_set_held(&lease, owner_b, lease.epoch, true, true) ||
-        lease_revoke(&lease, owner_b, 17000) != LEASE_REVOKED || lease.active ||
-        !lease_held_empty(&lease) || lease_revoke(&lease, owner_c, 17000) != LEASE_NOOP ||
-        lease_request(&lease, owner_c, NULL, 18000) != LEASE_GRANTED ||
+        lease_revoke(&lease, owner_b, 37000) != LEASE_REVOKED || lease.active ||
+        !lease_held_empty(&lease) || lease_revoke(&lease, owner_c, 37000) != LEASE_NOOP ||
+        lease_request(&lease, owner_c, NULL, 38000) != LEASE_GRANTED ||
         !lease_set_held(&lease, owner_c, lease.epoch, true, true) ||
         lease_restart(&lease) != LEASE_RESTARTED || lease.active ||
         !lease_held_empty(&lease) || lease.epoch != 11) return false;

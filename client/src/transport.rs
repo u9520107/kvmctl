@@ -1,11 +1,14 @@
 use anyhow::{Context, Result, bail, ensure};
 use bytes::BytesMut;
-use log::{Level, LevelFilter, Log, Metadata, Record};
-use std::io::Read;
+use log::{LevelFilter, Log, Metadata, Record};
+use std::fs::OpenOptions;
+use std::io::{Read, Write};
 use std::net::{SocketAddr, TcpStream};
+use std::path::PathBuf;
+use std::str::FromStr;
 use std::sync::atomic::{AtomicBool, AtomicU8, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use webrtc::data_channel::{DataChannel, DataChannelEvent, RTCDataChannelInit};
 use webrtc::peer_connection::{
     PeerConnection, PeerConnectionBuilder, PeerConnectionEventHandler, RTCCertificate,
@@ -18,6 +21,7 @@ static CERTIFICATE_REJECTED: AtomicBool = AtomicBool::new(false);
 static RTC_ERROR_LOGS: AtomicUsize = AtomicUsize::new(0);
 static RTC_ERROR_CLASS: AtomicU8 = AtomicU8::new(0);
 static RTC_ERROR_LOCATION: OnceLock<(String, Option<u32>)> = OnceLock::new();
+static LOG_LEVEL: OnceLock<LevelFilter> = OnceLock::new();
 
 #[derive(Default)]
 struct ConnectionStates {
@@ -29,7 +33,10 @@ struct CertificateLog;
 
 impl Log for CertificateLog {
     fn enabled(&self, metadata: &Metadata<'_>) -> bool {
-        matches!(metadata.level(), Level::Error | Level::Warn)
+        LOG_LEVEL
+            .get()
+            .and_then(LevelFilter::to_level)
+            .is_some_and(|level| metadata.level() <= level)
     }
 
     fn log(&self, record: &Record<'_>) {
@@ -54,6 +61,25 @@ impl Log for CertificateLog {
             if message.contains("remote certificate does not match any fingerprint") {
                 CERTIFICATE_REJECTED.store(true, Ordering::Release);
             }
+            let line = format!(
+                "{} [{}] {}: {}\n",
+                SystemTime::now()
+                    .duration_since(UNIX_EPOCH)
+                    .map(|value| value.as_millis())
+                    .unwrap_or_default(),
+                record.level(),
+                record.target(),
+                record.args()
+            );
+            eprint!("{line}");
+            if let Some(path) = diagnostic_log_path() {
+                if let Some(parent) = path.parent() {
+                    let _ = std::fs::create_dir_all(parent);
+                }
+                if let Ok(mut file) = OpenOptions::new().create(true).append(true).open(path) {
+                    let _ = file.write_all(line.as_bytes());
+                }
+            }
         }
     }
 
@@ -62,10 +88,33 @@ impl Log for CertificateLog {
 
 static CERTIFICATE_LOG: CertificateLog = CertificateLog;
 
+fn diagnostic_log_level() -> LevelFilter {
+    std::env::var("KVMCTL_LOG")
+        .ok()
+        .and_then(|value| LevelFilter::from_str(&value).ok())
+        .unwrap_or(LevelFilter::Info)
+}
+
+fn diagnostic_log_path() -> Option<PathBuf> {
+    std::env::var_os("KVMCTL_LOG_FILE")
+        .map(PathBuf::from)
+        .or_else(|| {
+            std::env::var_os("LOCALAPPDATA")
+                .map(PathBuf::from)
+                .map(|root| root.join("kvmctl").join("kvmctl.log"))
+        })
+}
+
+pub(crate) fn init_logging() {
+    let level = *LOG_LEVEL.get_or_init(diagnostic_log_level);
+    let _ = log::set_logger(&CERTIFICATE_LOG);
+    log::set_max_level(level);
+}
+
 fn install_certificate_log() -> Result<()> {
-    log::set_logger(&CERTIFICATE_LOG)
-        .map_err(|_| anyhow::anyhow!("cannot capture DTLS certificate rejection events"))?;
-    log::set_max_level(LevelFilter::Warn);
+    // The process logger is global. Tray reconnects and other callers may have
+    // installed it already; that is not a transport failure.
+    init_logging();
     Ok(())
 }
 
@@ -1070,157 +1119,578 @@ pub(crate) fn run_foreground_session(
     status: crate::Status,
     credential: crate::credentials::ClientCredential,
 ) -> Result<SocketAddr> {
+    let control = SessionControl::new();
+    let input = control.clone();
+    std::thread::spawn(move || {
+        let mut line = String::new();
+        loop {
+            line.clear();
+            if std::io::stdin().read_line(&mut line).is_err() {
+                input.cancel();
+                break;
+            }
+            if let Some(request_id) = input.pending_takeover() {
+                input.respond_to_takeover(request_id, line.trim().eq_ignore_ascii_case("yes"));
+            } else {
+                input.cancel();
+                break;
+            }
+        }
+    });
+    let service = service.clone();
+    let resolver_service = service.clone();
+    run_session(
+        service,
+        status,
+        credential,
+        control,
+        move || Ok(resolver_service.clone()),
+        |event| match event {
+            SessionEvent::Connecting => println!("Connecting/local…"),
+            SessionEvent::ConnectedLocal => {
+                println!("Connected/local. Press Enter to disconnect.")
+            }
+            SessionEvent::InputLocalConfirmed => {}
+            SessionEvent::TakeoverPending { .. } => {
+                println!("Takeover requested. Input remains local. Accept? type yes or no:")
+            }
+            SessionEvent::Recovering { seconds_remaining } => {
+                println!("Connection lost. Recovering/local ({seconds_remaining}s remaining)…")
+            }
+            SessionEvent::Unavailable { reason } => println!("Unavailable: {reason}"),
+            SessionEvent::OwnershipLost { reason } => println!("Ownership lost: {reason}"),
+            SessionEvent::Notice(message) => println!("{message}"),
+            SessionEvent::Disconnected => {}
+        },
+    )
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) enum SessionEvent {
+    Connecting,
+    ConnectedLocal,
+    InputLocalConfirmed,
+    TakeoverPending {
+        request_id: [u8; 16],
+        requester: [u8; 32],
+        response_window_ms: u64,
+    },
+    Recovering {
+        seconds_remaining: u64,
+    },
+    Unavailable {
+        reason: String,
+    },
+    OwnershipLost {
+        reason: String,
+    },
+    Notice(String),
+    Disconnected,
+}
+
+#[derive(Clone)]
+pub(crate) struct SessionControl {
+    cancelled: Arc<AtomicBool>,
+    takeover: Arc<Mutex<Option<([u8; 16], Option<bool>, Instant)>>>,
+}
+
+impl SessionControl {
+    pub(crate) fn new() -> Self {
+        Self {
+            cancelled: Arc::new(AtomicBool::new(false)),
+            takeover: Arc::new(Mutex::new(None)),
+        }
+    }
+
+    pub(crate) fn cancel(&self) {
+        self.cancelled.store(true, Ordering::Release);
+    }
+
+    pub(crate) fn is_cancelled(&self) -> bool {
+        self.cancelled.load(Ordering::Acquire)
+    }
+
+    pub(crate) fn respond_to_takeover(&self, request_id: [u8; 16], accepted: bool) {
+        if let Some((pending, decision, _)) = self.takeover.lock().unwrap().as_mut()
+            && *pending == request_id
+            && decision.is_none()
+        {
+            *decision = Some(accepted);
+        }
+    }
+
+    pub(crate) fn pending_takeover(&self) -> Option<[u8; 16]> {
+        self.takeover
+            .lock()
+            .unwrap()
+            .as_ref()
+            .map(|(request_id, _, _)| *request_id)
+    }
+
+    fn start_takeover(&self, request_id: [u8; 16], response_window_ms: u64) {
+        *self.takeover.lock().unwrap() = Some((
+            request_id,
+            None,
+            Instant::now() + Duration::from_millis(response_window_ms),
+        ));
+    }
+
+    fn takeover_expired(&self) -> bool {
+        let mut takeover = self.takeover.lock().unwrap();
+        if takeover
+            .as_ref()
+            .is_some_and(|(_, _, deadline)| Instant::now() >= *deadline)
+        {
+            *takeover = None;
+            true
+        } else {
+            false
+        }
+    }
+
+    fn take_takeover_decision(&self, request_id: [u8; 16]) -> Option<bool> {
+        let mut takeover = self.takeover.lock().unwrap();
+        let Some((pending, decision, deadline)) = takeover.as_ref() else {
+            return None;
+        };
+        if *pending != request_id {
+            return None;
+        }
+        if Instant::now() >= *deadline {
+            *takeover = None;
+            return None;
+        }
+        let decision = (*decision)?;
+        *takeover = None;
+        Some(decision)
+    }
+
+    fn clear_takeover(&self) {
+        *self.takeover.lock().unwrap() = None;
+    }
+}
+
+enum SessionExit {
+    Disconnected,
+    Lost(String),
+    Unavailable(String),
+    OwnershipLost(String),
+}
+
+pub(crate) fn run_session<F, R>(
+    initial_service: crate::discovery::Service,
+    status: crate::Status,
+    credential: crate::credentials::ClientCredential,
+    control: SessionControl,
+    mut resolve: R,
+    mut on_event: F,
+) -> Result<SocketAddr>
+where
+    F: FnMut(SessionEvent),
+    R: FnMut() -> Result<crate::discovery::Service, String>,
+{
     install_certificate_log()?;
-    let address = crate::discovery::socket_address(service).map_err(anyhow::Error::msg)?;
-    let hostname = service.hostname.clone();
+    log::info!("session connecting to {}", initial_service.hostname);
+    let mut service = initial_service;
     let runtime = default_runtime().context("no WebRTC runtime")?;
-    let device_status = AtomicU8::new(1);
-    let mut result: Option<Result<()>> = None;
-    runtime.block_on(Box::pin(async {
-        result = Some(
-            async {
-                let mut peer = open_signaling_peer(
+    let mut recovery_started: Option<Instant> = None;
+    let mut retry_delay = Duration::from_secs(1);
+    let mut last_address =
+        crate::discovery::socket_address(&service).map_err(anyhow::Error::msg)?;
+    loop {
+        if control.is_cancelled() {
+            on_event(SessionEvent::Disconnected);
+            return Ok(last_address);
+        }
+        on_event(if recovery_started.is_some() {
+            SessionEvent::Recovering {
+                seconds_remaining: 60u64
+                    .saturating_sub(recovery_started.unwrap().elapsed().as_secs()),
+            }
+        } else {
+            SessionEvent::Connecting
+        });
+        let device_status = AtomicU8::new(1);
+        let mut connected_in_attempt = false;
+        let mut exit = None;
+        runtime.block_on(Box::pin(async {
+            exit = Some(
+                run_session_once(
                     runtime.clone(),
-                    &device_status,
-                    address,
-                    &hostname,
+                    &service,
                     &status,
                     &credential,
+                    &control,
+                    &mut |event| {
+                        if matches!(event, SessionEvent::ConnectedLocal) {
+                            connected_in_attempt = true;
+                        }
+                        on_event(event);
+                    },
+                    &device_status,
+                )
+                .await,
+            );
+        }));
+        let exit = exit.context("runtime did not execute")??;
+        if connected_in_attempt {
+            recovery_started = None;
+            retry_delay = Duration::from_secs(1);
+        }
+        match exit {
+            SessionExit::Disconnected => {
+                on_event(SessionEvent::Disconnected);
+                return Ok(last_address);
+            }
+            SessionExit::OwnershipLost(reason) => {
+                log::warn!("session ownership lost: {reason}");
+                on_event(SessionEvent::OwnershipLost { reason });
+                return Ok(last_address);
+            }
+            SessionExit::Unavailable(reason) if recovery_started.is_none() => {
+                on_event(SessionEvent::Unavailable {
+                    reason: reason.clone(),
+                });
+                return Err(anyhow::anyhow!(reason));
+            }
+            SessionExit::Unavailable(reason) => {
+                on_event(SessionEvent::Notice(format!(
+                    "Recovery attempt unavailable: {reason}"
+                )));
+            }
+            SessionExit::Lost(reason) => {
+                log::warn!("session transport lost: {reason}");
+                recovery_started.get_or_insert_with(Instant::now);
+                on_event(SessionEvent::Notice(format!(
+                    "Connection lost; input remains local: {reason}"
+                )));
+            }
+        }
+        let started = recovery_started.expect("recovery start set before retry");
+        if control.is_cancelled() {
+            on_event(SessionEvent::Disconnected);
+            return Ok(last_address);
+        }
+        if started.elapsed() >= Duration::from_secs(60) {
+            let reason = "recovery window expired".to_owned();
+            on_event(SessionEvent::Unavailable {
+                reason: reason.clone(),
+            });
+            return Err(anyhow::anyhow!(reason));
+        }
+        if let Ok(next) = resolve() {
+            service = next;
+            last_address =
+                crate::discovery::socket_address(&service).map_err(anyhow::Error::msg)?;
+        }
+        let wait_until = Instant::now() + retry_delay;
+        while Instant::now() < wait_until {
+            if control.is_cancelled() {
+                on_event(SessionEvent::Disconnected);
+                return Ok(last_address);
+            }
+            std::thread::sleep(Duration::from_millis(100));
+        }
+        retry_delay = (retry_delay * 2).min(Duration::from_secs(5));
+    }
+}
+
+pub(crate) fn run_takeover_request(
+    service: &crate::discovery::Service,
+    status: crate::Status,
+    credential: &crate::credentials::ClientCredential,
+) -> Result<()> {
+    install_certificate_log()?;
+    let address = crate::discovery::socket_address(service).map_err(anyhow::Error::msg)?;
+    let runtime = default_runtime().context("no WebRTC runtime")?;
+    let device_status = AtomicU8::new(1);
+    let mut result = None;
+    runtime.block_on(Box::pin(async {
+        let opened = open_signaling_peer(
+            runtime.clone(),
+            &device_status,
+            address,
+            &service.hostname,
+            &status,
+            credential,
+        )
+        .await;
+        let mut peer = match opened {
+            Ok(peer) => peer,
+            Err(error) => {
+                result = Some(Err(error));
+                return;
+            }
+        };
+        result = Some(
+            async {
+                peer.session
+                    .send_transcript_proof(&peer.proof)
+                    .map_err(anyhow::Error::msg)?;
+                let request_id = crate::random_id().map_err(anyhow::Error::msg)?;
+                let mut responses = ResponseCursor::new(peer.session.session_id());
+                send_hid_event(
+                    &peer.control,
+                    crate::hid_protocol::Envelope {
+                        message_type: crate::hid_protocol::TAKEOVER_REQUEST,
+                        session_id: peer.session.session_id(),
+                        lease_epoch: 0,
+                        sequence: 0,
+                        event: crate::hid_protocol::Event::TakeoverRequest { request_id },
+                    },
                 )
                 .await?;
-                let session_result = async {
-                    peer.session
-                        .send_transcript_proof(&peer.proof)
-                        .map_err(anyhow::Error::msg)
-                        .context("foreground session authorization")?;
-                    let mut responses = ResponseCursor::new(peer.session.session_id());
-                    send_hid_event(
-                        &peer.control,
-                        crate::hid_protocol::Envelope {
-                            message_type: crate::hid_protocol::LEASE_REQUEST,
-                            session_id: peer.session.session_id(),
-                            lease_epoch: 0,
-                            sequence: 0,
-                            event: crate::hid_protocol::Event::LeaseRequest,
-                        },
-                    )
-                    .await?;
-                    let (response, epoch) =
-                        receive_endpoint_response_any_epoch(
-                            &*runtime,
-                            &peer.control,
-                            &mut responses,
-                        )
-                        .await?;
-                    require_response(
-                        response,
-                        EndpointResponse::LeaseState {
-                            owner: Some(credential.fingerprint),
-                            state: 1,
-                        },
-                    )?;
-                    eprintln!(
-                        "M2.1 SESSION authenticated=true input_local=true physical_input_capture=off"
-                    );
-                    println!("Connected/local. Press Enter to disconnect.");
-                    let (done_tx, done_rx) = std::sync::mpsc::channel();
-                    std::thread::spawn(move || {
-                        let mut line = String::new();
-                        let _ = std::io::stdin().read_line(&mut line);
-                        let _ = done_tx.send(());
-                    });
-                    let mut sequence = 1;
-                    let mut heartbeat = Instant::now();
-                    loop {
-                        if done_rx.try_recv().is_ok() {
-                            send_hid_event(
-                                &peer.control,
-                                crate::hid_protocol::Envelope {
-                                    message_type: crate::hid_protocol::LEASE_RELEASE,
-                                    session_id: peer.session.session_id(),
-                                    lease_epoch: epoch,
-                                    sequence,
-                                    event: crate::hid_protocol::Event::LeaseRelease,
-                                },
-                            )
-                            .await?;
-                            require_response(
-                                receive_endpoint_response(
-                                    &*runtime,
-                                    &peer.control,
-                                    &mut responses,
-                                    next_lease_epoch(epoch),
-                                )
-                                .await?,
-                                EndpointResponse::LeaseState {
-                                    owner: None,
-                                    state: 0,
-                                },
-                            )?;
-                            break;
-                        }
-                        if heartbeat.elapsed() >= Duration::from_secs(1) {
-                            send_hid_event(
-                                &peer.control,
-                                crate::hid_protocol::Envelope {
-                                    message_type: crate::hid_protocol::HEARTBEAT,
-                                    session_id: peer.session.session_id(),
-                                    lease_epoch: epoch,
-                                    sequence,
-                                    event: crate::hid_protocol::Event::Heartbeat,
-                                },
-                            )
-                            .await?;
-                            sequence += 1;
-                            heartbeat = Instant::now();
-                        }
-                        match timeout(&*runtime, Duration::from_millis(100), peer.control.poll()).await {
-                            Ok(Some(DataChannelEvent::OnMessage(message))) => {
-                                let (response, response_epoch) =
-                                    responses.decode_any_epoch(&message.data)?;
-                                match response {
-                                    EndpointResponse::TakeoverNotice { .. }
-                                        if response_epoch == epoch =>
-                                    {
-                                        bail!(
-                                            "foreground session ended for takeover request"
-                                        );
-                                    }
-                                    EndpointResponse::Error { code } => {
-                                        bail!(
-                                            "foreground lease lost: {code} (endpoint epoch {response_epoch})"
-                                        );
-                                    }
-                                    EndpointResponse::LeaseState { owner, state }
-                                        if response_epoch == epoch
-                                            && owner == Some(credential.fingerprint)
-                                            && state == 1 => {}
-                                    response => {
-                                        bail!(
-                                            "foreground session ownership changed: {response:?}"
-                                        );
+                eprintln!("M2.2 TAKEOVER_REQUEST sent; waiting for local-owner decision");
+                let deadline = Instant::now() + Duration::from_secs(60);
+                loop {
+                    ensure!(Instant::now() < deadline, "takeover request timed out");
+                    match timeout(&*runtime, Duration::from_millis(250), peer.control.poll()).await
+                    {
+                        Err(_) => continue,
+                        Ok(Some(DataChannelEvent::OnMessage(message))) => {
+                            let (response, epoch) = responses.decode_any_epoch(&message.data)?;
+                            log::debug!(
+                                "takeover requester response epoch={epoch} value={response:?}"
+                            );
+                            match response {
+                                EndpointResponse::LeaseState { owner, state }
+                                    if owner == Some(credential.fingerprint) && state == 1 =>
+                                {
+                                    eprintln!("M2.2 TAKEOVER_REQUEST granted=true epoch={epoch}");
+                                    return Ok(());
+                                }
+                                EndpointResponse::LeaseState { state: 2, .. } => {
+                                    eprintln!("M2.2 TAKEOVER_REQUEST pending=true");
+                                }
+                                EndpointResponse::TakeoverResponse { accepted, .. } => {
+                                    eprintln!("M2.2 TAKEOVER_REQUEST accepted={accepted}");
+                                    if !accepted {
+                                        return Ok(());
                                     }
                                 }
+                                EndpointResponse::Error { code } => {
+                                    bail!("takeover request rejected: {code}");
+                                }
+                                _ => {}
                             }
-                            Ok(Some(DataChannelEvent::OnClose)) | Ok(None) => {
-                                bail!("foreground control channel closed")
-                            }
-                            Ok(_) => {}
-                            Err(_) => {}
                         }
-                        runtime.sleep(Duration::from_millis(50)).await;
+                        Ok(Some(DataChannelEvent::OnClose)) | Ok(None) => {
+                            bail!("takeover requester control channel closed")
+                        }
+                        Ok(_) => {}
                     }
-                    Ok(())
                 }
-                .await;
-                peer.close(&*runtime).await;
-                session_result
             }
             .await,
         );
+        peer.close(&*runtime).await;
     }));
-    result.context("runtime did not execute")??;
-    Ok(address)
+    result.context("runtime did not execute")?
+}
+
+async fn run_session_once<F>(
+    runtime: Arc<dyn Runtime>,
+    service: &crate::discovery::Service,
+    status: &crate::Status,
+    credential: &crate::credentials::ClientCredential,
+    control: &SessionControl,
+    on_event: &mut F,
+    device_status: &AtomicU8,
+) -> Result<SessionExit>
+where
+    F: FnMut(SessionEvent),
+{
+    let address = crate::discovery::socket_address(service).map_err(anyhow::Error::msg)?;
+    let mut peer = match open_signaling_peer(
+        runtime.clone(),
+        device_status,
+        address,
+        &service.hostname,
+        status,
+        credential,
+    )
+    .await
+    {
+        Ok(peer) => peer,
+        Err(error) => return Ok(SessionExit::Unavailable(error.to_string())),
+    };
+    log::debug!("session signaling authenticated for {}", service.hostname);
+    let mut connected = false;
+    let session_result: Result<SessionExit> = async {
+        peer.session
+            .send_transcript_proof(&peer.proof)
+            .map_err(anyhow::Error::msg)
+            .context("foreground session authorization")?;
+        if control.is_cancelled() {
+            return Ok(SessionExit::Disconnected);
+        }
+        let mut responses = ResponseCursor::new(peer.session.session_id());
+        send_hid_event(
+            &peer.control,
+            crate::hid_protocol::Envelope {
+                message_type: crate::hid_protocol::LEASE_REQUEST,
+                session_id: peer.session.session_id(),
+                lease_epoch: 0,
+                sequence: 0,
+                event: crate::hid_protocol::Event::LeaseRequest,
+            },
+        )
+        .await?;
+        let (response, epoch) =
+            receive_endpoint_response_any_epoch(&*runtime, &peer.control, &mut responses).await?;
+        require_response(
+            response,
+            EndpointResponse::LeaseState {
+                owner: Some(credential.fingerprint),
+                state: 1,
+            },
+        )?;
+        log::info!("session lease granted epoch={epoch}");
+        eprintln!("M2.1 SESSION authenticated=true input_local=true physical_input_capture=off");
+        connected = true;
+        on_event(SessionEvent::ConnectedLocal);
+        let mut sequence = 1;
+        let mut heartbeat = Instant::now();
+        let mut takeover_epoch = epoch;
+        loop {
+            if control.is_cancelled() {
+                let release = send_hid_event(
+                    &peer.control,
+                    crate::hid_protocol::Envelope {
+                        message_type: crate::hid_protocol::LEASE_RELEASE,
+                        session_id: peer.session.session_id(),
+                        lease_epoch: takeover_epoch,
+                        sequence,
+                        event: crate::hid_protocol::Event::LeaseRelease,
+                    },
+                )
+                .await;
+                if release.is_ok() {
+                    let _ = receive_endpoint_response(
+                        &*runtime,
+                        &peer.control,
+                        &mut responses,
+                        next_lease_epoch(takeover_epoch),
+                    )
+                    .await;
+                }
+                return Ok(SessionExit::Disconnected);
+            }
+            if heartbeat.elapsed() >= Duration::from_secs(1) {
+                log::debug!(
+                    "session heartbeat send epoch={} sequence={sequence}",
+                    takeover_epoch
+                );
+                send_hid_event(
+                    &peer.control,
+                    crate::hid_protocol::Envelope {
+                        message_type: crate::hid_protocol::HEARTBEAT,
+                        session_id: peer.session.session_id(),
+                        lease_epoch: takeover_epoch,
+                        sequence,
+                        event: crate::hid_protocol::Event::Heartbeat,
+                    },
+                )
+                .await?;
+                sequence += 1;
+                heartbeat = Instant::now();
+            }
+            match timeout(&*runtime, Duration::from_millis(100), peer.control.poll()).await {
+                Ok(Some(DataChannelEvent::OnMessage(message))) => {
+                    let (response, response_epoch) = responses.decode_any_epoch(&message.data)?;
+                    log::debug!("session response epoch={response_epoch} value={response:?}");
+                    match response {
+                        EndpointResponse::TakeoverNotice {
+                            request_id,
+                            requester,
+                            response_window_ms,
+                        } if response_epoch == takeover_epoch => {
+                            control.start_takeover(request_id, response_window_ms);
+                            on_event(SessionEvent::InputLocalConfirmed);
+                            on_event(SessionEvent::TakeoverPending {
+                                request_id,
+                                requester,
+                                response_window_ms,
+                            });
+                        }
+                        EndpointResponse::LeaseState { owner, state }
+                            if owner == Some(credential.fingerprint)
+                                && (state == 1 || state == 2) =>
+                        {
+                            takeover_epoch = response_epoch;
+                        }
+                        EndpointResponse::Error { code } => {
+                            return Ok(SessionExit::OwnershipLost(format!(
+                                "{code} (endpoint epoch {response_epoch})"
+                            )));
+                        }
+                        EndpointResponse::LeaseState { owner, .. }
+                            if owner != Some(credential.fingerprint) =>
+                        {
+                            return Ok(SessionExit::OwnershipLost(
+                                "another enrolled identity owns target".to_owned(),
+                            ));
+                        }
+                        EndpointResponse::TakeoverResponse { .. } => {}
+                        response => {
+                            return Ok(SessionExit::Lost(format!(
+                                "unexpected foreground response: {response:?}"
+                            )));
+                        }
+                    }
+                }
+                Ok(Some(DataChannelEvent::OnClose)) | Ok(None) => {
+                    return Ok(SessionExit::Lost(
+                        "foreground control channel closed".into(),
+                    ));
+                }
+                Ok(_) | Err(_) => {}
+            }
+            if let Some(request_id) = control.pending_takeover()
+                && let Some(accepted) = control.take_takeover_decision(request_id)
+            {
+                send_hid_event(
+                    &peer.control,
+                    crate::hid_protocol::Envelope {
+                        message_type: crate::hid_protocol::TAKEOVER_RESPONSE,
+                        session_id: peer.session.session_id(),
+                        lease_epoch: takeover_epoch,
+                        sequence,
+                        event: crate::hid_protocol::Event::TakeoverResponse {
+                            request_id,
+                            accepted,
+                        },
+                    },
+                )
+                .await?;
+                sequence += 1;
+                on_event(SessionEvent::Notice(if accepted {
+                    "Takeover accepted; input remains local until ownership changes.".into()
+                } else {
+                    "Takeover rejected; input remains local.".into()
+                }));
+            }
+            if control.takeover_expired() {
+                on_event(SessionEvent::Notice(
+                    "Takeover request expired; input remains local.".into(),
+                ));
+            }
+            runtime.sleep(Duration::from_millis(50)).await;
+        }
+    }
+    .await;
+    peer.close(&*runtime).await;
+    match session_result {
+        Ok(exit) => Ok(exit),
+        Err(error) => {
+            control.clear_takeover();
+            if connected {
+                Ok(SessionExit::Lost(error.to_string()))
+            } else {
+                Ok(SessionExit::Unavailable(error.to_string()))
+            }
+        }
+    }
 }
 
 async fn echo_signaling(
@@ -1328,9 +1798,10 @@ impl ResponseCursor {
         );
         ensure!(
             envelope.sequence == self.next_sequence,
-            "endpoint response sequence mismatch: expected {}, received {}",
+            "endpoint response sequence mismatch: expected {}, received {} ({:?})",
             self.next_sequence,
-            envelope.sequence
+            envelope.sequence,
+            envelope.event
         );
         Ok(envelope)
     }
@@ -1881,6 +2352,65 @@ impl<'a> TakeoverClient<'a> {
         );
         Ok(())
     }
+
+    async fn expect_with_heartbeat(
+        &mut self,
+        epoch: u32,
+        expected: EndpointResponse,
+        deadline: Duration,
+    ) -> Result<()> {
+        let started = Instant::now();
+        let mut heartbeat = started + Duration::from_secs(1);
+        self.send(
+            crate::hid_protocol::HEARTBEAT,
+            epoch,
+            crate::hid_protocol::Event::Heartbeat,
+        )
+        .await?;
+        let received = loop {
+            if Instant::now() >= heartbeat {
+                self.send(
+                    crate::hid_protocol::HEARTBEAT,
+                    epoch,
+                    crate::hid_protocol::Event::Heartbeat,
+                )
+                .await?;
+                heartbeat += Duration::from_secs(1);
+            }
+            if started.elapsed() >= deadline {
+                bail!(
+                    "client {} timed out waiting for {expected:?} at epoch {epoch}",
+                    self.label
+                );
+            }
+            match timeout(
+                self.runtime,
+                Duration::from_millis(100),
+                self.control.poll(),
+            )
+            .await
+            {
+                Ok(Some(DataChannelEvent::OnMessage(message))) => {
+                    break self.responses.decode(&message.data, epoch)?;
+                }
+                Ok(Some(DataChannelEvent::OnClose)) | Ok(None) => {
+                    bail!("scripted control channel closed")
+                }
+                Ok(_) | Err(_) => {}
+            }
+        };
+        eprintln!(
+            "M1.4 TAKEOVER client={} epoch={epoch} response_sequence={} response={received:?}",
+            self.label,
+            self.responses.next_sequence - 1
+        );
+        ensure!(
+            received == expected,
+            "client {} expected {expected:?}",
+            self.label
+        );
+        Ok(())
+    }
 }
 
 fn next_lease_epoch(epoch: u32) -> u32 {
@@ -1935,7 +2465,7 @@ async fn exercise_takeover(
     let notice = |request_id| EndpointResponse::TakeoverNotice {
         request_id,
         requester: owner_b,
-        response_window_ms: 10_000,
+        response_window_ms: 30_000,
     };
     let stale = || EndpointResponse::Error {
         code: "stale_epoch".into(),
@@ -1980,6 +2510,16 @@ async fn exercise_takeover(
     );
     eprintln!("M1.4 TAKEOVER A-held epoch={a_epoch} keys=1 buttons=1");
 
+    a.send(hid::HEARTBEAT, a_epoch, Event::Heartbeat).await?;
+    takeover_heartbeat_processed(
+        a.runtime,
+        monitor,
+        a_epoch,
+        a.sequence - 1,
+        Instant::now() + Duration::from_millis(1500),
+    )
+    .await?;
+
     let rejected = crate::random_id().map_err(anyhow::Error::msg)?;
     b.send(
         hid::TAKEOVER_REQUEST,
@@ -1990,7 +2530,8 @@ async fn exercise_takeover(
     )
     .await?;
     b.expect(a_epoch, pending()).await?;
-    a.expect(a_epoch, notice(rejected)).await?;
+    a.expect_with_heartbeat(a_epoch, notice(rejected), Duration::from_secs(5))
+        .await?;
     a.send(
         hid::TAKEOVER_RESPONSE,
         a_epoch,
@@ -2029,10 +2570,11 @@ async fn exercise_takeover(
     )
     .await?;
     b.expect(a_epoch, pending()).await?;
-    a.expect(a_epoch, notice(timed)).await?;
+    a.expect_with_heartbeat(a_epoch, notice(timed), Duration::from_secs(5))
+        .await?;
     let pending_board_ms = monitor.fresh_snapshot()?.board_timestamp_ms;
     eprintln!("M1.4 TAKEOVER pending epoch={a_epoch} board_timestamp_ms={pending_board_ms}");
-    for heartbeat in 1..=11 {
+    for heartbeat in 1..=39 {
         let due = requested + Duration::from_millis(750 * heartbeat);
         a.runtime
             .sleep(due.saturating_duration_since(Instant::now()))
@@ -2055,7 +2597,7 @@ async fn exercise_takeover(
             b.expect(a_epoch, stale()).await?;
         }
     }
-    let final_sample = requested + Duration::from_secs(9);
+    let final_sample = requested + Duration::from_millis(29_500);
     a.runtime
         .sleep(final_sample.saturating_duration_since(Instant::now()))
         .await;
@@ -2064,7 +2606,7 @@ async fn exercise_takeover(
         monitor,
         a_epoch,
         a.sequence - 1,
-        requested + Duration::from_millis(9700),
+        requested + Duration::from_millis(29_700),
     )
     .await?;
     eprintln!(
@@ -2078,8 +2620,8 @@ async fn exercise_takeover(
     b.expect(b_epoch, owned(owner_b)).await?;
     let elapsed = requested.elapsed();
     ensure!(
-        elapsed >= Duration::from_secs(10),
-        "takeover granted before the 10-second window"
+        elapsed >= Duration::from_secs(30),
+        "takeover granted before the 30-second window"
     );
     a.expect(b_epoch, owned(owner_b)).await?;
     let cleared = monitor.fresh_snapshot()?;
@@ -2110,7 +2652,7 @@ async fn exercise_takeover(
     );
     b.send(hid::KEYBOARD_STATE, b_epoch, key()).await?;
     b.send(hid::MOUSE_BUTTONS, b_epoch, button()).await?;
-    wait_for_scripted_telemetry(monitor, &before_b, 2, b.sequence - 1)?;
+    wait_for_scripted_count(monitor, &before_b, 2)?;
     let accepted = monitor.fresh_snapshot()?;
     ensure!(
         accepted.lease_epoch == b_epoch
@@ -2945,6 +3487,18 @@ mod tests {
     use super::*;
 
     #[test]
+    fn session_control_only_accepts_decision_for_pending_request() {
+        let control = SessionControl::new();
+        let request_id = [7; 16];
+        control.start_takeover(request_id, 30_000);
+        control.respond_to_takeover([8; 16], true);
+        assert_eq!(control.pending_takeover(), Some(request_id));
+        control.respond_to_takeover(request_id, false);
+        assert_eq!(control.take_takeover_decision(request_id), Some(false));
+        assert_eq!(control.pending_takeover(), None);
+    }
+
+    #[test]
     fn rate_limit_evidence_requires_counter_advance_and_handles_wrap() {
         assert_eq!(checked_rate_limit_delta(7, 8, 1).unwrap(), 1);
         assert_eq!(checked_rate_limit_delta(u32::MAX, 0, 1).unwrap(), 1);
@@ -3085,7 +3639,7 @@ mod tests {
             event: crate::hid_protocol::Event::TakeoverNotice {
                 request_id: [1; 16],
                 requester: [2; 32],
-                response_window_ms: 10_000,
+                response_window_ms: 30_000,
             },
         };
         assert_eq!(
@@ -3095,7 +3649,7 @@ mod tests {
             EndpointResponse::TakeoverNotice {
                 request_id: [1; 16],
                 requester: [2; 32],
-                response_window_ms: 10_000,
+                response_window_ms: 30_000,
             }
         );
 

@@ -337,7 +337,9 @@ static void queue_notice_locked(transport_peer_t *slot, const kvmctl_hid_event_t
         memcpy(notice.request_id, request->request_id, sizeof(notice.request_id));
         memcpy(notice.requester, lease_slot_identity(peer_index(slot)), sizeof(notice.requester));
         notice.response_window_ms = LEASE_TAKEOVER_WINDOW_MS;
-        (void)queue_response(&s_peers[i], &notice);
+        bool queued = queue_response(&s_peers[i], &notice);
+        ESP_LOGI("kvmctl_lease", "takeover notice owner_slot=%d requester_slot=%d queued=%d next_response_sequence=%llu",
+                 (int)i, peer_index(slot), queued, (unsigned long long)s_peers[i].response_sequence);
     }
 }
 

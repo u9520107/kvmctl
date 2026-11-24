@@ -24,7 +24,7 @@ pub const HEARTBEAT_VECTOR: &[u8] = &[
 ];
 pub const MAX_CONTROL: usize = 512;
 pub const MAX_MOTION: usize = 64;
-const TAKEOVER_WINDOW_MS: u64 = 10_000;
+const TAKEOVER_WINDOW_MS: u64 = 30_000;
 const HEARTBEAT_EXPIRY_MS: u64 = 3_000;
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -441,7 +441,7 @@ fn payload(reader: &mut Reader<'_>, message_type: u64) -> Result<Event, DecodeEr
                 return Err(DecodeError::UnknownKey);
             }
             let response_window_ms = reader.uint()?;
-            if response_window_ms > 10_000 {
+            if response_window_ms > 30_000 {
                 return Err(DecodeError::InvalidValue);
             }
             Ok(Event::TakeoverNotice {
@@ -908,7 +908,7 @@ mod tests {
             Event::TakeoverNotice {
                 request_id: [5; 16],
                 requester: [6; 32],
-                response_window_ms: 10_000,
+                response_window_ms: 30_000,
             },
             Event::Error {
                 code: "busy".into(),
@@ -1013,8 +1013,32 @@ mod tests {
             state.heartbeat(enrolled_a, state.epoch, 16_996),
             LeaseResult::Granted
         );
-        assert_eq!(state.tick(17_001), LeaseResult::Granted);
-        assert_eq!(state.grant_pending(true, 17_001), LeaseResult::Granted);
+        assert_eq!(
+            state.heartbeat(enrolled_a, state.epoch, 19_995),
+            LeaseResult::Granted
+        );
+        assert_eq!(
+            state.heartbeat(enrolled_a, state.epoch, 22_994),
+            LeaseResult::Granted
+        );
+        assert_eq!(
+            state.heartbeat(enrolled_a, state.epoch, 25_993),
+            LeaseResult::Granted
+        );
+        assert_eq!(
+            state.heartbeat(enrolled_a, state.epoch, 28_992),
+            LeaseResult::Granted
+        );
+        assert_eq!(
+            state.heartbeat(enrolled_a, state.epoch, 31_991),
+            LeaseResult::Granted
+        );
+        assert_eq!(
+            state.heartbeat(enrolled_a, state.epoch, 34_990),
+            LeaseResult::Granted
+        );
+        assert_eq!(state.tick(37_001), LeaseResult::Granted);
+        assert_eq!(state.grant_pending(true, 37_001), LeaseResult::Granted);
         assert_eq!(state.owner, Some(enrolled_b));
         assert_eq!(state.held, HeldState::default());
 
@@ -1024,16 +1048,16 @@ mod tests {
         assert!(state.owner.is_none());
         assert_eq!(state.held, HeldState::default());
         assert_eq!(
-            state.heartbeat(enrolled_b, revoked_epoch, 18_000),
+            state.heartbeat(enrolled_b, revoked_epoch, 38_000),
             LeaseResult::Stale
         );
-        assert_eq!(state.request(enrolled_b, 18_001), LeaseResult::Granted);
+        assert_eq!(state.request(enrolled_b, 38_001), LeaseResult::Granted);
         state.held.buttons = 1;
         state.restart();
         assert!(state.owner.is_none());
         assert_eq!(state.held, HeldState::default());
         assert_eq!(
-            state.heartbeat(enrolled_b, state.epoch.wrapping_sub(1), 18_002),
+            state.heartbeat(enrolled_b, state.epoch.wrapping_sub(1), 38_002),
             LeaseResult::Stale
         );
         assert!(epoch_b < state.epoch);
