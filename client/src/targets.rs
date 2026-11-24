@@ -1,6 +1,12 @@
-use std::fs;
+use std::fs::{self, OpenOptions};
+use std::io::Write;
 use std::net::Ipv4Addr;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::time::{Duration, Instant};
+use windows_sys::Win32::Foundation::ERROR_SHARING_VIOLATION;
+
+static TEMP_COUNTER: AtomicU64 = AtomicU64::new(0);
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Target {
@@ -38,6 +44,28 @@ fn path() -> Result<PathBuf, String> {
         .ok_or("cannot save targets: LOCALAPPDATA is unavailable".into())
 }
 
+fn acquire_lock(path: &Path) -> Result<fs::File, String> {
+    use std::os::windows::fs::OpenOptionsExt;
+
+    let parent = path.parent().ok_or("saved target path has no parent")?;
+    fs::create_dir_all(parent)
+        .map_err(|error| format!("cannot create target directory: {error}"))?;
+    let lock_path = path.with_extension("tsv.lock");
+    let mut options = OpenOptions::new();
+    options.read(true).write(true).create(true).share_mode(0);
+    let deadline = Instant::now() + Duration::from_secs(5);
+    loop {
+        match options.open(&lock_path) {
+            Ok(lock) => return Ok(lock),
+            Err(error)
+                if error.raw_os_error() == Some(ERROR_SHARING_VIOLATION as i32)
+                    && Instant::now() < deadline => {}
+            Err(error) => return Err(format!("cannot lock saved targets: {error}")),
+        }
+        std::thread::sleep(Duration::from_millis(10));
+    }
+}
+
 fn parse_hex(value: &str) -> Option<[u8; 32]> {
     if value.len() != 64 || !value.bytes().all(|byte| byte.is_ascii_hexdigit()) {
         return None;
@@ -55,6 +83,10 @@ fn hex(value: &[u8; 32]) -> String {
 
 pub fn load() -> Result<Vec<Target>, String> {
     let path = path()?;
+    load_from(&path)
+}
+
+fn load_from(path: &Path) -> Result<Vec<Target>, String> {
     let contents = match fs::read_to_string(path) {
         Ok(contents) => contents,
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
@@ -89,7 +121,8 @@ pub fn load() -> Result<Vec<Target>, String> {
 
 pub fn save(target: &Target) -> Result<(), String> {
     let path = path()?;
-    let mut targets = load()?;
+    let _lock = acquire_lock(&path)?;
+    let mut targets = load_from(&path)?;
     if let Some(existing) = targets
         .iter_mut()
         .find(|existing| existing.name.eq_ignore_ascii_case(&target.name))
@@ -102,7 +135,7 @@ pub fn save(target: &Target) -> Result<(), String> {
     write_targets(&path, &targets)
 }
 
-fn write_targets(path: &PathBuf, targets: &[Target]) -> Result<(), String> {
+fn write_targets(path: &Path, targets: &[Target]) -> Result<(), String> {
     let contents = targets
         .iter()
         .map(|target| {
@@ -121,9 +154,28 @@ fn write_targets(path: &PathBuf, targets: &[Target]) -> Result<(), String> {
     let parent = path.parent().ok_or("saved target path has no parent")?;
     fs::create_dir_all(parent)
         .map_err(|error| format!("cannot create target directory: {error}"))?;
-    let temporary = path.with_extension("tsv.tmp");
-    fs::write(&temporary, contents)
-        .map_err(|error| format!("cannot write saved targets: {error}"))?;
+    let file_name = path
+        .file_name()
+        .and_then(|name| name.to_str())
+        .ok_or("saved target path has no file name")?;
+    let temporary = parent.join(format!(
+        ".{file_name}.{}.{}.tmp",
+        std::process::id(),
+        TEMP_COUNTER.fetch_add(1, Ordering::Relaxed)
+    ));
+    let write_result = (|| {
+        let mut file = OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&temporary)
+            .map_err(|error| format!("cannot create saved targets temporary file: {error}"))?;
+        file.write_all(contents.as_bytes())
+            .map_err(|error| format!("cannot write saved targets: {error}"))
+    })();
+    if let Err(error) = write_result {
+        let _ = fs::remove_file(&temporary);
+        return Err(error);
+    }
     let old = path.with_extension("tsv.old");
     if path.exists() {
         let _ = fs::remove_file(&old);
@@ -148,19 +200,27 @@ pub fn find(name: &str) -> Result<Target, String> {
 }
 
 pub fn remove(name: &str) -> Result<(), String> {
-    let mut targets = load()?;
+    let path = path()?;
+    let _lock = acquire_lock(&path)?;
+    let mut targets = load_from(&path)?;
     let before = targets.len();
     targets.retain(|target| !target.name.eq_ignore_ascii_case(name));
     if targets.len() == before {
         return Err(format!("saved target `{name}` was not found"));
     }
-    write_targets(&path()?, &targets)
+    write_targets(&path, &targets)
 }
 
 pub fn update_address(name: &str, address: Ipv4Addr) -> Result<(), String> {
-    let mut target = find(name)?;
+    let path = path()?;
+    let _lock = acquire_lock(&path)?;
+    let mut targets = load_from(&path)?;
+    let target = targets
+        .iter_mut()
+        .find(|target| target.name.eq_ignore_ascii_case(name))
+        .ok_or_else(|| format!("saved target `{name}` was not found"))?;
     target.last_ipv4 = Some(address);
-    save(&target)
+    write_targets(&path, &targets)
 }
 
 #[cfg(test)]
@@ -172,5 +232,6 @@ mod tests {
         assert!(Target::new("board\t1".into(), [0; 32], [0; 32], [0; 32], None).is_err());
         assert!(Target::new("board\n1".into(), [0; 32], [0; 32], [0; 32], None).is_err());
         assert!(Target::new("board".into(), [0; 32], [0; 32], [0; 32], None).is_ok());
+        assert!(Target::new("COMPUTER".into(), [0; 32], [0; 32], [0; 32], None).is_ok());
     }
 }

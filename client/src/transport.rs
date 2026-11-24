@@ -1174,10 +1174,38 @@ pub(crate) fn run_foreground_session(
                             sequence += 1;
                             heartbeat = Instant::now();
                         }
-                        if let Ok(Some(DataChannelEvent::OnClose)) =
-                            timeout(&*runtime, Duration::from_millis(100), peer.control.poll()).await
-                        {
-                            bail!("foreground control channel closed");
+                        match timeout(&*runtime, Duration::from_millis(100), peer.control.poll()).await? {
+                            Some(DataChannelEvent::OnMessage(message)) => {
+                                let (response, response_epoch) =
+                                    responses.decode_any_epoch(&message.data)?;
+                                match response {
+                                    EndpointResponse::TakeoverNotice { .. }
+                                        if response_epoch == epoch =>
+                                    {
+                                        bail!(
+                                            "foreground session ended for takeover request"
+                                        );
+                                    }
+                                    EndpointResponse::Error { code } => {
+                                        bail!(
+                                            "foreground lease lost: {code} (endpoint epoch {response_epoch})"
+                                        );
+                                    }
+                                    EndpointResponse::LeaseState { owner, state }
+                                        if response_epoch == epoch
+                                            && owner == Some(credential.fingerprint)
+                                            && state == 1 => {}
+                                    response => {
+                                        bail!(
+                                            "foreground session ownership changed: {response:?}"
+                                        );
+                                    }
+                                }
+                            }
+                            Some(DataChannelEvent::OnClose) | None => {
+                                bail!("foreground control channel closed")
+                            }
+                            _ => {}
                         }
                         runtime.sleep(Duration::from_millis(50)).await;
                     }

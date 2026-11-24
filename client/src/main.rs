@@ -1586,15 +1586,19 @@ fn read_hidden_line(prompt: &str) -> Result<String, String> {
 }
 
 #[cfg(windows)]
+fn is_com_port_name(value: &str) -> bool {
+    value.len() > 3
+        && value.starts_with("COM")
+        && value[3..].bytes().all(|byte| byte.is_ascii_digit())
+}
+
+#[cfg(windows)]
 fn select_port(
     ports: &[serial::PortInfo],
     requested: Option<&str>,
 ) -> Result<serial::PortInfo, String> {
     if let Some(port) = requested {
-        if !port.starts_with("COM")
-            || !port[3..].bytes().all(|b| b.is_ascii_digit())
-            || port.len() == 3
-        {
+        if !is_com_port_name(port) {
             return Err("invalid COM port".into());
         }
         return ports
@@ -1756,7 +1760,7 @@ fn run_target_command(args: &[String]) -> Result<(), String> {
     }
     if command == "target" && args.get(1).is_some_and(|v| v == "save") {
         let tail = args.get(2..).unwrap_or(&[]);
-        let (requested_port, fields) = if tail.first().is_some_and(|value| value.starts_with("COM"))
+        let (requested_port, fields) = if tail.first().is_some_and(|value| is_com_port_name(value))
         {
             (tail.first().map(String::as_str), &tail[1..])
         } else {
@@ -1847,20 +1851,20 @@ fn run() -> Result<(), String> {
         return Ok(());
     }
     let (requested_port, params) = match command {
-        "led" if args.get(1).is_some_and(|arg| arg.starts_with("COM")) => (
+        "led" if args.get(1).is_some_and(|arg| is_com_port_name(arg)) => (
             args.get(1).map(String::as_str),
             args.get(2..).unwrap_or(&[]),
         ),
         "led" => (None, args.get(1..).unwrap_or(&[])),
-        "flash" if args.get(1).is_some_and(|arg| arg.starts_with("COM")) => (
+        "flash" if args.get(1).is_some_and(|arg| is_com_port_name(arg)) => (
             args.get(1).map(String::as_str),
             args.get(2..).unwrap_or(&[]),
         ),
-        "revoke" if args.get(1).is_some_and(|arg| arg.starts_with("COM")) => (
+        "revoke" if args.get(1).is_some_and(|arg| is_com_port_name(arg)) => (
             args.get(1).map(String::as_str),
             args.get(2..).unwrap_or(&[]),
         ),
-        "signaling-test" if args.get(1).is_some_and(|arg| arg.starts_with("COM")) => (
+        "signaling-test" if args.get(1).is_some_and(|arg| is_com_port_name(arg)) => (
             args.get(1).map(String::as_str),
             args.get(2..).unwrap_or(&[]),
         ),
@@ -2427,6 +2431,17 @@ mod tests {
             None
         );
         assert_eq!(serial::automatic_selection(&[port(true), port(true)]), None);
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn com_port_detection_requires_digits_after_com() {
+        assert!(is_com_port_name("COM1"));
+        assert!(is_com_port_name("COM10"));
+        assert!(!is_com_port_name("COM"));
+        assert!(!is_com_port_name("COMPUTER"));
+        assert!(!is_com_port_name("COM1X"));
+        assert!(!is_com_port_name("com1"));
     }
 
     fn bytes(contents: &str) -> Vec<u8> {
