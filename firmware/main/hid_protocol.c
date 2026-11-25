@@ -84,7 +84,10 @@ static bool payload(reader_t *r, uint64_t type, kvmctl_hid_event_t *event)
         event->accepted = value == 0xf5;
         return true;
     case KVMCTL_HID_LEASE_STATE:
-        if (!map(r, 2) || !uint_value(r, 0) || r->pos >= r->len) return false;
+        {
+        uint64_t field_count = 0;
+        if (!head(r, 5, &field_count) || (field_count != 2 && field_count != 3) ||
+            !uint_value(r, 0) || r->pos >= r->len) return false;
         if (r->data[r->pos] == 0xf6) {
             ++r->pos;
             event->owner_present = false;
@@ -94,7 +97,12 @@ static bool payload(reader_t *r, uint64_t type, kvmctl_hid_event_t *event)
         }
         if (!uint_value(r, 1) || !head(r, 0, &value) || value > 2) return false;
         event->state = (uint8_t)value;
+        if (field_count == 3) {
+            if (!uint_value(r, 2) || !head(r, 0, &event->request_sequence)) return false;
+            event->request_sequence_present = true;
+        }
         return true;
+        }
     case KVMCTL_HID_TAKEOVER_NOTICE:
         if (!map(r, 3) || !uint_value(r, 0) || !bytes(r, event->request_id, 16) ||
             !uint_value(r, 1) || !bytes(r, event->requester, 32) ||
@@ -243,11 +251,14 @@ size_t kvmctl_hid_encode(const kvmctl_hid_event_t *event, uint8_t *data,
         write_uint(&w, 1); if (w.ok && w.pos < w.len) w.data[w.pos++] = event->accepted ? 0xf5 : 0xf4;
         else w.ok = false;
     } else if (event->type == KVMCTL_HID_LEASE_STATE) {
-        write_head(&w, 5, 2); write_uint(&w, 0);
+        write_head(&w, 5, event->request_sequence_present ? 3 : 2); write_uint(&w, 0);
         if (event->owner_present) write_bytes(&w, event->owner, sizeof(event->owner));
         else if (w.ok && w.pos < w.len) w.data[w.pos++] = 0xf6;
         else w.ok = false;
         write_uint(&w, 1); write_uint(&w, event->state);
+        if (event->request_sequence_present) {
+            write_uint(&w, 2); write_uint(&w, event->request_sequence);
+        }
     } else if (event->type == KVMCTL_HID_TAKEOVER_NOTICE) {
         write_head(&w, 5, 3); write_uint(&w, 0); write_bytes(&w, event->request_id, sizeof(event->request_id));
         write_uint(&w, 1); write_bytes(&w, event->requester, sizeof(event->requester));
@@ -298,6 +309,12 @@ bool kvmctl_hid_check_vectors(void)
     size_t encoded_length = kvmctl_hid_encode(&response, encoded, sizeof(encoded));
     if (encoded_length == 0 || !kvmctl_hid_decode(encoded, encoded_length, false, &event) ||
         event.type != KVMCTL_HID_LEASE_STATE || event.owner_present || event.state != 0) return false;
+    response.request_sequence_present = true;
+    response.request_sequence = 42;
+    encoded_length = kvmctl_hid_encode(&response, encoded, sizeof(encoded));
+    if (encoded_length == 0 || !kvmctl_hid_decode(encoded, encoded_length, false, &event) ||
+        event.type != KVMCTL_HID_LEASE_STATE || !event.request_sequence_present ||
+        event.request_sequence != 42) return false;
     response.type = KVMCTL_HID_TAKEOVER_RESPONSE;
     response.request_id[0] = 1;
     response.accepted = true;

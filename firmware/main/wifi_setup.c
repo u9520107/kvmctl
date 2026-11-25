@@ -4,6 +4,11 @@
 #include "esp_netif.h"
 #include "esp_timer.h"
 #include "esp_wifi.h"
+#include "apps/ping/ping_sock.h"
+#include "freertos/FreeRTOS.h"
+#include "freertos/semphr.h"
+#include "freertos/portmacro.h"
+#include "lwip/ip4_addr.h"
 #include "mbedtls/platform_util.h"
 #include "nvs.h"
 #include "recovery.h"
@@ -17,6 +22,20 @@ static bool s_initialized;
 static bool s_started;
 static esp_timer_handle_t s_reconnect_timer;
 static uint8_t s_retry_step;
+static esp_netif_t *s_sta_netif;
+static bool s_connected_once;
+static uint32_t s_reconnect_count;
+static uint32_t s_disconnect_count;
+static uint32_t s_last_disconnect_reason;
+static portMUX_TYPE s_quality_mux = portMUX_INITIALIZER_UNLOCKED;
+
+typedef struct {
+    SemaphoreHandle_t done;
+    uint32_t received;
+    uint32_t total_ms;
+    uint32_t min_ms;
+    uint32_t max_ms;
+} ping_state_t;
 
 static void schedule_reconnect(void);
 
@@ -63,6 +82,23 @@ static void reset_reconnect(void)
     }
 }
 
+static void ping_success(esp_ping_handle_t handle, void *arg)
+{
+    ping_state_t *state = arg;
+    uint32_t elapsed = 0;
+    if (esp_ping_get_profile(handle, ESP_PING_PROF_TIMEGAP, &elapsed, sizeof(elapsed)) != ESP_OK) return;
+    ++state->received;
+    state->total_ms += elapsed;
+    if (elapsed < state->min_ms) state->min_ms = elapsed;
+    if (elapsed > state->max_ms) state->max_ms = elapsed;
+}
+
+static void ping_end(esp_ping_handle_t handle, void *arg)
+{
+    (void)handle;
+    xSemaphoreGive(((ping_state_t *)arg)->done);
+}
+
 static bool valid_passphrase(const uint8_t *passphrase, size_t len)
 {
     if (len >= 8 && len <= 63) {
@@ -107,7 +143,6 @@ static bool valid_utf8(const uint8_t *data, size_t len)
 static void wifi_event_handler(void *arg, esp_event_base_t base, int32_t id, void *data)
 {
     (void)arg;
-    (void)data;
     if (base == WIFI_EVENT && id == WIFI_EVENT_STA_START) {
         s_state = 1;
         if (esp_wifi_connect() != ESP_OK) {
@@ -121,9 +156,19 @@ static void wifi_event_handler(void *arg, esp_event_base_t base, int32_t id, voi
         }
     } else if (base == WIFI_EVENT && id == WIFI_EVENT_STA_DISCONNECTED) {
         s_state = 3;
+        portENTER_CRITICAL(&s_quality_mux);
+        ++s_disconnect_count;
+        if (data != NULL) {
+            s_last_disconnect_reason = ((const wifi_event_sta_disconnected_t *)data)->reason;
+        }
+        portEXIT_CRITICAL(&s_quality_mux);
         schedule_reconnect();
     } else if (base == IP_EVENT && id == IP_EVENT_STA_GOT_IP) {
         s_state = 2;
+        portENTER_CRITICAL(&s_quality_mux);
+        if (s_connected_once) ++s_reconnect_count;
+        s_connected_once = true;
+        portEXIT_CRITICAL(&s_quality_mux);
         reset_reconnect();
     }
 }
@@ -135,7 +180,8 @@ static esp_err_t wifi_stack_init(void)
     if (err != ESP_OK && err != ESP_ERR_INVALID_STATE) return err;
     err = esp_event_loop_create_default();
     if (err != ESP_OK && err != ESP_ERR_INVALID_STATE) return err;
-    if (esp_netif_create_default_wifi_sta() == NULL) return ESP_ERR_NO_MEM;
+    s_sta_netif = esp_netif_create_default_wifi_sta();
+    if (s_sta_netif == NULL) return ESP_ERR_NO_MEM;
 
     wifi_init_config_t config = WIFI_INIT_CONFIG_DEFAULT();
     err = esp_wifi_init(&config);
@@ -187,6 +233,67 @@ static esp_err_t apply_credentials(const uint8_t *ssid, size_t ssid_len,
 uint8_t wifi_setup_state(void)
 {
     return s_state;
+}
+
+esp_err_t wifi_setup_quality(wifi_quality_metrics_t *metrics)
+{
+    if (metrics == NULL || s_sta_netif == NULL || s_state != 2) return ESP_ERR_INVALID_STATE;
+    memset(metrics, 0, sizeof(*metrics));
+    portENTER_CRITICAL(&s_quality_mux);
+    metrics->reconnect_count = s_reconnect_count;
+    metrics->disconnect_count = s_disconnect_count;
+    metrics->last_disconnect_reason = s_last_disconnect_reason;
+    portEXIT_CRITICAL(&s_quality_mux);
+
+    wifi_ap_record_t ap = {0};
+    if (esp_wifi_sta_get_ap_info(&ap) != ESP_OK) return ESP_ERR_INVALID_STATE;
+    metrics->rssi_offset = (uint8_t)((int)ap.rssi + 128);
+    metrics->channel = ap.primary;
+
+    esp_netif_ip_info_t ip_info = {0};
+    esp_err_t err = esp_netif_get_ip_info(s_sta_netif, &ip_info);
+    if (err != ESP_OK || ip_info.gw.addr == 0) return ESP_ERR_INVALID_STATE;
+    memcpy(metrics->ping_target, &ip_info.gw.addr, sizeof(metrics->ping_target));
+
+    ping_state_t state = {
+        .done = xSemaphoreCreateBinary(),
+        .min_ms = UINT32_MAX,
+    };
+    if (state.done == NULL) return ESP_ERR_NO_MEM;
+    esp_ping_config_t config = ESP_PING_DEFAULT_CONFIG();
+    config.count = 20;
+    config.interval_ms = 100;
+    config.timeout_ms = 500;
+    ip_addr_set_ip4_u32(&config.target_addr, ip_info.gw.addr);
+    esp_ping_callbacks_t callbacks = {
+        .cb_args = &state,
+        .on_ping_success = ping_success,
+        .on_ping_timeout = NULL,
+        .on_ping_end = ping_end,
+    };
+    esp_ping_handle_t handle = NULL;
+    err = esp_ping_new_session(&config, &callbacks, &handle);
+    if (err == ESP_OK) err = esp_ping_start(handle);
+    if (err == ESP_OK && xSemaphoreTake(state.done, pdMS_TO_TICKS(12000)) != pdTRUE) {
+        err = ESP_ERR_TIMEOUT;
+    }
+    uint32_t sent = 0;
+    if (handle != NULL &&
+        esp_ping_get_profile(handle, ESP_PING_PROF_REQUEST, &sent, sizeof(sent)) != ESP_OK) {
+        sent = config.count;
+    }
+    if (handle != NULL) {
+        esp_ping_stop(handle);
+        esp_ping_delete_session(handle);
+    }
+    vSemaphoreDelete(state.done);
+    if (err != ESP_OK) return err;
+    metrics->ping_sent = sent;
+    metrics->ping_received = state.received;
+    metrics->ping_min_ms = state.received == 0 ? 0 : state.min_ms;
+    metrics->ping_avg_ms = state.received == 0 ? 0 : state.total_ms / state.received;
+    metrics->ping_max_ms = state.max_ms;
+    return ESP_OK;
 }
 
 esp_err_t wifi_setup_init(void)

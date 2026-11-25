@@ -25,7 +25,7 @@ pub const HEARTBEAT_VECTOR: &[u8] = &[
 pub const MAX_CONTROL: usize = 512;
 pub const MAX_MOTION: usize = 64;
 const TAKEOVER_WINDOW_MS: u64 = 30_000;
-const HEARTBEAT_EXPIRY_MS: u64 = 3_000;
+const HEARTBEAT_EXPIRY_MS: u64 = 10_000;
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Event {
@@ -40,6 +40,7 @@ pub enum Event {
     LeaseState {
         owner: Option<[u8; 32]>,
         state: u8,
+        request_sequence: Option<u64>,
     },
     Heartbeat,
     TakeoverNotice {
@@ -261,8 +262,12 @@ pub fn encode(envelope: &Envelope) -> Vec<u8> {
             field(&mut out, 1);
             out.push(if *accepted { 0xf5 } else { 0xf4 });
         }
-        Event::LeaseState { owner, state } => {
-            put_head(&mut out, 5, 2);
+        Event::LeaseState {
+            owner,
+            state,
+            request_sequence,
+        } => {
+            put_head(&mut out, 5, if request_sequence.is_some() { 3 } else { 2 });
             field(&mut out, 0);
             match owner {
                 Some(owner) => bytes(&mut out, owner),
@@ -270,6 +275,10 @@ pub fn encode(envelope: &Envelope) -> Vec<u8> {
             }
             field(&mut out, 1);
             uint(&mut out, *state as u64);
+            if let Some(request_sequence) = request_sequence {
+                field(&mut out, 2);
+                uint(&mut out, *request_sequence);
+            }
         }
         Event::KeyboardState { modifiers, keys } => {
             put_head(&mut out, 5, 2);
@@ -391,7 +400,10 @@ fn payload(reader: &mut Reader<'_>, message_type: u64) -> Result<Event, DecodeEr
             })
         }
         LEASE_STATE => {
-            reader.map(2)?;
+            let field_count = reader.head(5)?;
+            if field_count != 2 && field_count != 3 {
+                return Err(DecodeError::WrongFieldCount);
+            }
             if reader.uint()? != 0 {
                 return Err(DecodeError::UnknownKey);
             }
@@ -419,7 +431,19 @@ fn payload(reader: &mut Reader<'_>, message_type: u64) -> Result<Event, DecodeEr
             if state > 2 {
                 return Err(DecodeError::InvalidValue);
             }
-            Ok(Event::LeaseState { owner, state })
+            let request_sequence = if field_count == 3 {
+                if reader.uint()? != 2 {
+                    return Err(DecodeError::UnknownKey);
+                }
+                Some(reader.uint()?)
+            } else {
+                None
+            };
+            Ok(Event::LeaseState {
+                owner,
+                state,
+                request_sequence,
+            })
         }
         TAKEOVER_NOTICE => {
             reader.map(3)?;
@@ -833,6 +857,17 @@ mod tests {
         bytes.push(1);
         assert!(decode(&bytes).is_err());
     }
+
+    #[test]
+    fn lease_state_can_echo_heartbeat_request_sequence() {
+        let event = Event::LeaseState {
+            owner: Some([8; 32]),
+            state: 1,
+            request_sequence: Some(42),
+        };
+        let decoded = decode(&encode(&env(event.clone(), 7, 3))).unwrap();
+        assert_eq!(decoded.event, event);
+    }
     #[test]
     fn lease_is_exclusive_and_takeover_bounded() {
         let a = [1; 32];
@@ -860,8 +895,8 @@ mod tests {
         assert_eq!(state.heartbeat(a, state.epoch, 1), LeaseResult::Granted);
         state.held.buttons = 1;
         state.takeover(a, b, [1; 16], 1);
-        assert_eq!(state.tick(3_001), LeaseResult::Granted);
-        assert_eq!(state.grant_pending(true, 3_001), LeaseResult::Granted);
+        assert_eq!(state.tick(10_001), LeaseResult::Granted);
+        assert_eq!(state.grant_pending(true, 10_001), LeaseResult::Granted);
         assert_eq!(state.owner, Some(b));
         assert_eq!(state.held, HeldState::default());
     }
@@ -904,6 +939,7 @@ mod tests {
             Event::LeaseState {
                 owner: None,
                 state: 0,
+                request_sequence: None,
             },
             Event::TakeoverNotice {
                 request_id: [5; 16],
@@ -976,14 +1012,14 @@ mod tests {
             state.takeover(enrolled_b, enrolled_a, expiry_takeover, 6),
             LeaseResult::AcceptedPending
         );
-        assert_eq!(state.tick(3_006), LeaseResult::Granted);
-        assert_eq!(state.grant_pending(true, 3_006), LeaseResult::Granted);
+        assert_eq!(state.tick(10_006), LeaseResult::Granted);
+        assert_eq!(state.grant_pending(true, 10_006), LeaseResult::Granted);
         assert_eq!(state.owner, Some(enrolled_a));
         assert_eq!(state.held, HeldState::default());
 
         let old_epoch = state.epoch;
         state.held.buttons = 1;
-        assert_eq!(state.tick(6_007), LeaseResult::Expired);
+        assert_eq!(state.tick(20_007), LeaseResult::Expired);
         assert!(state.owner.is_none());
         assert_eq!(state.held, HeldState::default());
         assert_eq!(
@@ -1083,8 +1119,8 @@ mod tests {
             state.takeover(a, b, [4; 16], 4),
             LeaseResult::AcceptedPending
         );
-        assert_eq!(state.tick(3_004), LeaseResult::Granted);
-        assert_eq!(state.grant_pending(false, 3_004), LeaseResult::Rejected);
+        assert_eq!(state.tick(10_004), LeaseResult::Granted);
+        assert_eq!(state.grant_pending(false, 10_004), LeaseResult::Rejected);
         assert!(state.owner.is_none() && state.pending.is_none());
     }
 }

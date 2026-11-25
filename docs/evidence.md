@@ -1555,3 +1555,70 @@ cleanup deadlines and repeat interval are justified by the passing integrated
 baseline above; physical-input capture remains disabled by policy. No
 standalone Windows executable was built or delivered. All working-tree changes
 remain uncommitted.
+
+### Resilient heartbeat and Wi-Fi diagnostics (2026-11-25)
+
+Resident-session timing changed after board power-loss testing showed one-second heartbeats and three-second lease expiry left too little room for transient Wi-Fi loss. Client now sends request/response heartbeat every 3 seconds, allows one in flight, marks tray degraded after first missed response, and reconnects after three consecutive misses. Firmware lease expiry is 10 seconds as safety margin. Degradation stays in tray; reconnecting/recovery remains visible through lifecycle state and OSD.
+
+Board diagnostics available as `wifi-test [COMx]`. Command reads RSSI, channel, Wi-Fi reconnect/disconnect counters, last disconnect reason, then sends 20 ICMP echo requests to station default gateway with 100 ms interval and 500 ms timeout. Reports sent/received, loss, minimum/average/maximum RTT. Diagnostic snapshot, not replacement for sustained packet-loss testing.
+
+Observed before implementation: host-to-router ping had 0% loss over 20 packets; host-to-board (`192.168.50.137`) had 1 timeout in 30 packets (3% loss), 30--128 ms samples, 74 ms average. Same period included SCTP `T3-rtx timed out` and `nT3Timeouts`/`nAckTimeouts` logs. Evidence shows board-path instability, not proof ESP32 or access point alone caused it.
+
+Espressif documentation confirms ESP32-S3 is 2.4 GHz 802.11 b/g/n and default modem-sleep policy can delay receive work until DTIM. Later controlled A/B test should compare current policy with `WIFI_PS_NONE`; do not change power policy from one short ping sample. Capture RSSI, channel, disconnect reason, reconnect count, gateway loss, client heartbeat misses, and lease expiry together.
+
+Input implication: current transport and firmware tests keep physical input disabled. Before M2.3 enables Windows capture, every lease-loss path must emit an all-up keyboard/button snapshot locally, then keep input disarmed until fresh authenticated session and lease epoch. Outage input discarded, never queued or replayed. Applies to heartbeat expiry, release, disconnect, peer cleanup, takeover, target switch, revoke, endpoint restart, and reconnect.
+
+### M2.2 resident tray and session lifecycle closure (2026-11-25)
+
+M2.2 was closed after live tray validation on the recognized CH343 board at
+COM6. The current source client showed the transient starting/connecting state,
+connected/local status, target tooltip, centered OSD notices, and recovery
+status. Physical input remained local throughout; no HID reports were enabled.
+
+The heartbeat implementation uses a request/response lease heartbeat rather
+than a one-way ping. The client sends immediately after lease acquisition,
+permits only one outstanding heartbeat, marks the tray degraded after one
+miss, and reconnects after three consecutive missing `LeaseState` responses.
+The firmware returns a state response for an accepted heartbeat and keeps a
+10-second lease safety expiry. The on-board
+transport test passed with:
+
+```text
+M1.2 TRANSPORT COMPLETE sessions=2 reconnect=clean hid_reports=0
+```
+
+The test's heartbeat-aware response path required a heartbeat acknowledgement
+while exercising both the initial and reconnect sessions. Rust unit tests also
+passed with 51 tests and zero failures.
+
+The updated firmware was built and flashed app-only to COM6:
+
+```text
+Firmware: b18f5f3-dirty
+Image: firmware/build/kvmctl_firmware.bin
+Bytes: 1,266,208
+SHA-256: 6340f216810253e5003607d2b1182a81b92b866fb751bcf261b2fc40fcda4c44
+Backup: firmware/backups/factory-app-heartbeat-COM6-20261125.bin
+Backup bytes: 2,031,616
+Post-flash status: Wi-Fi connected; identity and TLS pin unchanged
+```
+
+Power-loss recovery was observed in the resident client log. After a connected
+session held lease epoch 3, the client recorded `session transport lost:
+heartbeat response timeout`, closed the session, reconnected, reached WebRTC
+connected again, and received lease epoch 1. This confirms stale connected
+state is cleared by a failed request/response heartbeat and that automatic
+recovery returns to local input.
+
+Post-fix validation used the firmware image with the ESP peer DTLS idle-read
+timeout retry. The app-only flash wrote 1,273,504 bytes at `0x10000`, verified
+SHA-256 `09cd75c4bc8e4143c9f912a1397e6a4a78c67976736a6e211a1adae3355b3603`,
+and wrote no backup. The first post-flash session recorded 28 acknowledged
+heartbeats at 76--230 ms. During the controlled power-loss test, the client
+recorded three consecutive heartbeat misses, declared transport lost, rebuilt
+the WebRTC session, received a new lease epoch, and then recorded 11
+acknowledged heartbeats at 72--231 ms. No post-fix 1--2 second RTT spikes or
+stale connected state appeared.
+
+Closure decision: M2.2 is closed for the defined resident-tray and session
+lifecycle acceptance fields. Live physical-input capture remains gated to M2.3.

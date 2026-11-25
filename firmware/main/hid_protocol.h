@@ -38,6 +38,8 @@ typedef struct {
     bool owner_present;
     uint8_t owner[32];
     uint8_t state;
+    bool request_sequence_present;
+    uint64_t request_sequence;
     uint8_t requester[32];
     uint64_t response_window_ms;
     char error_code[33];

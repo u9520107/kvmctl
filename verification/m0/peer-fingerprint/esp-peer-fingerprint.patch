@@ -310,6 +310,40 @@
  
 --- a/components/esp_peer/src/dtls_common.h
 +++ b/components/esp_peer/src/dtls_common.h
+@@ -645,26 +645,32 @@
+ int dtls_srtp_read(dtls_srtp_t *dtls_srtp, unsigned char *buf, size_t len)
+ {
+     int ret = 0;
+     int read_bytes = 0;
++    bool timeout_retried = false;
+     media_lib_mutex_lock(dtls_srtp->lock, MEDIA_LIB_MAX_LOCK_TIME);
+     while (read_bytes < len) {
+         measure_start("ssl_read");
+         ret = mbedtls_ssl_read(&dtls_srtp->ssl, buf + read_bytes, len - read_bytes);
+         measure_stop("ssl_read");
+         if (ret > 0) {
+             read_bytes += ret;
+             continue;
+         } else if (ret == 0 || ret == MBEDTLS_ERR_SSL_PEER_CLOSE_NOTIFY ||
+                    ret == MBEDTLS_ERR_SSL_CLIENT_RECONNECT) {
+             ESP_LOGE(TAG, "Detected DTLS connection close ret %d", ret);
+             ret = MBEDTLS_ERR_SSL_PEER_CLOSE_NOTIFY;
+             break;
+-        } else if (ret == MBEDTLS_ERR_SSL_WANT_READ || ret == MBEDTLS_ERR_SSL_TIMEOUT) {
++        } else if (ret == MBEDTLS_ERR_SSL_TIMEOUT && !timeout_retried) {
++            /* mbedTLS can expire its timer before consuming a datagram already
++             * supplied by the datagram BIO; retry after it clears that timer. */
++            timeout_retried = true;
++            continue;
++        } else if (ret == MBEDTLS_ERR_SSL_WANT_READ || ret == MBEDTLS_ERR_SSL_TIMEOUT) {
+             ret = 0;
+             break;
+         } else {
+             ESP_LOGE(TAG, "mbedtls_ssl_read error: %d", ret);
+             ret = 0;
+             break;
+         }
+     }
 @@ -534,6 +534,11 @@
      return ret;
  }

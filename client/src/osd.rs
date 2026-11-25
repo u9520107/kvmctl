@@ -155,11 +155,12 @@ unsafe fn paint(window: HWND) -> LRESULT {
                 right: rect.right - PADDING_X,
                 bottom: rect.bottom - PADDING_Y,
             };
+            let mut measure_rect = text_rect;
             let text_height = DrawTextW(
                 dc,
                 text.as_ptr(),
                 text_len,
-                &mut text_rect,
+                &mut measure_rect,
                 DT_CENTER | DT_WORDBREAK | DT_NOPREFIX | DT_CALCRECT,
             );
             text_rect.top = rect.top + ((rect.bottom - rect.top - text_height) / 2).max(PADDING_Y);

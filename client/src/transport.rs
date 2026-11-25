@@ -23,6 +23,9 @@ static RTC_ERROR_CLASS: AtomicU8 = AtomicU8::new(0);
 static RTC_ERROR_LOCATION: OnceLock<(String, Option<u32>)> = OnceLock::new();
 static LOG_LEVEL: OnceLock<LevelFilter> = OnceLock::new();
 
+const HEARTBEAT_INTERVAL: Duration = Duration::from_secs(3);
+const HEARTBEAT_MISS_LIMIT: u8 = 3;
+
 #[derive(Default)]
 struct ConnectionStates {
     ice: String,
@@ -33,10 +36,16 @@ struct CertificateLog;
 
 impl Log for CertificateLog {
     fn enabled(&self, metadata: &Metadata<'_>) -> bool {
-        LOG_LEVEL
-            .get()
-            .and_then(LevelFilter::to_level)
-            .is_some_and(|level| metadata.level() <= level)
+        let Some(level) = LOG_LEVEL.get().and_then(LevelFilter::to_level) else {
+            return false;
+        };
+        if metadata.level() > level {
+            return false;
+        }
+        metadata.level() <= log::Level::Info
+            || level == log::Level::Trace
+            || metadata.target() == "kvmctl"
+            || metadata.target().starts_with("kvmctl::")
     }
 
     fn log(&self, record: &Record<'_>) {
@@ -1166,6 +1175,12 @@ pub(crate) fn run_foreground_session(
                 println!("Connected/local. Press Enter to disconnect.")
             }
             SessionEvent::InputLocalConfirmed => {}
+            SessionEvent::ConnectionDegraded { missed } => {
+                println!("Connection degraded; heartbeat misses={missed}")
+            }
+            SessionEvent::ConnectionRecovered { rtt_ms } => {
+                println!("Connection recovered; heartbeat RTT={rtt_ms}ms")
+            }
             SessionEvent::TakeoverPending { .. } => {
                 println!("Takeover requested. Input remains local. Accept? type yes or no:")
             }
@@ -1185,6 +1200,12 @@ pub(crate) enum SessionEvent {
     Connecting,
     ConnectedLocal,
     InputLocalConfirmed,
+    ConnectionDegraded {
+        missed: u8,
+    },
+    ConnectionRecovered {
+        rtt_ms: u64,
+    },
     TakeoverPending {
         request_id: [u8; 16],
         requester: [u8; 32],
@@ -1606,7 +1627,11 @@ where
         connected = true;
         on_event(SessionEvent::ConnectedLocal);
         let mut sequence = 1;
-        let mut heartbeat = Instant::now();
+        let mut heartbeat_due = Instant::now();
+        let mut heartbeat_sent_at = None;
+        let mut heartbeat_request_sequence = None;
+        let mut missed_heartbeats = 0u8;
+        let mut degraded = false;
         let mut takeover_epoch = epoch;
         loop {
             if control.is_cancelled() {
@@ -1632,7 +1657,26 @@ where
                 }
                 return Ok(SessionExit::Disconnected);
             }
-            if heartbeat.elapsed() >= Duration::from_secs(1) {
+            let now = Instant::now();
+            if heartbeat_sent_at.is_some_and(|sent_at| now.duration_since(sent_at) >= HEARTBEAT_INTERVAL) {
+                heartbeat_sent_at = None;
+                heartbeat_request_sequence = None;
+                missed_heartbeats = missed_heartbeats.saturating_add(1);
+                log::warn!("session heartbeat missed count={missed_heartbeats}");
+                if !degraded {
+                    degraded = true;
+                    on_event(SessionEvent::ConnectionDegraded {
+                        missed: missed_heartbeats,
+                    });
+                }
+                if missed_heartbeats >= HEARTBEAT_MISS_LIMIT {
+                    return Ok(SessionExit::Lost(format!(
+                        "heartbeat missed {missed_heartbeats} consecutive responses"
+                    )));
+                }
+            }
+            if heartbeat_sent_at.is_none() && now >= heartbeat_due {
+                let send_started = Instant::now();
                 log::debug!(
                     "session heartbeat send epoch={} sequence={sequence}",
                     takeover_epoch
@@ -1648,12 +1692,21 @@ where
                     },
                 )
                 .await?;
+                let send_completed = Instant::now();
                 sequence += 1;
-                heartbeat = Instant::now();
+                heartbeat_due += HEARTBEAT_INTERVAL;
+                heartbeat_request_sequence = Some(sequence - 1);
+                heartbeat_sent_at = Some(send_completed);
+                log::debug!(
+                    "session heartbeat send-complete sequence={} enqueue_ms={}",
+                    sequence - 1,
+                    send_completed.duration_since(send_started).as_millis()
+                );
             }
             match timeout(&*runtime, Duration::from_millis(100), peer.control.poll()).await {
                 Ok(Some(DataChannelEvent::OnMessage(message))) => {
                     let (response, response_epoch) = responses.decode_any_epoch(&message.data)?;
+                    let response_request_sequence = responses.take_request_sequence();
                     log::debug!("session response epoch={response_epoch} value={response:?}");
                     match response {
                         EndpointResponse::TakeoverNotice {
@@ -1661,6 +1714,13 @@ where
                             requester,
                             response_window_ms,
                         } if response_epoch == takeover_epoch => {
+                            log::warn!(
+                                "session takeover notice epoch={} requester={} request={} window_ms={}",
+                                response_epoch,
+                                crate::hex(&requester[..4]),
+                                crate::hex(&request_id[..4]),
+                                response_window_ms
+                            );
                             control.start_takeover(request_id, response_window_ms);
                             on_event(SessionEvent::InputLocalConfirmed);
                             on_event(SessionEvent::TakeoverPending {
@@ -1673,17 +1733,72 @@ where
                             if owner == Some(credential.fingerprint)
                                 && (state == 1 || state == 2) =>
                         {
+                            let heartbeat_acknowledged = matches!(
+                                (response_request_sequence, heartbeat_request_sequence),
+                                (Some(received), Some(pending)) if received == pending
+                            );
+                            if heartbeat_acknowledged {
+                                if let Some(sent_at) = heartbeat_sent_at.take() {
+                                    let rtt_ms = Instant::now()
+                                        .duration_since(sent_at)
+                                        .as_millis()
+                                        .min(u128::from(u64::MAX))
+                                        as u64;
+                                    log::debug!(
+                                        "session heartbeat acknowledged epoch={response_epoch} rtt_ms={rtt_ms}"
+                                    );
+                                    if missed_heartbeats != 0 && degraded {
+                                        on_event(SessionEvent::ConnectionRecovered { rtt_ms });
+                                    }
+                                    missed_heartbeats = 0;
+                                    degraded = false;
+                                    heartbeat_request_sequence = None;
+                                }
+                            } else {
+                                log::debug!(
+                                    "session state ignored as heartbeat ack response_request_sequence={response_request_sequence:?} pending_request_sequence={heartbeat_request_sequence:?}"
+                                );
+                            }
                             takeover_epoch = response_epoch;
                         }
                         EndpointResponse::Error { code } => {
+                            log::warn!(
+                                "session lease error epoch={} code={code}",
+                                response_epoch
+                            );
                             return Ok(session_error_exit(&code, response_epoch));
                         }
-                        EndpointResponse::LeaseState { owner, .. }
-                            if owner != Some(credential.fingerprint) =>
-                        {
-                            return Ok(SessionExit::OwnershipLost(
-                                "another enrolled identity owns target".to_owned(),
-                            ));
+                        EndpointResponse::LeaseState { owner, state } => match owner {
+                            Some(owner) if owner != credential.fingerprint => {
+                                log::warn!(
+                                    "session lease owner mismatch epoch={} state={} local={} remote={}",
+                                    response_epoch,
+                                    state,
+                                    crate::hex(&credential.fingerprint[..4]),
+                                    crate::hex(&owner[..4])
+                                );
+                                return Ok(SessionExit::OwnershipLost(format!(
+                                    "another enrolled identity owns target (owner={} epoch={} state={})",
+                                    crate::hex(&owner[..4]),
+                                    response_epoch,
+                                    state
+                                )));
+                            }
+                            None => {
+                                log::warn!(
+                                    "session lease expired epoch={} state={} owner=none",
+                                    response_epoch,
+                                    state
+                                );
+                                return Ok(SessionExit::Lost(format!(
+                                    "endpoint lease expired (endpoint epoch {response_epoch})"
+                                )));
+                            }
+                            Some(_) => {
+                                return Ok(SessionExit::Lost(format!(
+                                    "unexpected endpoint lease state {state} (endpoint epoch {response_epoch})"
+                                )));
+                            }
                         }
                         EndpointResponse::TakeoverResponse { .. } => {}
                         response => {
@@ -1814,6 +1929,7 @@ enum EndpointResponse {
 struct ResponseCursor {
     session_id: [u8; 16],
     next_sequence: u64,
+    last_request_sequence: Option<u64>,
 }
 
 impl ResponseCursor {
@@ -1821,6 +1937,7 @@ impl ResponseCursor {
         Self {
             session_id,
             next_sequence: 0,
+            last_request_sequence: None,
         }
     }
 
@@ -1832,6 +1949,7 @@ impl ResponseCursor {
             envelope.lease_epoch,
             envelope.event
         );
+        self.last_request_sequence = Self::request_sequence(&envelope.event);
         self.advance()?;
         Self::response(envelope.event)
     }
@@ -1839,8 +1957,22 @@ impl ResponseCursor {
     fn decode_any_epoch(&mut self, data: &[u8]) -> Result<(EndpointResponse, u32)> {
         let envelope = self.decode_envelope(data)?;
         let epoch = envelope.lease_epoch;
+        self.last_request_sequence = Self::request_sequence(&envelope.event);
         self.advance()?;
         Ok((Self::response(envelope.event)?, epoch))
+    }
+
+    fn take_request_sequence(&mut self) -> Option<u64> {
+        self.last_request_sequence.take()
+    }
+
+    fn request_sequence(event: &crate::hid_protocol::Event) -> Option<u64> {
+        match event {
+            crate::hid_protocol::Event::LeaseState {
+                request_sequence, ..
+            } => *request_sequence,
+            _ => None,
+        }
     }
 
     fn decode_envelope(&self, data: &[u8]) -> Result<crate::hid_protocol::Envelope> {
@@ -1870,7 +2002,7 @@ impl ResponseCursor {
 
     fn response(event: crate::hid_protocol::Event) -> Result<EndpointResponse> {
         Ok(match event {
-            crate::hid_protocol::Event::LeaseState { owner, state } => {
+            crate::hid_protocol::Event::LeaseState { owner, state, .. } => {
                 EndpointResponse::LeaseState { owner, state }
             }
             crate::hid_protocol::Event::TakeoverResponse {
@@ -1943,6 +2075,24 @@ async fn send_hid_event(
     let encoded = crate::hid_protocol::encode(&event);
     channel.send(BytesMut::from(encoded.as_slice())).await?;
     Ok(())
+}
+
+async fn send_heartbeat(
+    runtime: &dyn Runtime,
+    control: &Arc<dyn DataChannel>,
+    responses: &mut ResponseCursor,
+    event: crate::hid_protocol::Envelope,
+    epoch: u32,
+    client_fingerprint: [u8; 32],
+) -> Result<()> {
+    send_hid_event(control, event).await?;
+    require_response(
+        receive_endpoint_response(runtime, control, responses, epoch).await?,
+        EndpointResponse::LeaseState {
+            owner: Some(client_fingerprint),
+            state: 1,
+        },
+    )
 }
 
 async fn send_timed_hid_event(
@@ -2105,14 +2255,18 @@ async fn scripted_transport(
         let started = Instant::now();
         for repeat in 0..SUSTAIN_REPEAT_COUNT {
             let control_sequence = 2 + u64::from(repeat) * 4;
-            send_hid_event(
+            send_heartbeat(
+                runtime,
                 control,
+                &mut responses,
                 event(
                     hid_protocol::HEARTBEAT,
                     epoch,
                     control_sequence,
                     Event::Heartbeat,
                 ),
+                epoch,
+                client_fingerprint,
             )
             .await?;
             send_hid_event(
@@ -2213,9 +2367,13 @@ async fn scripted_transport(
         return Ok(());
     }
 
-    send_hid_event(
+    send_heartbeat(
+        runtime,
         control,
+        &mut responses,
         event(hid_protocol::HEARTBEAT, epoch, 1 + offset, Event::Heartbeat),
+        epoch,
+        client_fingerprint,
     )
     .await?;
     send_timed_hid_event(
@@ -2384,6 +2542,21 @@ impl<'a> TakeoverClient<'a> {
         Ok(())
     }
 
+    async fn heartbeat(&mut self, epoch: u32) -> Result<()> {
+        self.send(
+            crate::hid_protocol::HEARTBEAT,
+            epoch,
+            crate::hid_protocol::Event::Heartbeat,
+        )
+        .await?;
+        match receive_endpoint_response(self.runtime, self.control, &mut self.responses, epoch)
+            .await?
+        {
+            EndpointResponse::LeaseState { state: 1 | 2, .. } => Ok(()),
+            response => bail!("client {} heartbeat got {response:?}", self.label),
+        }
+    }
+
     async fn expect(&mut self, epoch: u32, expected: EndpointResponse) -> Result<()> {
         let received =
             receive_endpoint_response(self.runtime, self.control, &mut self.responses, epoch)
@@ -2414,7 +2587,8 @@ impl<'a> TakeoverClient<'a> {
         deadline: Duration,
     ) -> Result<()> {
         let started = Instant::now();
-        let mut heartbeat = started + Duration::from_secs(1);
+        let mut heartbeat = started + HEARTBEAT_INTERVAL;
+        let mut heartbeat_acknowledged = false;
         self.send(
             crate::hid_protocol::HEARTBEAT,
             epoch,
@@ -2429,7 +2603,7 @@ impl<'a> TakeoverClient<'a> {
                     crate::hid_protocol::Event::Heartbeat,
                 )
                 .await?;
-                heartbeat += Duration::from_secs(1);
+                heartbeat += HEARTBEAT_INTERVAL;
             }
             if started.elapsed() >= deadline {
                 bail!(
@@ -2445,7 +2619,12 @@ impl<'a> TakeoverClient<'a> {
             .await
             {
                 Ok(Some(DataChannelEvent::OnMessage(message))) => {
-                    break self.responses.decode(&message.data, epoch)?;
+                    let response = self.responses.decode(&message.data, epoch)?;
+                    if matches!(&response, EndpointResponse::LeaseState { .. }) {
+                        heartbeat_acknowledged = true;
+                        continue;
+                    }
+                    break response;
                 }
                 Ok(Some(DataChannelEvent::OnClose)) | Ok(None) => {
                     bail!("scripted control channel closed")
@@ -2457,6 +2636,10 @@ impl<'a> TakeoverClient<'a> {
             "M1.4 TAKEOVER client={} epoch={epoch} response_sequence={} response={received:?}",
             self.label,
             self.responses.next_sequence - 1
+        );
+        ensure!(
+            heartbeat_acknowledged,
+            "heartbeat did not receive a lease-state response"
         );
         ensure!(
             received == expected,
@@ -2564,7 +2747,7 @@ async fn exercise_takeover(
     );
     eprintln!("M1.4 TAKEOVER A-held epoch={a_epoch} keys=1 buttons=1");
 
-    a.send(hid::HEARTBEAT, a_epoch, Event::Heartbeat).await?;
+    a.heartbeat(a_epoch).await?;
     takeover_heartbeat_processed(
         a.runtime,
         monitor,
@@ -2606,7 +2789,7 @@ async fn exercise_takeover(
     a.expect(a_epoch, owned(owner_a)).await?;
     b.expect(a_epoch, owned(owner_a)).await?;
 
-    a.send(hid::HEARTBEAT, a_epoch, Event::Heartbeat).await?;
+    a.heartbeat(a_epoch).await?;
     takeover_heartbeat_processed(
         a.runtime,
         monitor,
@@ -2633,7 +2816,7 @@ async fn exercise_takeover(
         a.runtime
             .sleep(due.saturating_duration_since(Instant::now()))
             .await;
-        a.send(hid::HEARTBEAT, a_epoch, Event::Heartbeat).await?;
+        a.heartbeat(a_epoch).await?;
         let metrics = monitor.snapshot();
         ensure!(
             metrics.lease_epoch == a_epoch
@@ -2690,7 +2873,7 @@ async fn exercise_takeover(
         elapsed.as_millis()
     );
     let heartbeat_baseline = monitor.fresh_snapshot()?;
-    b.send(hid::HEARTBEAT, b_epoch, Event::Heartbeat).await?;
+    b.heartbeat(b_epoch).await?;
     wait_for_scripted_telemetry(monitor, &heartbeat_baseline, 1, b.sequence - 1)?;
     if hid_baseline.is_some() {
         b.send(hid::HID_BENCH_ARM, b_epoch, Event::HidBenchArm)
@@ -2938,7 +3121,7 @@ async fn run_cleanup_path(
     match path {
         CleanupPath::Disconnect => peer.close(&*runtime).await,
         CleanupPath::HeartbeatExpiry => {
-            runtime.sleep(Duration::from_millis(3_500)).await;
+            runtime.sleep(Duration::from_millis(10_500)).await;
             if let Some(before_reports) = before.hid_reports {
                 wait_for_hid_reports(monitor, before_reports, 4)?;
             }
@@ -3658,6 +3841,7 @@ mod tests {
             event: crate::hid_protocol::Event::LeaseState {
                 owner: Some([8; 32]),
                 state: 1,
+                request_sequence: Some(42),
             },
         };
         let mut cursor = ResponseCursor::new(session_id);
@@ -3670,6 +3854,7 @@ mod tests {
                 state: 1,
             }
         );
+        assert_eq!(cursor.take_request_sequence(), Some(42));
         let mut dynamic_epoch = state.clone();
         dynamic_epoch.lease_epoch = 3;
         let (response, epoch) = ResponseCursor::new(session_id)

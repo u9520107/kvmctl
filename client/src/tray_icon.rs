@@ -16,18 +16,22 @@ const RED: Color = Color(239, 84, 84, 255);
 #[derive(Clone, Copy)]
 pub(crate) enum TrayState {
     NoTarget,
+    Starting,
     Connecting,
     ConnectedLocal,
+    ConnectionDegraded,
     OwnershipPending,
     Recovering,
     Unavailable,
     OwnershipLost,
 }
 
-const STATES: [TrayState; 7] = [
+const STATES: [TrayState; 9] = [
     TrayState::NoTarget,
+    TrayState::Starting,
     TrayState::Connecting,
     TrayState::ConnectedLocal,
+    TrayState::ConnectionDegraded,
     TrayState::OwnershipPending,
     TrayState::Recovering,
     TrayState::Unavailable,
@@ -73,12 +77,14 @@ impl TrayState {
     fn index(self) -> usize {
         match self {
             Self::NoTarget => 0,
-            Self::Connecting => 1,
-            Self::ConnectedLocal => 2,
-            Self::OwnershipPending => 3,
-            Self::Recovering => 4,
-            Self::Unavailable => 5,
-            Self::OwnershipLost => 6,
+            Self::Starting => 1,
+            Self::Connecting => 2,
+            Self::ConnectedLocal => 3,
+            Self::ConnectionDegraded => 4,
+            Self::OwnershipPending => 5,
+            Self::Recovering => 6,
+            Self::Unavailable => 7,
+            Self::OwnershipLost => 8,
         }
     }
 }
@@ -153,7 +159,7 @@ impl Canvas {
     }
 
     fn badge(&mut self, center: (i32, i32), color: Color) {
-        let radius = (self.size / 8).max(2);
+        let radius = (self.size / 5).max(4);
         for y in center.1 - radius..=center.1 + radius {
             for x in center.0 - radius..=center.0 + radius {
                 let dx = x - center.0;
@@ -232,13 +238,15 @@ fn create_icon(size: usize, state: TrayState) -> Result<HICON, String> {
         WHITE,
     );
 
-    // External badge stays visible without competing with the display glyph.
-    let accent = (canvas.scale(29), canvas.scale(23));
+    // Status badge stays visible without competing with the display glyph.
+    let accent = (canvas.scale(24), canvas.scale(20));
     let accent_width = (size as i32 / 16).max(1);
     match state {
         TrayState::NoTarget => {}
+        TrayState::Starting => canvas.badge(accent, AMBER),
         TrayState::ConnectedLocal => canvas.badge(accent, GREEN),
         TrayState::Connecting => canvas.badge(accent, AMBER),
+        TrayState::ConnectionDegraded => canvas.badge(accent, AMBER),
         TrayState::OwnershipPending => canvas.badge(accent, VIOLET),
         TrayState::Recovering => {
             canvas.badge(accent, AMBER);

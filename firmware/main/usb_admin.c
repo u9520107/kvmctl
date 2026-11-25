@@ -28,6 +28,7 @@
 #define ADMIN_TRANSPORT_OFFER 0x67
 #define ADMIN_TRANSPORT_CLOSE 0x68
 #define ADMIN_TRANSPORT_STATUS 0x69
+#define ADMIN_WIFI_QUALITY 0x6a
 
 typedef struct {
     const uint8_t *data;
@@ -262,6 +263,9 @@ static request_decode_result_t decode_request(const uint8_t *data, size_t len,
     if (request->command == ADMIN_TRANSPORT_STATUS) {
         return read_map(&r, 0) && r.pos == r.len ? REQUEST_SUPPORTED : REQUEST_INVALID;
     }
+    if (request->command == ADMIN_WIFI_QUALITY) {
+        return read_map(&r, 0) && r.pos == r.len ? REQUEST_SUPPORTED : REQUEST_INVALID;
+    }
     return REQUEST_INVALID;
 }
 
@@ -363,6 +367,30 @@ static size_t encode_transport_status_response(const admin_request_t *request)
         !put_uint(s_response, sizeof(s_response), &pos, metrics.event_processing_us) ||
         !put_uint(s_response, sizeof(s_response), &pos, 25) ||
         !put_uint(s_response, sizeof(s_response), &pos, metrics.response_queue_residence_us)) return 0;
+    return pos;
+}
+
+static size_t encode_error(const admin_request_t *request, uint64_t code);
+
+static size_t encode_wifi_quality_response(const admin_request_t *request)
+{
+    wifi_quality_metrics_t metrics;
+    size_t pos;
+    esp_err_t err = wifi_setup_quality(&metrics);
+    if (err != ESP_OK) return encode_error(request, err == ESP_ERR_INVALID_STATE ? 3 : 6);
+    if (!begin_response(request, 0, true, &pos) ||
+        !put_head(s_response, sizeof(s_response), &pos, 5, 11) ||
+        !put_uint(s_response, sizeof(s_response), &pos, 0) || !put_uint(s_response, sizeof(s_response), &pos, metrics.rssi_offset) ||
+        !put_uint(s_response, sizeof(s_response), &pos, 1) || !put_uint(s_response, sizeof(s_response), &pos, metrics.channel) ||
+        !put_uint(s_response, sizeof(s_response), &pos, 2) || !put_uint(s_response, sizeof(s_response), &pos, metrics.reconnect_count) ||
+        !put_uint(s_response, sizeof(s_response), &pos, 3) || !put_uint(s_response, sizeof(s_response), &pos, metrics.disconnect_count) ||
+        !put_uint(s_response, sizeof(s_response), &pos, 4) || !put_uint(s_response, sizeof(s_response), &pos, metrics.last_disconnect_reason) ||
+        !put_uint(s_response, sizeof(s_response), &pos, 5) || !put_bytes(s_response, sizeof(s_response), &pos, metrics.ping_target, sizeof(metrics.ping_target)) ||
+        !put_uint(s_response, sizeof(s_response), &pos, 6) || !put_uint(s_response, sizeof(s_response), &pos, metrics.ping_sent) ||
+        !put_uint(s_response, sizeof(s_response), &pos, 7) || !put_uint(s_response, sizeof(s_response), &pos, metrics.ping_received) ||
+        !put_uint(s_response, sizeof(s_response), &pos, 8) || !put_uint(s_response, sizeof(s_response), &pos, metrics.ping_min_ms) ||
+        !put_uint(s_response, sizeof(s_response), &pos, 9) || !put_uint(s_response, sizeof(s_response), &pos, metrics.ping_avg_ms) ||
+        !put_uint(s_response, sizeof(s_response), &pos, 10) || !put_uint(s_response, sizeof(s_response), &pos, metrics.ping_max_ms)) return 0;
     return pos;
 }
 
@@ -481,6 +509,7 @@ static size_t dispatch_request(admin_request_t *request)
         return err == ESP_OK ? encode_empty_result(request) : encode_error(request, 6);
     }
     if (request->command == ADMIN_TRANSPORT_STATUS) return encode_transport_status_response(request);
+    if (request->command == ADMIN_WIFI_QUALITY) return encode_wifi_quality_response(request);
     return encode_error(request, 7);
 }
 

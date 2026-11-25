@@ -115,8 +115,10 @@ fn tray_data(tray: &TrayIcon, state: TrayState, target: Option<&str>) -> NOTIFYI
     data.hIcon = tray.icon(state);
     let status = match state {
         TrayState::NoTarget => "No active target; input local",
+        TrayState::Starting => "Starting; input local",
         TrayState::Connecting => "Connecting; input local",
         TrayState::ConnectedLocal => "Connected/local",
+        TrayState::ConnectionDegraded => "Connection degraded; input local",
         TrayState::OwnershipPending => "Takeover pending; input local",
         TrayState::Recovering => "Recovering; input local",
         TrayState::Unavailable => "Unavailable; input local",
@@ -576,16 +578,21 @@ fn start_tray_session(state: &mut UiState, index: usize) {
         );
         return;
     }
+    set_tray_state(state, TrayState::Starting);
     let saved = match targets::load() {
         Ok(saved) => saved,
         Err(error) => {
             tray_notice(&state.tray, "kvmctl unavailable", &error);
+            set_tray_state(state, TrayState::Unavailable);
             return;
         }
     };
     let Some(target) = saved.get(index).cloned() else {
+        set_tray_state(state, TrayState::NoTarget);
         return;
     };
+    state.selected_target = Some(target.clone());
+    set_tray_state(state, TrayState::Starting);
     let credential = match credentials::ClientCredential::load_existing(false) {
         Ok(credential) if credential.fingerprint == target.client_fingerprint => credential,
         Ok(_) => {
@@ -642,7 +649,6 @@ fn start_tray_session(state: &mut UiState, index: usize) {
         );
         return;
     }
-    state.selected_target = Some(target.clone());
     state.tray_session = Some(TraySession {
         target: target.name.clone(),
         control,
@@ -720,6 +726,14 @@ fn apply_session_event(
             );
         }
         transport::SessionEvent::InputLocalConfirmed => {
+            if !matches!(state.tray_state, TrayState::ConnectionDegraded) {
+                set_tray_state(state, TrayState::ConnectedLocal);
+            }
+        }
+        transport::SessionEvent::ConnectionDegraded { .. } => {
+            set_tray_state(state, TrayState::ConnectionDegraded);
+        }
+        transport::SessionEvent::ConnectionRecovered { .. } => {
             set_tray_state(state, TrayState::ConnectedLocal);
         }
         transport::SessionEvent::TakeoverPending {
@@ -732,7 +746,10 @@ fn apply_session_event(
                 .as_ref()
                 .map(|session| (session.control.clone(), session.target.clone()))
             {
-                if matches!(state.tray_state, TrayState::ConnectedLocal) {
+                if matches!(
+                    state.tray_state,
+                    TrayState::ConnectedLocal | TrayState::ConnectionDegraded
+                ) {
                     set_tray_state(state, TrayState::OwnershipPending);
                     prompt = Some((control, target_name, request_id, requester));
                 } else {
@@ -760,7 +777,9 @@ fn apply_session_event(
             tray_notice(&state.tray, "kvmctl ownership lost", &reason);
         }
         transport::SessionEvent::Notice(message) => {
-            if message.starts_with("Takeover accepted") || message.starts_with("Takeover rejected")
+            if (message.starts_with("Takeover accepted")
+                || message.starts_with("Takeover rejected"))
+                && !matches!(state.tray_state, TrayState::ConnectionDegraded)
             {
                 set_tray_state(state, TrayState::ConnectedLocal);
             }

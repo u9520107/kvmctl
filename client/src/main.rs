@@ -36,6 +36,7 @@ const LED_SET_COMMAND: u64 = 0x66;
 const TRANSPORT_OFFER_COMMAND: u64 = 0x67;
 const TRANSPORT_CLOSE_COMMAND: u64 = 0x68;
 const TRANSPORT_STATUS_COMMAND: u64 = 0x69;
+const WIFI_QUALITY_COMMAND: u64 = 0x6a;
 
 #[derive(Debug)]
 struct Status {
@@ -47,6 +48,21 @@ struct Status {
     led_enabled: bool,
     led_brightness: u64,
     led_rgb: [u8; 3],
+}
+
+#[derive(Debug)]
+struct WifiQuality {
+    rssi_dbm: i16,
+    channel: u8,
+    reconnect_count: u32,
+    disconnect_count: u32,
+    last_disconnect_reason: u32,
+    ping_target: std::net::Ipv4Addr,
+    ping_sent: u32,
+    ping_received: u32,
+    ping_min_ms: u32,
+    ping_avg_ms: u32,
+    ping_max_ms: u32,
 }
 
 #[derive(Clone, Copy)]
@@ -204,6 +220,10 @@ fn encode_wifi_request(
     put_uint(&mut payload, 1);
     put_bytes(&mut payload, passphrase);
     Ok(encode_request(WIFI_SET_COMMAND, request_id, &payload))
+}
+
+fn encode_wifi_quality_request(request_id: &[u8; 16]) -> Vec<u8> {
+    encode_request(WIFI_QUALITY_COMMAND, request_id, &[0xa0])
 }
 
 fn valid_passphrase(passphrase: &[u8]) -> bool {
@@ -407,6 +427,83 @@ fn decode_transport_status_response(
         total_soc_cpu_us,
         event_processing_us,
         response_queue_residence_us,
+    })
+}
+
+fn decode_wifi_quality_response(data: &[u8], request_id: &[u8; 16]) -> Result<WifiQuality, String> {
+    let mut r = Reader::new(data);
+    r.expect_map(6)?;
+    r.expect_uint(0)?;
+    r.expect_uint(1)?;
+    r.expect_uint(1)?;
+    r.expect_uint(0)?;
+    r.expect_uint(2)?;
+    r.expect_uint(WIFI_QUALITY_COMMAND)?;
+    r.expect_uint(3)?;
+    if r.expect_bytes(16)? != request_id {
+        return Err("response request ID mismatch".into());
+    }
+    r.expect_uint(4)?;
+    let code = r.uint()?;
+    if code != 0 {
+        return Err(format!(
+            "device rejected Wi-Fi quality request with code {code}"
+        ));
+    }
+    r.expect_uint(5)?;
+    r.expect_map(11)?;
+    r.expect_uint(0)?;
+    let rssi_offset = r.uint()?;
+    r.expect_uint(1)?;
+    let channel = r.uint()?;
+    r.expect_uint(2)?;
+    let reconnect_count = r.uint()?;
+    r.expect_uint(3)?;
+    let disconnect_count = r.uint()?;
+    r.expect_uint(4)?;
+    let last_disconnect_reason = r.uint()?;
+    r.expect_uint(5)?;
+    let ping_target: [u8; 4] = r.expect_bytes(4)?.try_into().unwrap();
+    r.expect_uint(6)?;
+    let ping_sent = r.uint()?;
+    r.expect_uint(7)?;
+    let ping_received = r.uint()?;
+    r.expect_uint(8)?;
+    let ping_min_ms = r.uint()?;
+    r.expect_uint(9)?;
+    let ping_avg_ms = r.uint()?;
+    r.expect_uint(10)?;
+    let ping_max_ms = r.uint()?;
+    if rssi_offset > 255
+        || channel > 255
+        || [
+            reconnect_count,
+            disconnect_count,
+            last_disconnect_reason,
+            ping_sent,
+            ping_received,
+            ping_min_ms,
+            ping_avg_ms,
+            ping_max_ms,
+        ]
+        .iter()
+        .any(|value| *value > u64::from(u32::MAX))
+        || !r.done()
+    {
+        return Err("invalid Wi-Fi quality response".into());
+    }
+    Ok(WifiQuality {
+        rssi_dbm: rssi_offset as i16 - 128,
+        channel: channel as u8,
+        reconnect_count: reconnect_count as u32,
+        disconnect_count: disconnect_count as u32,
+        last_disconnect_reason: last_disconnect_reason as u32,
+        ping_target: std::net::Ipv4Addr::from(ping_target),
+        ping_sent: ping_sent as u32,
+        ping_received: ping_received as u32,
+        ping_min_ms: ping_min_ms as u32,
+        ping_avg_ms: ping_avg_ms as u32,
+        ping_max_ms: ping_max_ms as u32,
     })
 }
 
@@ -850,6 +947,8 @@ mod serial {
     use windows_sys::Win32::System::Registry::{REG_MULTI_SZ, REG_SZ};
 
     const SUPPORTED_UART_ID: &str = "VID_1A86&PID_55D3";
+    const SERIAL_READ_TIMEOUT_MS: u32 = 2_000;
+    const WIFI_QUALITY_READ_TIMEOUT_MS: u32 = 15_000;
 
     #[derive(Clone)]
     pub struct PortInfo {
@@ -1125,6 +1224,20 @@ mod serial {
     }
 
     impl Port {
+        fn set_read_timeout_ms(&mut self, read_timeout_ms: u32) -> Result<(), String> {
+            let timeouts = COMMTIMEOUTS {
+                ReadIntervalTimeout: 10,
+                ReadTotalTimeoutMultiplier: 0,
+                ReadTotalTimeoutConstant: read_timeout_ms,
+                WriteTotalTimeoutMultiplier: 10,
+                WriteTotalTimeoutConstant: 2_000,
+            };
+            if unsafe { SetCommTimeouts(self.0, &timeouts) } == 0 {
+                return Err(win_error("cannot set serial timeouts"));
+            }
+            Ok(())
+        }
+
         pub fn open(name: &str) -> Result<Self, String> {
             if !name.starts_with("COM") || !name[3..].bytes().all(|b| b.is_ascii_digit()) {
                 return Err("invalid COM port".into());
@@ -1147,7 +1260,7 @@ mod serial {
             if handle == INVALID_HANDLE_VALUE {
                 return Err(win_error("cannot open serial port"));
             }
-            let port = Self(handle);
+            let mut port = Self(handle);
             let mut dcb: DCB = unsafe { std::mem::zeroed() };
             dcb.DCBlength = std::mem::size_of::<DCB>() as u32;
             if unsafe { GetCommState(handle, &mut dcb) } == 0 {
@@ -1162,16 +1275,7 @@ mod serial {
             if unsafe { SetCommState(handle, &dcb) } == 0 {
                 return Err(win_error("cannot apply serial settings"));
             }
-            let timeouts = COMMTIMEOUTS {
-                ReadIntervalTimeout: 10,
-                ReadTotalTimeoutMultiplier: 0,
-                ReadTotalTimeoutConstant: 2000,
-                WriteTotalTimeoutMultiplier: 10,
-                WriteTotalTimeoutConstant: 2000,
-            };
-            if unsafe { SetCommTimeouts(handle, &timeouts) } == 0 {
-                return Err(win_error("cannot set serial timeouts"));
-            }
+            port.set_read_timeout_ms(SERIAL_READ_TIMEOUT_MS)?;
             unsafe {
                 PurgeComm(handle, PURGE_RXCLEAR | PURGE_TXCLEAR);
             }
@@ -1327,6 +1431,16 @@ mod serial {
             let response =
                 self.exchange(&encode_request(TRANSPORT_STATUS_COMMAND, &id, &[0xa0]))?;
             decode_transport_status_response(&response, &id)
+        }
+
+        pub(crate) fn wifi_quality(&mut self) -> Result<WifiQuality, String> {
+            let id = random_id()?;
+            self.set_read_timeout_ms(WIFI_QUALITY_READ_TIMEOUT_MS)?;
+            let response_result = self.exchange(&encode_wifi_quality_request(&id));
+            let restore_result = self.set_read_timeout_ms(SERIAL_READ_TIMEOUT_MS);
+            let response = response_result?;
+            restore_result?;
+            decode_wifi_quality_response(&response, &id)
         }
 
         fn exchange(&mut self, payload: &[u8]) -> Result<Vec<u8>, String> {
@@ -1836,7 +1950,7 @@ fn run() -> Result<(), String> {
     let command = args.first().map(String::as_str).unwrap_or("status");
     if command == "--help" || command == "-h" {
         println!(
-            "kvmctl [ports | status [COMx] | telemetry [COMx] | wifi [COMx] | enroll [COMx] [takeover] | clients [COMx] | revoke [COMx] <fingerprint|all> | discover [COMx] | targets | target list | target save [COMx] <name> [IPv4] | target remove <name> | session <target> [IPv4] | signaling-test [COMx] [scenario [IPv4] | IPv4] | led [COMx] on|off <brightness> <RRGGBB> | transport-test [COMx] | flash [COMx] <firmware.bin> <backup.bin>]; signaling-test takeover-request uses takeover identity; KVMCTL_LOG=debug enables diagnostics; log file defaults to %LOCALAPPDATA%\\kvmctl\\kvmctl.log"
+            "kvmctl [ports | status [COMx] | telemetry [COMx] | wifi [COMx] | wifi-test [COMx] | enroll [COMx] [takeover] | clients [COMx] | revoke [COMx] <fingerprint|all> | discover [COMx] | targets | target list | target save [COMx] <name> [IPv4] | target remove <name> | session <target> [IPv4] | signaling-test [COMx] [scenario [IPv4] | IPv4] | led [COMx] on|off <brightness> <RRGGBB> | transport-test [COMx] | flash [COMx] <firmware.bin> <backup.bin>]; signaling-test takeover-request uses takeover identity; KVMCTL_LOG=debug enables diagnostics; log file defaults to %LOCALAPPDATA%\\kvmctl\\kvmctl.log"
         );
         return Ok(());
     }
@@ -1884,6 +1998,7 @@ fn run() -> Result<(), String> {
         "status"
             | "telemetry"
             | "wifi"
+            | "wifi-test"
             | "enroll"
             | "recover"
             | "clients"
@@ -1901,7 +2016,14 @@ fn run() -> Result<(), String> {
     }
     if matches!(
         command,
-        "status" | "telemetry" | "wifi" | "recover" | "clients" | "discover" | "transport-test"
+        "status"
+            | "telemetry"
+            | "wifi"
+            | "wifi-test"
+            | "recover"
+            | "clients"
+            | "discover"
+            | "transport-test"
     ) && !params.is_empty()
     {
         return Err("this command takes only an optional COM port".into());
@@ -2319,6 +2441,31 @@ fn run() -> Result<(), String> {
             );
             Ok(())
         }
+        "wifi-test" => {
+            let quality = port.wifi_quality()?;
+            let loss_tenths = quality
+                .ping_sent
+                .saturating_sub(quality.ping_received)
+                .saturating_mul(1000)
+                / quality.ping_sent.max(1);
+            println!("RSSI: {} dBm", quality.rssi_dbm);
+            println!("Channel: {}", quality.channel);
+            println!("Wi-Fi reconnects: {}", quality.reconnect_count);
+            println!("Wi-Fi disconnects: {}", quality.disconnect_count);
+            println!("Last disconnect reason: {}", quality.last_disconnect_reason);
+            println!("Ping target: {}", quality.ping_target);
+            println!(
+                "Ping: {}/{} ({loss_whole}.{loss_fraction}% loss), min/avg/max {ping_min} / {ping_avg} / {ping_max} ms",
+                quality.ping_received,
+                quality.ping_sent,
+                loss_whole = loss_tenths / 10,
+                loss_fraction = loss_tenths % 10,
+                ping_min = quality.ping_min_ms,
+                ping_avg = quality.ping_avg_ms,
+                ping_max = quality.ping_max_ms
+            );
+            Ok(())
+        }
         "wifi" => {
             let ssid = read_hidden_line("SSID: ")?;
             let mut passphrase =
@@ -2446,9 +2593,23 @@ fn run() -> Result<(), String> {
 }
 
 fn main() {
-    if let Err(error) = run() {
-        eprintln!("kvmctl: {error}");
-        std::process::exit(1);
+    let pid = std::process::id();
+    #[cfg(windows)]
+    {
+        transport::init_logging();
+        log::info!(target: "kvmctl::lifecycle", "client startup pid={pid}");
+    }
+    match run() {
+        Ok(()) => {
+            #[cfg(windows)]
+            log::info!(target: "kvmctl::lifecycle", "client quit pid={pid} outcome=ok");
+        }
+        Err(error) => {
+            #[cfg(windows)]
+            log::error!(target: "kvmctl::lifecycle", "client quit pid={pid} outcome=error error={error}");
+            eprintln!("kvmctl: {error}");
+            std::process::exit(1);
+        }
     }
 }
 
@@ -2523,6 +2684,39 @@ mod tests {
         assert!(encode_wifi_request(&id, b"", b"password").is_err());
         assert!(encode_wifi_request(&id, b"test", b"short").is_err());
         assert!(encode_led_request(&id, false, 101, [0; 3]).is_err());
+    }
+
+    #[test]
+    fn wifi_quality_response_decodes_metrics() {
+        let id = [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15];
+        let mut valid = vec![0xa6];
+        for (key, value) in [(0, 1), (1, 0), (2, WIFI_QUALITY_COMMAND)] {
+            put_uint(&mut valid, key);
+            put_uint(&mut valid, value);
+        }
+        put_uint(&mut valid, 3);
+        put_bytes(&mut valid, &id);
+        put_uint(&mut valid, 4);
+        put_uint(&mut valid, 0);
+        put_uint(&mut valid, 5);
+        put_head(&mut valid, 5, 11);
+        for (key, value) in [(0, 64), (1, 6), (2, 2), (3, 3), (4, 201)] {
+            put_uint(&mut valid, key);
+            put_uint(&mut valid, value);
+        }
+        put_uint(&mut valid, 5);
+        put_bytes(&mut valid, &[192, 168, 50, 1]);
+        for (key, value) in [(6, 20), (7, 19), (8, 2), (9, 8), (10, 31)] {
+            put_uint(&mut valid, key);
+            put_uint(&mut valid, value);
+        }
+        let quality = decode_wifi_quality_response(&valid, &id).unwrap();
+        assert_eq!(quality.rssi_dbm, -64);
+        assert_eq!(
+            quality.ping_target,
+            std::net::Ipv4Addr::new(192, 168, 50, 1)
+        );
+        assert_eq!(quality.ping_received, 19);
     }
 
     #[test]

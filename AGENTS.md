@@ -11,6 +11,7 @@
 
 - Do not build or deliver standalone `.exe` files, or place executable build output elsewhere for the user.
 - The user can run the Rust app from source with Cargo. If runtime behavior needs checking, tell the user what `cargo run` command to run; do not compile an `.exe` for them.
+- Development flashing of source-built firmware may skip the current-app backup; write and verify only the factory app partition, never erase or overwrite bootloader, partition table, or data partitions, and retain any existing known-good rollback image.
 
 ## Repository hygiene
 

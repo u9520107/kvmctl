@@ -107,10 +107,16 @@ Exit: From PowerShell, a user can identify a USB board, enroll and administer cl
 
 #### M2.2: Resident tray and session lifecycle
 
+Status: **Closed - 2026-11-25**.
+
 - Reuse the CLI's session functionality, target settings, and enrollment records. Selecting a target connects with input local. Connected/local retains the lease and heartbeats. Takeover returns input local before showing an actionable prompt. Reconnect restores the connection with input local and requires explicit remote activation.
 - Show no-target and connected/local icons, target tooltips, and visible connecting, recovering, unavailable, and ownership states. Add short OSD notices for connection and recovery changes.
 
+Resilience follow-up: use 3-second request/response heartbeats, three consecutive missed responses for client reconnect, and a 10-second endpoint lease safety expiry. Tray exposes an amber degraded state; degradation does not create an OSD notice. `wifi-test [COMx]` reports board RSSI/channel, Wi-Fi reconnect/disconnect counters, last disconnect reason, and gateway ping quality. This remains diagnostic evidence for M2.3/M2.4; it does not close live input safety work.
+
 Exit: A user can select a saved target from the tray, stay connected and owned with input local, handle takeover, and recover from a dropped connection with input still local.
+
+Closure evidence is recorded in [test evidence](evidence.md#m22-resident-tray-and-session-lifecycle-closure-2026-11-25). The live tray flow was exercised on COM6: target selection showed the transient starting/connecting states, the connected/local icon and centered OSD notices were visible, and removing board power produced a heartbeat timeout followed by automatic reconnect with a new lease. The hardware transport test also completed two sessions with clean reconnect and zero HID reports.
 
 #### M2.3: Live input, emergency escape, and switching
 
