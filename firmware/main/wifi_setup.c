@@ -13,6 +13,7 @@
 #include "nvs.h"
 #include "recovery.h"
 #include <stdbool.h>
+#include <stdlib.h>
 #include <string.h>
 
 #define WIFI_NAMESPACE "kvmctl_wifi"
@@ -24,6 +25,7 @@ static esp_timer_handle_t s_reconnect_timer;
 static uint8_t s_retry_step;
 static esp_netif_t *s_sta_netif;
 static bool s_connected_once;
+static bool s_ip_counted_for_association;
 static uint32_t s_reconnect_count;
 static uint32_t s_disconnect_count;
 static uint32_t s_last_disconnect_reason;
@@ -35,6 +37,7 @@ typedef struct {
     uint32_t total_ms;
     uint32_t min_ms;
     uint32_t max_ms;
+    uint32_t references;
 } ping_state_t;
 
 static void schedule_reconnect(void);
@@ -93,10 +96,31 @@ static void ping_success(esp_ping_handle_t handle, void *arg)
     if (elapsed > state->max_ms) state->max_ms = elapsed;
 }
 
+static void ping_state_retain(ping_state_t *state)
+{
+    portENTER_CRITICAL(&s_quality_mux);
+    ++state->references;
+    portEXIT_CRITICAL(&s_quality_mux);
+}
+
+static void ping_state_release(ping_state_t *state)
+{
+    bool last_reference = false;
+    portENTER_CRITICAL(&s_quality_mux);
+    if (--state->references == 0) last_reference = true;
+    portEXIT_CRITICAL(&s_quality_mux);
+    if (last_reference) {
+        vSemaphoreDelete(state->done);
+        free(state);
+    }
+}
+
 static void ping_end(esp_ping_handle_t handle, void *arg)
 {
     (void)handle;
-    xSemaphoreGive(((ping_state_t *)arg)->done);
+    ping_state_t *state = arg;
+    xSemaphoreGive(state->done);
+    ping_state_release(state);
 }
 
 static bool valid_passphrase(const uint8_t *passphrase, size_t len)
@@ -157,6 +181,7 @@ static void wifi_event_handler(void *arg, esp_event_base_t base, int32_t id, voi
     } else if (base == WIFI_EVENT && id == WIFI_EVENT_STA_DISCONNECTED) {
         s_state = 3;
         portENTER_CRITICAL(&s_quality_mux);
+        s_ip_counted_for_association = false;
         ++s_disconnect_count;
         if (data != NULL) {
             s_last_disconnect_reason = ((const wifi_event_sta_disconnected_t *)data)->reason;
@@ -166,8 +191,11 @@ static void wifi_event_handler(void *arg, esp_event_base_t base, int32_t id, voi
     } else if (base == IP_EVENT && id == IP_EVENT_STA_GOT_IP) {
         s_state = 2;
         portENTER_CRITICAL(&s_quality_mux);
-        if (s_connected_once) ++s_reconnect_count;
-        s_connected_once = true;
+        if (!s_ip_counted_for_association) {
+            if (s_connected_once) ++s_reconnect_count;
+            s_connected_once = true;
+            s_ip_counted_for_association = true;
+        }
         portEXIT_CRITICAL(&s_quality_mux);
         reset_reconnect();
     }
@@ -255,44 +283,63 @@ esp_err_t wifi_setup_quality(wifi_quality_metrics_t *metrics)
     if (err != ESP_OK || ip_info.gw.addr == 0) return ESP_ERR_INVALID_STATE;
     memcpy(metrics->ping_target, &ip_info.gw.addr, sizeof(metrics->ping_target));
 
-    ping_state_t state = {
-        .done = xSemaphoreCreateBinary(),
-        .min_ms = UINT32_MAX,
-    };
-    if (state.done == NULL) return ESP_ERR_NO_MEM;
+    ping_state_t *state = calloc(1, sizeof(*state));
+    if (state == NULL) return ESP_ERR_NO_MEM;
+    state->done = xSemaphoreCreateBinary();
+    state->min_ms = UINT32_MAX;
+    state->references = 1;
+    if (state->done == NULL) {
+        free(state);
+        return ESP_ERR_NO_MEM;
+    }
     esp_ping_config_t config = ESP_PING_DEFAULT_CONFIG();
     config.count = 20;
     config.interval_ms = 100;
     config.timeout_ms = 500;
     ip_addr_set_ip4_u32(&config.target_addr, ip_info.gw.addr);
     esp_ping_callbacks_t callbacks = {
-        .cb_args = &state,
+        .cb_args = state,
         .on_ping_success = ping_success,
         .on_ping_timeout = NULL,
         .on_ping_end = ping_end,
     };
     esp_ping_handle_t handle = NULL;
     err = esp_ping_new_session(&config, &callbacks, &handle);
-    if (err == ESP_OK) err = esp_ping_start(handle);
-    if (err == ESP_OK && xSemaphoreTake(state.done, pdMS_TO_TICKS(12000)) != pdTRUE) {
+    bool ping_started = false;
+    bool ping_finished = false;
+    if (err == ESP_OK) {
+        ping_state_retain(state);
+        err = esp_ping_start(handle);
+        if (err == ESP_OK) {
+            ping_started = true;
+        } else {
+            ping_state_release(state);
+        }
+    }
+    if (err == ESP_OK && xSemaphoreTake(state->done, pdMS_TO_TICKS(12000)) == pdTRUE) {
+        ping_finished = true;
+    } else if (err == ESP_OK) {
         err = ESP_ERR_TIMEOUT;
     }
     uint32_t sent = 0;
-    if (handle != NULL &&
+    if (err == ESP_OK &&
         esp_ping_get_profile(handle, ESP_PING_PROF_REQUEST, &sent, sizeof(sent)) != ESP_OK) {
         sent = config.count;
     }
     if (handle != NULL) {
-        esp_ping_stop(handle);
+        if (ping_started && !ping_finished) esp_ping_stop(handle);
         esp_ping_delete_session(handle);
     }
-    vSemaphoreDelete(state.done);
-    if (err != ESP_OK) return err;
+    if (err != ESP_OK) {
+        ping_state_release(state);
+        return err;
+    }
     metrics->ping_sent = sent;
-    metrics->ping_received = state.received;
-    metrics->ping_min_ms = state.received == 0 ? 0 : state.min_ms;
-    metrics->ping_avg_ms = state.received == 0 ? 0 : state.total_ms / state.received;
-    metrics->ping_max_ms = state.max_ms;
+    metrics->ping_received = state->received;
+    metrics->ping_min_ms = state->received == 0 ? 0 : state->min_ms;
+    metrics->ping_avg_ms = state->received == 0 ? 0 : state->total_ms / state->received;
+    metrics->ping_max_ms = state->max_ms;
+    ping_state_release(state);
     return ESP_OK;
 }
 

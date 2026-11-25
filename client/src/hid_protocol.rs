@@ -29,7 +29,9 @@ const HEARTBEAT_EXPIRY_MS: u64 = 10_000;
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Event {
-    LeaseRequest,
+    LeaseRequest {
+        heartbeat_ack_supported: bool,
+    },
     TakeoverRequest {
         request_id: [u8; 16],
     },
@@ -244,9 +246,16 @@ pub fn encode(envelope: &Envelope) -> Vec<u8> {
     uint(&mut out, envelope.sequence);
     field(&mut out, 6);
     match &envelope.event {
-        Event::LeaseRequest | Event::Heartbeat | Event::LeaseRelease | Event::HidBenchArm => {
-            put_head(&mut out, 5, 0)
+        Event::LeaseRequest {
+            heartbeat_ack_supported,
+        } => {
+            put_head(&mut out, 5, if *heartbeat_ack_supported { 1 } else { 0 });
+            if *heartbeat_ack_supported {
+                field(&mut out, 0);
+                out.push(0xf5);
+            }
         }
+        Event::Heartbeat | Event::LeaseRelease | Event::HidBenchArm => put_head(&mut out, 5, 0),
         Event::TakeoverRequest { request_id } => {
             put_head(&mut out, 5, 1);
             field(&mut out, 0);
@@ -355,10 +364,30 @@ fn signed_value(reader: &mut Reader<'_>) -> Result<i16, DecodeError> {
 
 fn payload(reader: &mut Reader<'_>, message_type: u64) -> Result<Event, DecodeError> {
     match message_type {
-        LEASE_REQUEST | HEARTBEAT | LEASE_RELEASE | HID_BENCH_ARM => {
+        LEASE_REQUEST => {
+            let field_count = reader.head(5)?;
+            let heartbeat_ack_supported = match field_count {
+                0 => false,
+                1 => {
+                    if reader.uint()? != 0 {
+                        return Err(DecodeError::UnknownKey);
+                    }
+                    let value = *reader.bytes.get(reader.pos).ok_or(DecodeError::Truncated)?;
+                    reader.pos += 1;
+                    if value != 0xf5 {
+                        return Err(DecodeError::InvalidValue);
+                    }
+                    true
+                }
+                _ => return Err(DecodeError::WrongFieldCount),
+            };
+            Ok(Event::LeaseRequest {
+                heartbeat_ack_supported,
+            })
+        }
+        HEARTBEAT | LEASE_RELEASE | HID_BENCH_ARM => {
             reader.map(0)?;
             Ok(match message_type {
-                LEASE_REQUEST => Event::LeaseRequest,
                 HEARTBEAT => Event::Heartbeat,
                 LEASE_RELEASE => Event::LeaseRelease,
                 _ => Event::HidBenchArm,
@@ -818,7 +847,7 @@ mod tests {
     fn env(event: Event, epoch: u32, sequence: u64) -> Envelope {
         Envelope {
             message_type: match event {
-                Event::LeaseRequest => LEASE_REQUEST,
+                Event::LeaseRequest { .. } => LEASE_REQUEST,
                 Event::TakeoverRequest { .. } => TAKEOVER_REQUEST,
                 Event::TakeoverResponse { .. } => TAKEOVER_RESPONSE,
                 Event::LeaseState { .. } => LEASE_STATE,
@@ -842,6 +871,25 @@ mod tests {
     fn shared_heartbeat_vector_round_trips() {
         assert_eq!(encode(&env(Event::Heartbeat, 7, 0)), HEARTBEAT_VECTOR);
         assert_eq!(decode(HEARTBEAT_VECTOR).unwrap().event, Event::Heartbeat);
+    }
+
+    #[test]
+    fn lease_request_negotiates_heartbeat_ack_without_changing_legacy_wire() {
+        let legacy = Event::LeaseRequest {
+            heartbeat_ack_supported: false,
+        };
+        assert_eq!(
+            decode(&encode(&env(legacy.clone(), 0, 0))).unwrap().event,
+            legacy
+        );
+        let capable = Event::LeaseRequest {
+            heartbeat_ack_supported: true,
+        };
+        assert_eq!(
+            decode(&encode(&env(capable.clone(), 0, 0))).unwrap().event,
+            capable
+        );
+        assert_eq!(encode(&env(legacy, 0, 0)).last(), Some(&0xa0));
     }
     #[test]
     fn strict_rejections_cover_canonical_and_unknown_data() {

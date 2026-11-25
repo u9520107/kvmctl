@@ -24,6 +24,7 @@ static RTC_ERROR_LOCATION: OnceLock<(String, Option<u32>)> = OnceLock::new();
 static LOG_LEVEL: OnceLock<LevelFilter> = OnceLock::new();
 
 const HEARTBEAT_INTERVAL: Duration = Duration::from_secs(3);
+const LEGACY_HEARTBEAT_INTERVAL: Duration = Duration::from_secs(1);
 const HEARTBEAT_MISS_LIMIT: u8 = 3;
 
 #[derive(Default)]
@@ -1023,6 +1024,7 @@ async fn exchange_signaling(
     status: &crate::Status,
     credential: &crate::credentials::ClientCredential,
     proof_case: TranscriptProofCase<'_>,
+    heartbeat_ack_supported: bool,
 ) -> Result<Vec<u8>> {
     let authorized_case = matches!(&proof_case, TranscriptProofCase::Valid { .. });
     let mut peer = open_signaling_peer(
@@ -1054,6 +1056,7 @@ async fn exchange_signaling(
                         credential.fingerprint,
                         status.identity_fingerprint,
                         mode,
+                        heartbeat_ack_supported,
                     )
                     .await?;
                 }
@@ -1145,6 +1148,24 @@ pub(crate) fn run_foreground_session(
     credential: crate::credentials::ClientCredential,
     rediscover: bool,
 ) -> Result<SocketAddr> {
+    let heartbeat_mode =
+        crate::discovery::compatibility_mode(&service).map_err(anyhow::Error::msg)?;
+    run_foreground_session_with_heartbeat_ack(
+        service,
+        status,
+        credential,
+        rediscover,
+        heartbeat_mode == crate::discovery::HeartbeatMode::Acknowledged,
+    )
+}
+
+pub(crate) fn run_foreground_session_with_heartbeat_ack(
+    service: crate::discovery::Service,
+    status: crate::Status,
+    credential: crate::credentials::ClientCredential,
+    rediscover: bool,
+    heartbeat_ack_supported: bool,
+) -> Result<SocketAddr> {
     let control = SessionControl::new();
     let input = control.clone();
     std::thread::spawn(move || {
@@ -1163,12 +1184,13 @@ pub(crate) fn run_foreground_session(
             }
         }
     });
-    run_session(
+    run_session_with_heartbeat_ack(
         service,
         status,
         credential,
         control,
         rediscover,
+        heartbeat_ack_supported,
         |event| match event {
             SessionEvent::Connecting => println!("Connecting/local…"),
             SessionEvent::ConnectedLocal => {
@@ -1355,11 +1377,48 @@ pub(crate) fn run_session<F>(
     credential: crate::credentials::ClientCredential,
     control: SessionControl,
     rediscover: bool,
+    on_event: F,
+) -> Result<SocketAddr>
+where
+    F: FnMut(SessionEvent),
+{
+    let heartbeat_mode =
+        crate::discovery::compatibility_mode(&initial_service).map_err(anyhow::Error::msg)?;
+    run_session_with_heartbeat_ack(
+        initial_service,
+        status,
+        credential,
+        control,
+        rediscover,
+        heartbeat_mode == crate::discovery::HeartbeatMode::Acknowledged,
+        on_event,
+    )
+}
+
+pub(crate) fn run_session_with_heartbeat_ack<F>(
+    initial_service: crate::discovery::Service,
+    status: crate::Status,
+    credential: crate::credentials::ClientCredential,
+    control: SessionControl,
+    rediscover: bool,
+    heartbeat_ack_supported: bool,
     mut on_event: F,
 ) -> Result<SocketAddr>
 where
     F: FnMut(SessionEvent),
 {
+    let advertised_mode =
+        crate::discovery::compatibility_mode(&initial_service).map_err(anyhow::Error::msg)?;
+    ensure!(
+        advertised_mode
+            == if heartbeat_ack_supported {
+                crate::discovery::HeartbeatMode::Acknowledged
+            } else {
+                crate::discovery::HeartbeatMode::Legacy
+            },
+        "service compatibility mode changed before session start"
+    );
+    let mut heartbeat_ack_supported = heartbeat_ack_supported;
     install_certificate_log()?;
     log::info!("session connecting to {}", initial_service.hostname);
     let mut service = initial_service;
@@ -1393,6 +1452,7 @@ where
                     &status,
                     &credential,
                     &control,
+                    heartbeat_ack_supported,
                     &mut |event| {
                         if matches!(event, SessionEvent::ConnectedLocal) {
                             connected_in_attempt = true;
@@ -1457,6 +1517,9 @@ where
             })
             && !control.is_cancelled()
         {
+            heartbeat_ack_supported = crate::discovery::compatibility_mode(&next)
+                .map_err(anyhow::Error::msg)?
+                == crate::discovery::HeartbeatMode::Acknowledged;
             service = next;
             last_address = address;
         }
@@ -1477,6 +1540,7 @@ pub(crate) fn run_takeover_request(
     status: crate::Status,
     credential: &crate::credentials::ClientCredential,
 ) -> Result<()> {
+    crate::discovery::compatibility_mode(service).map_err(anyhow::Error::msg)?;
     install_certificate_log()?;
     let address = crate::discovery::socket_address(service).map_err(anyhow::Error::msg)?;
     let runtime = default_runtime().context("no WebRTC runtime")?;
@@ -1572,6 +1636,7 @@ async fn run_session_once<F>(
     status: &crate::Status,
     credential: &crate::credentials::ClientCredential,
     control: &SessionControl,
+    heartbeat_ack_supported: bool,
     on_event: &mut F,
     device_status: &AtomicU8,
 ) -> Result<SessionExit>
@@ -1609,7 +1674,9 @@ where
                 session_id: peer.session.session_id(),
                 lease_epoch: 0,
                 sequence: 0,
-                event: crate::hid_protocol::Event::LeaseRequest,
+                event: crate::hid_protocol::Event::LeaseRequest {
+                    heartbeat_ack_supported,
+                },
             },
         )
         .await?;
@@ -1627,7 +1694,17 @@ where
         connected = true;
         on_event(SessionEvent::ConnectedLocal);
         let mut sequence = 1;
-        let mut heartbeat_due = Instant::now();
+        let heartbeat_interval = if heartbeat_ack_supported {
+            HEARTBEAT_INTERVAL
+        } else {
+            LEGACY_HEARTBEAT_INTERVAL
+        };
+        let mut heartbeat_due = Instant::now()
+            + if heartbeat_ack_supported {
+                Duration::ZERO
+            } else {
+                heartbeat_interval
+            };
         let mut heartbeat_sent_at = None;
         let mut heartbeat_request_sequence = None;
         let mut missed_heartbeats = 0u8;
@@ -1658,7 +1735,10 @@ where
                 return Ok(SessionExit::Disconnected);
             }
             let now = Instant::now();
-            if heartbeat_sent_at.is_some_and(|sent_at| now.duration_since(sent_at) >= HEARTBEAT_INTERVAL) {
+            if heartbeat_ack_supported
+                && heartbeat_sent_at
+                    .is_some_and(|sent_at| now.duration_since(sent_at) >= heartbeat_interval)
+            {
                 heartbeat_sent_at = None;
                 heartbeat_request_sequence = None;
                 missed_heartbeats = missed_heartbeats.saturating_add(1);
@@ -1675,7 +1755,7 @@ where
                     )));
                 }
             }
-            if heartbeat_sent_at.is_none() && now >= heartbeat_due {
+            if (!heartbeat_ack_supported || heartbeat_sent_at.is_none()) && now >= heartbeat_due {
                 let send_started = Instant::now();
                 log::debug!(
                     "session heartbeat send epoch={} sequence={sequence}",
@@ -1694,9 +1774,11 @@ where
                 .await?;
                 let send_completed = Instant::now();
                 sequence += 1;
-                heartbeat_due += HEARTBEAT_INTERVAL;
-                heartbeat_request_sequence = Some(sequence - 1);
-                heartbeat_sent_at = Some(send_completed);
+                heartbeat_due += heartbeat_interval;
+                if heartbeat_ack_supported {
+                    heartbeat_request_sequence = Some(sequence - 1);
+                    heartbeat_sent_at = Some(send_completed);
+                }
                 log::debug!(
                     "session heartbeat send-complete sequence={} enqueue_ms={}",
                     sequence - 1,
@@ -2041,10 +2123,24 @@ async fn receive_endpoint_response(
     cursor: &mut ResponseCursor,
     expected_epoch: u32,
 ) -> Result<EndpointResponse> {
+    Ok(
+        receive_endpoint_response_with_sequence(runtime, control, cursor, expected_epoch)
+            .await?
+            .0,
+    )
+}
+
+async fn receive_endpoint_response_with_sequence(
+    runtime: &dyn Runtime,
+    control: &Arc<dyn DataChannel>,
+    cursor: &mut ResponseCursor,
+    expected_epoch: u32,
+) -> Result<(EndpointResponse, Option<u64>)> {
     loop {
         match timeout(runtime, Duration::from_secs(5), control.poll()).await? {
             Some(DataChannelEvent::OnMessage(message)) => {
-                return cursor.decode(&message.data, expected_epoch);
+                let response = cursor.decode(&message.data, expected_epoch)?;
+                return Ok((response, cursor.take_request_sequence()));
             }
             Some(DataChannelEvent::OnClose) | None => bail!("scripted control channel closed"),
             _ => {}
@@ -2084,8 +2180,12 @@ async fn send_heartbeat(
     event: crate::hid_protocol::Envelope,
     epoch: u32,
     client_fingerprint: [u8; 32],
+    heartbeat_ack_supported: bool,
 ) -> Result<()> {
     send_hid_event(control, event).await?;
+    if !heartbeat_ack_supported {
+        return Ok(());
+    }
     require_response(
         receive_endpoint_response(runtime, control, responses, epoch).await?,
         EndpointResponse::LeaseState {
@@ -2186,6 +2286,7 @@ async fn scripted_transport(
     client_fingerprint: [u8; 32],
     endpoint_fingerprint: [u8; 32],
     mode: ScriptMode,
+    heartbeat_ack_supported: bool,
 ) -> Result<()> {
     use crate::hid_protocol::{self, Envelope, Event};
 
@@ -2201,7 +2302,14 @@ async fn scripted_transport(
 
     send_hid_event(
         control,
-        event(hid_protocol::LEASE_REQUEST, 0, 0, Event::LeaseRequest),
+        event(
+            hid_protocol::LEASE_REQUEST,
+            0,
+            0,
+            Event::LeaseRequest {
+                heartbeat_ack_supported,
+            },
+        ),
     )
     .await?;
     require_response(
@@ -2267,6 +2375,7 @@ async fn scripted_transport(
                 ),
                 epoch,
                 client_fingerprint,
+                heartbeat_ack_supported,
             )
             .await?;
             send_hid_event(
@@ -2374,6 +2483,7 @@ async fn scripted_transport(
         event(hid_protocol::HEARTBEAT, epoch, 1 + offset, Event::Heartbeat),
         epoch,
         client_fingerprint,
+        heartbeat_ack_supported,
     )
     .await?;
     send_timed_hid_event(
@@ -2508,16 +2618,23 @@ struct TakeoverClient<'a> {
     control: &'a Arc<dyn DataChannel>,
     responses: ResponseCursor,
     sequence: u64,
+    heartbeat_ack_supported: bool,
 }
 
 impl<'a> TakeoverClient<'a> {
-    fn new<P>(label: &'static str, runtime: &'a dyn Runtime, peer: &'a SignalingPeer<P>) -> Self {
+    fn new<P>(
+        label: &'static str,
+        runtime: &'a dyn Runtime,
+        peer: &'a SignalingPeer<P>,
+        heartbeat_ack_supported: bool,
+    ) -> Self {
         Self {
             label,
             runtime,
             control: &peer.control,
             responses: ResponseCursor::new(peer.session.session_id()),
             sequence: 0,
+            heartbeat_ack_supported,
         }
     }
 
@@ -2543,17 +2660,35 @@ impl<'a> TakeoverClient<'a> {
     }
 
     async fn heartbeat(&mut self, epoch: u32) -> Result<()> {
+        let request_sequence = self.sequence;
         self.send(
             crate::hid_protocol::HEARTBEAT,
             epoch,
             crate::hid_protocol::Event::Heartbeat,
         )
         .await?;
-        match receive_endpoint_response(self.runtime, self.control, &mut self.responses, epoch)
-            .await?
-        {
-            EndpointResponse::LeaseState { state: 1 | 2, .. } => Ok(()),
-            response => bail!("client {} heartbeat got {response:?}", self.label),
+        if !self.heartbeat_ack_supported {
+            return Ok(());
+        }
+        loop {
+            let (response, response_request_sequence) = receive_endpoint_response_with_sequence(
+                self.runtime,
+                self.control,
+                &mut self.responses,
+                epoch,
+            )
+            .await?;
+            match response {
+                EndpointResponse::LeaseState { state: 1 | 2, .. }
+                    if response_request_sequence == Some(request_sequence) =>
+                {
+                    return Ok(());
+                }
+                EndpointResponse::Error { code } => {
+                    bail!("client {} heartbeat got endpoint error: {code}", self.label)
+                }
+                _ => {}
+            }
         }
     }
 
@@ -2588,21 +2723,28 @@ impl<'a> TakeoverClient<'a> {
     ) -> Result<()> {
         let started = Instant::now();
         let mut heartbeat = started + HEARTBEAT_INTERVAL;
-        let mut heartbeat_acknowledged = false;
+        let mut heartbeat_request_sequences = Vec::new();
+        let mut heartbeat_acknowledged = !self.heartbeat_ack_supported;
+        let mut received = None;
+        let mut received_sequence = None;
+        let request_sequence = self.sequence;
         self.send(
             crate::hid_protocol::HEARTBEAT,
             epoch,
             crate::hid_protocol::Event::Heartbeat,
         )
         .await?;
+        heartbeat_request_sequences.push(request_sequence);
         let received = loop {
             if Instant::now() >= heartbeat {
+                let request_sequence = self.sequence;
                 self.send(
                     crate::hid_protocol::HEARTBEAT,
                     epoch,
                     crate::hid_protocol::Event::Heartbeat,
                 )
                 .await?;
+                heartbeat_request_sequences.push(request_sequence);
                 heartbeat += HEARTBEAT_INTERVAL;
             }
             if started.elapsed() >= deadline {
@@ -2620,11 +2762,28 @@ impl<'a> TakeoverClient<'a> {
             {
                 Ok(Some(DataChannelEvent::OnMessage(message))) => {
                     let response = self.responses.decode(&message.data, epoch)?;
-                    if matches!(&response, EndpointResponse::LeaseState { .. }) {
+                    let response_request_sequence = self.responses.take_request_sequence();
+                    if self.heartbeat_ack_supported
+                        && matches!(&response, EndpointResponse::LeaseState { .. })
+                        && response_request_sequence
+                            .is_some_and(|sequence| heartbeat_request_sequences.contains(&sequence))
+                    {
                         heartbeat_acknowledged = true;
-                        continue;
+                        heartbeat_request_sequences
+                            .retain(|sequence| Some(*sequence) != response_request_sequence);
                     }
-                    break response;
+                    if response == expected {
+                        received_sequence = Some(self.responses.next_sequence - 1);
+                        received = Some(response);
+                    } else if !matches!(&response, EndpointResponse::LeaseState { .. }) {
+                        bail!(
+                            "client {} expected {expected:?}, got {response:?}",
+                            self.label
+                        );
+                    }
+                    if received.is_some() && heartbeat_acknowledged {
+                        break received.take().expect("received response just checked");
+                    }
                 }
                 Ok(Some(DataChannelEvent::OnClose)) | Ok(None) => {
                     bail!("scripted control channel closed")
@@ -2635,11 +2794,7 @@ impl<'a> TakeoverClient<'a> {
         eprintln!(
             "M1.4 TAKEOVER client={} epoch={epoch} response_sequence={} response={received:?}",
             self.label,
-            self.responses.next_sequence - 1
-        );
-        ensure!(
-            heartbeat_acknowledged,
-            "heartbeat did not receive a lease-state response"
+            received_sequence.expect("received response sequence just recorded")
         );
         ensure!(
             received == expected,
@@ -2725,7 +2880,14 @@ async fn exercise_takeover(
     };
     let a_epoch = next_lease_epoch(baseline.lease_epoch);
     let b_epoch = next_lease_epoch(next_lease_epoch(a_epoch));
-    a.send(hid::LEASE_REQUEST, 0, Event::LeaseRequest).await?;
+    a.send(
+        hid::LEASE_REQUEST,
+        0,
+        Event::LeaseRequest {
+            heartbeat_ack_supported: a.heartbeat_ack_supported,
+        },
+    )
+    .await?;
     a.expect(a_epoch, owned(owner_a)).await?;
     if hid_baseline.is_some() {
         a.send(hid::HID_BENCH_ARM, a_epoch, Event::HidBenchArm)
@@ -2935,6 +3097,7 @@ async fn run_takeover(
     credential_a: &crate::credentials::ClientCredential,
     credential_b: &crate::credentials::ClientCredential,
     physical_hid: bool,
+    heartbeat_ack_supported: bool,
 ) -> Result<()> {
     ensure!(
         credential_a.fingerprint != credential_b.fingerprint,
@@ -2967,8 +3130,8 @@ async fn run_takeover(
             eprintln!("M1.4 TAKEOVER both_clients_authorized=true endpoint_transcripts=verified dtls_identities=verified");
             exercise_takeover(
                 monitor,
-                TakeoverClient::new("A", &*runtime, &a),
-                TakeoverClient::new("B", &*runtime, &b),
+                TakeoverClient::new("A", &*runtime, &a, heartbeat_ack_supported),
+                TakeoverClient::new("B", &*runtime, &b, heartbeat_ack_supported),
                 credential_a.fingerprint,
                 credential_b.fingerprint,
                 status.identity_fingerprint,
@@ -3032,6 +3195,7 @@ async fn run_cleanup_path(
     status: &crate::Status,
     credential: &crate::credentials::ClientCredential,
     path: CleanupPath,
+    heartbeat_ack_supported: bool,
 ) -> Result<()> {
     let mut peer = open_signaling_peer(
         runtime.clone(),
@@ -3058,12 +3222,14 @@ async fn run_cleanup_path(
     };
     let epoch = next_lease_epoch(before.lease_epoch);
     {
-        let mut client = TakeoverClient::new("cleanup", &*runtime, &peer);
+        let mut client = TakeoverClient::new("cleanup", &*runtime, &peer, heartbeat_ack_supported);
         client
             .send(
                 crate::hid_protocol::LEASE_REQUEST,
                 0,
-                crate::hid_protocol::Event::LeaseRequest,
+                crate::hid_protocol::Event::LeaseRequest {
+                    heartbeat_ack_supported: client.heartbeat_ack_supported,
+                },
             )
             .await?;
         client
@@ -3421,7 +3587,19 @@ pub(crate) fn run_signaling_test(
     credential: crate::credentials::ClientCredential,
     takeover_peer: Option<crate::credentials::ClientCredential>,
     scenario: &str,
+    heartbeat_ack_supported: bool,
 ) -> Result<SocketAddr> {
+    let advertised_mode =
+        crate::discovery::compatibility_mode(service).map_err(anyhow::Error::msg)?;
+    ensure!(
+        advertised_mode
+            == if heartbeat_ack_supported {
+                crate::discovery::HeartbeatMode::Acknowledged
+            } else {
+                crate::discovery::HeartbeatMode::Legacy
+            },
+        "service compatibility mode changed before signaling test"
+    );
     ensure!(
         matches!(
             scenario,
@@ -3468,6 +3646,7 @@ pub(crate) fn run_signaling_test(
                             &credential,
                             peer,
                             scenario == "takeover",
+                            heartbeat_ack_supported,
                         )
                         .await?;
                     }
@@ -3491,6 +3670,7 @@ pub(crate) fn run_signaling_test(
                             &status,
                             &credential,
                             path,
+                            heartbeat_ack_supported,
                         )
                         .await?;
                     }
@@ -3514,6 +3694,7 @@ pub(crate) fn run_signaling_test(
                                 check_resources: false,
                                 revoke_after_authorization: false,
                             },
+                            heartbeat_ack_supported,
                         )
                         .await?;
                     }
@@ -3531,6 +3712,7 @@ pub(crate) fn run_signaling_test(
                                 check_resources: false,
                                 revoke_after_authorization: false,
                             },
+                            heartbeat_ack_supported,
                         )
                         .await?;
                     }
@@ -3543,6 +3725,7 @@ pub(crate) fn run_signaling_test(
                             &status,
                             &credential,
                             TranscriptProofCase::Missing,
+                            heartbeat_ack_supported,
                         )
                         .await?;
                     }
@@ -3555,6 +3738,7 @@ pub(crate) fn run_signaling_test(
                             &status,
                             &credential,
                             TranscriptProofCase::Invalid,
+                            heartbeat_ack_supported,
                         )
                         .await?;
                     }
@@ -3572,6 +3756,7 @@ pub(crate) fn run_signaling_test(
                                 check_resources: false,
                                 revoke_after_authorization: false,
                             },
+                            heartbeat_ack_supported,
                         )
                         .await?;
                         let _ = exchange_signaling(
@@ -3582,6 +3767,7 @@ pub(crate) fn run_signaling_test(
                             &status,
                             &credential,
                             TranscriptProofCase::Replayed(&valid),
+                            heartbeat_ack_supported,
                         )
                         .await?;
                     }
@@ -3599,6 +3785,7 @@ pub(crate) fn run_signaling_test(
                                 check_resources: true,
                                 revoke_after_authorization: false,
                             },
+                            heartbeat_ack_supported,
                         )
                         .await?;
                     }
@@ -3616,6 +3803,7 @@ pub(crate) fn run_signaling_test(
                                 check_resources: false,
                                 revoke_after_authorization: true,
                             },
+                            heartbeat_ack_supported,
                         )
                         .await?;
                     }

@@ -6,6 +6,7 @@
 #include <stdint.h>
 
 #define TRANSPORT_DIAGNOSTIC_CAPACITY 96
+#define TRANSPORT_LEASE_DIAGNOSTIC_CAPACITY 192
 
 typedef enum {
     TRANSPORT_STATUS_IDLE = 0,
@@ -63,3 +64,4 @@ void transport_get_metrics(transport_metrics_t *metrics);
 void transport_silence_logs(void);
 void transport_note_tls_rate_limited(void);
 void transport_clear_tls_diagnostic(void);
+void transport_get_lease_diagnostic(char *diagnostic, size_t capacity);

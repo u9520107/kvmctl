@@ -19,8 +19,9 @@ def block(source: str, name: str) -> str:
 
 
 release = block(transport, "accept_scripted_event")
-assert release.index("lease_release(") < release.index("begin_lease_cleanup_locked()")
-assert release.index("begin_lease_cleanup_locked()") < release.index("result = 2", release.index("begin_lease_cleanup_locked()"))
+cleanup = release.index("begin_lease_cleanup_locked(")
+assert release.index("lease_release(") < cleanup
+assert cleanup < release.index("result = 2", cleanup)
 assert "if (!s_lease_cleanup_pending) return;" in block(transport, "finish_lease_cleanup_locked")
 assert "pending_requester_eligible_locked" in block(transport, "finish_lease_cleanup_locked")
 

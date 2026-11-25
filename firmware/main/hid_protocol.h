@@ -40,6 +40,7 @@ typedef struct {
     uint8_t state;
     bool request_sequence_present;
     uint64_t request_sequence;
+    bool heartbeat_ack_supported;
     uint8_t requester[32];
     uint64_t response_window_ms;
     char error_code[33];

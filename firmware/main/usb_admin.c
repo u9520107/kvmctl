@@ -29,6 +29,7 @@
 #define ADMIN_TRANSPORT_CLOSE 0x68
 #define ADMIN_TRANSPORT_STATUS 0x69
 #define ADMIN_WIFI_QUALITY 0x6a
+#define ADMIN_TRANSPORT_DIAGNOSTIC 0x6b
 
 typedef struct {
     const uint8_t *data;
@@ -263,6 +264,9 @@ static request_decode_result_t decode_request(const uint8_t *data, size_t len,
     if (request->command == ADMIN_TRANSPORT_STATUS) {
         return read_map(&r, 0) && r.pos == r.len ? REQUEST_SUPPORTED : REQUEST_INVALID;
     }
+    if (request->command == ADMIN_TRANSPORT_DIAGNOSTIC) {
+        return read_map(&r, 0) && r.pos == r.len ? REQUEST_SUPPORTED : REQUEST_INVALID;
+    }
     if (request->command == ADMIN_WIFI_QUALITY) {
         return read_map(&r, 0) && r.pos == r.len ? REQUEST_SUPPORTED : REQUEST_INVALID;
     }
@@ -367,6 +371,18 @@ static size_t encode_transport_status_response(const admin_request_t *request)
         !put_uint(s_response, sizeof(s_response), &pos, metrics.event_processing_us) ||
         !put_uint(s_response, sizeof(s_response), &pos, 25) ||
         !put_uint(s_response, sizeof(s_response), &pos, metrics.response_queue_residence_us)) return 0;
+    return pos;
+}
+
+static size_t encode_transport_diagnostic_response(const admin_request_t *request)
+{
+    char diagnostic[TRANSPORT_LEASE_DIAGNOSTIC_CAPACITY];
+    size_t pos;
+    transport_get_lease_diagnostic(diagnostic, sizeof(diagnostic));
+    if (!begin_response(request, 0, true, &pos) ||
+        !put_head(s_response, sizeof(s_response), &pos, 5, 1) ||
+        !put_uint(s_response, sizeof(s_response), &pos, 0) ||
+        !put_text(s_response, sizeof(s_response), &pos, diagnostic)) return 0;
     return pos;
 }
 
@@ -509,6 +525,7 @@ static size_t dispatch_request(admin_request_t *request)
         return err == ESP_OK ? encode_empty_result(request) : encode_error(request, 6);
     }
     if (request->command == ADMIN_TRANSPORT_STATUS) return encode_transport_status_response(request);
+    if (request->command == ADMIN_TRANSPORT_DIAGNOSTIC) return encode_transport_diagnostic_response(request);
     if (request->command == ADMIN_WIFI_QUALITY) return encode_wifi_quality_response(request);
     return encode_error(request, 7);
 }

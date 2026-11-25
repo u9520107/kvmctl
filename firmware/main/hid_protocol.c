@@ -68,7 +68,15 @@ static bool payload(reader_t *r, uint64_t type, kvmctl_hid_event_t *event)
 {
     uint64_t value = 0;
     switch (type) {
-    case KVMCTL_HID_LEASE_REQUEST:
+    case KVMCTL_HID_LEASE_REQUEST: {
+        uint64_t field_count = 0;
+        if (!head(r, 5, &field_count) || (field_count != 0 && field_count != 1)) return false;
+        if (field_count == 1) {
+            if (!uint_value(r, 0) || r->pos >= r->len || r->data[r->pos++] != 0xf5) return false;
+            event->heartbeat_ack_supported = true;
+        }
+        return true;
+    }
     case KVMCTL_HID_HEARTBEAT:
     case KVMCTL_HID_LEASE_RELEASE:
     case KVMCTL_HID_BENCH_ARM:

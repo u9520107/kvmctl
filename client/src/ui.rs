@@ -618,6 +618,14 @@ fn start_tray_session(state: &mut UiState, index: usize) {
             return;
         }
     };
+    let heartbeat_mode = match discovery::compatibility_mode(&service) {
+        Ok(mode) => mode,
+        Err(error) => {
+            tray_notice(&state.tray, "Firmware upgrade required", &error);
+            set_tray_state(state, TrayState::Unavailable);
+            return;
+        }
+    };
     let status = saved_status(&target);
     let control = transport::SessionControl::new();
     let worker_control = control.clone();
@@ -626,12 +634,13 @@ fn start_tray_session(state: &mut UiState, index: usize) {
         .name("session".into())
         .spawn(move || {
             let event_sender = sender.clone();
-            let result = transport::run_session(
+            let result = transport::run_session_with_heartbeat_ack(
                 service,
                 status,
                 credential,
                 worker_control,
                 true,
+                heartbeat_mode == discovery::HeartbeatMode::Acknowledged,
                 move |event| {
                     let _ = event_sender.send(TrayMessage::Event(event));
                 },

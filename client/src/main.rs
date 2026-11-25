@@ -37,6 +37,7 @@ const TRANSPORT_OFFER_COMMAND: u64 = 0x67;
 const TRANSPORT_CLOSE_COMMAND: u64 = 0x68;
 const TRANSPORT_STATUS_COMMAND: u64 = 0x69;
 const WIFI_QUALITY_COMMAND: u64 = 0x6a;
+const TRANSPORT_DIAGNOSTIC_COMMAND: u64 = 0x6b;
 
 #[derive(Debug)]
 struct Status {
@@ -224,6 +225,10 @@ fn encode_wifi_request(
 
 fn encode_wifi_quality_request(request_id: &[u8; 16]) -> Vec<u8> {
     encode_request(WIFI_QUALITY_COMMAND, request_id, &[0xa0])
+}
+
+fn encode_transport_diagnostic_request(request_id: &[u8; 16]) -> Vec<u8> {
+    encode_request(TRANSPORT_DIAGNOSTIC_COMMAND, request_id, &[0xa0])
 }
 
 fn valid_passphrase(passphrase: &[u8]) -> bool {
@@ -428,6 +433,39 @@ fn decode_transport_status_response(
         event_processing_us,
         response_queue_residence_us,
     })
+}
+
+fn decode_transport_diagnostic_response(
+    data: &[u8],
+    request_id: &[u8; 16],
+) -> Result<String, String> {
+    let mut r = Reader::new(data);
+    r.expect_map(6)?;
+    r.expect_uint(0)?;
+    r.expect_uint(1)?;
+    r.expect_uint(1)?;
+    r.expect_uint(0)?;
+    r.expect_uint(2)?;
+    r.expect_uint(TRANSPORT_DIAGNOSTIC_COMMAND)?;
+    r.expect_uint(3)?;
+    if r.expect_bytes(16)? != request_id {
+        return Err("response request ID mismatch".into());
+    }
+    r.expect_uint(4)?;
+    let code = r.uint()?;
+    if code != 0 {
+        return Err(format!(
+            "device rejected transport diagnostic request with code {code}"
+        ));
+    }
+    r.expect_uint(5)?;
+    r.expect_map(1)?;
+    r.expect_uint(0)?;
+    let diagnostic = r.long_text(192)?;
+    if !r.done() {
+        return Err("trailing CBOR data".into());
+    }
+    Ok(diagnostic)
 }
 
 fn decode_wifi_quality_response(data: &[u8], request_id: &[u8; 16]) -> Result<WifiQuality, String> {
@@ -1433,6 +1471,12 @@ mod serial {
             decode_transport_status_response(&response, &id)
         }
 
+        pub(crate) fn transport_diagnostic(&mut self) -> Result<String, String> {
+            let id = random_id()?;
+            let response = self.exchange(&encode_transport_diagnostic_request(&id))?;
+            decode_transport_diagnostic_response(&response, &id)
+        }
+
         pub(crate) fn wifi_quality(&mut self) -> Result<WifiQuality, String> {
             let id = random_id()?;
             self.set_read_timeout_ms(WIFI_QUALITY_READ_TIMEOUT_MS)?;
@@ -1854,16 +1898,18 @@ fn run_target_command(args: &[String]) -> Result<(), String> {
             })
             .transpose()?;
         let service = target_service(&target, manual_address)?;
+        let heartbeat_mode = discovery::compatibility_mode(&service)?;
         println!(
             "Opening authenticated foreground session for `{}`. Input remains local; physical-input capture is off.",
             target.name
         );
         let status = saved_status(&target);
-        let address = transport::run_foreground_session(
+        let address = transport::run_foreground_session_with_heartbeat_ack(
             service,
             status,
             credential,
             manual_address.is_none(),
+            heartbeat_mode == discovery::HeartbeatMode::Acknowledged,
         )
         .map_err(|error| error.to_string())?;
         if let std::net::SocketAddr::V4(address) = address {
@@ -2262,6 +2308,7 @@ fn run() -> Result<(), String> {
                 ));
             }
         };
+        let heartbeat_mode = discovery::compatibility_mode(&service)?;
         let hid_mode = match scenario {
             "hid-bench" => "scripted HID",
             "hid-sustain" => "sustained HID",
@@ -2293,6 +2340,7 @@ fn run() -> Result<(), String> {
             credential,
             takeover_peer,
             scenario,
+            heartbeat_mode == discovery::HeartbeatMode::Acknowledged,
         )
         .map_err(|error| error.to_string())?;
         if let std::net::SocketAddr::V4(address) = address {
@@ -2419,6 +2467,7 @@ fn run() -> Result<(), String> {
         }
         "telemetry" => {
             let metrics = port.transport_status()?;
+            let lease_diagnostic = port.transport_diagnostic().ok();
             println!("state={}", metrics.state);
             println!("lease_epoch={}", metrics.lease_epoch);
             println!("last_event_sequence={}", metrics.last_event_sequence);
@@ -2439,6 +2488,9 @@ fn run() -> Result<(), String> {
                 "tls_diagnostic={}",
                 String::from_utf8_lossy(&metrics.tls_diagnostic[..metrics.tls_diagnostic_len])
             );
+            if let Some(diagnostic) = lease_diagnostic {
+                println!("lease_diagnostic={diagnostic}");
+            }
             Ok(())
         }
         "wifi-test" => {
@@ -2811,6 +2863,28 @@ mod tests {
         assert_eq!(
             decode_transport_offer_response(&accepted, &id).unwrap(),
             "v=0\r\n"
+        );
+    }
+
+    #[test]
+    fn decodes_framed_lease_diagnostic_response() {
+        let id = [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15];
+        let mut response = vec![0xa6];
+        for (key, value) in [(0, 1), (1, 0), (2, TRANSPORT_DIAGNOSTIC_COMMAND)] {
+            put_uint(&mut response, key);
+            put_uint(&mut response, value);
+        }
+        put_uint(&mut response, 3);
+        put_bytes(&mut response, &id);
+        put_uint(&mut response, 4);
+        put_uint(&mut response, 0);
+        put_uint(&mut response, 5);
+        response.push(0xa1);
+        put_uint(&mut response, 0);
+        put_text(&mut response, b"heartbeat accepted slot=0");
+        assert_eq!(
+            decode_transport_diagnostic_response(&response, &id).unwrap(),
+            "heartbeat accepted slot=0"
         );
     }
 

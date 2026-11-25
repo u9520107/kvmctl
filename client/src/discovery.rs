@@ -25,6 +25,57 @@ pub struct Service {
     pub properties: BTreeMap<String, String>,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum HeartbeatMode {
+    Legacy,
+    Acknowledged,
+}
+
+const SUPPORTED_PROTOCOL_VERSION: u64 = 1;
+
+pub fn compatibility_mode(service: &Service) -> Result<HeartbeatMode, String> {
+    let protocol_version = service
+        .properties
+        .get("v")
+        .map(|value| {
+            value.parse::<u64>().map_err(|_| {
+                format!(
+                    "Firmware {} advertises an invalid transport protocol version `{value}`. Upgrade firmware before connecting.",
+                    firmware_label(service)
+                )
+            })
+        })
+        .transpose()?;
+    if let Some(version) = protocol_version
+        && version != SUPPORTED_PROTOCOL_VERSION
+    {
+        return Err(format!(
+            "Firmware {} requires transport protocol v{version}; this client supports v{SUPPORTED_PROTOCOL_VERSION}. Upgrade firmware before connecting.",
+            firmware_label(service)
+        ));
+    }
+    Ok(
+        if service
+            .properties
+            .get("hb")
+            .is_some_and(|value| value == "1")
+        {
+            HeartbeatMode::Acknowledged
+        } else {
+            HeartbeatMode::Legacy
+        },
+    )
+}
+
+fn firmware_label(service: &Service) -> String {
+    service
+        .properties
+        .get("fw")
+        .filter(|value| !value.is_empty())
+        .cloned()
+        .unwrap_or_else(|| "unknown firmware".to_owned())
+}
+
 enum BrowseEvent {
     Instance(String),
     Error(u32),
@@ -304,10 +355,6 @@ pub fn matches_endpoint(service: &Service, fingerprint: &[u8; 32]) -> bool {
             .properties
             .get("path")
             .is_some_and(|value| value == "/v1/ws")
-        && service
-            .properties
-            .get("v")
-            .is_some_and(|value| value == "1")
 }
 
 #[link(name = "dnsapi")]
@@ -375,6 +422,20 @@ mod tests {
             ]),
         };
         assert!(matches_endpoint(&service, &fingerprint));
+        assert_eq!(compatibility_mode(&service), Ok(HeartbeatMode::Legacy));
+        let mut capable = service.clone();
+        capable.properties.insert("hb".into(), "1".into());
+        assert_eq!(
+            compatibility_mode(&capable),
+            Ok(HeartbeatMode::Acknowledged)
+        );
+        let mut incompatible = service.clone();
+        incompatible.properties.insert("v".into(), "2".into());
+        incompatible.properties.insert("fw".into(), "2.0.0".into());
+        assert!(matches_endpoint(&incompatible, &fingerprint));
+        let error = compatibility_mode(&incompatible).unwrap_err();
+        assert!(error.contains("2.0.0"));
+        assert!(error.contains("Upgrade firmware"));
         let mut forged = service.clone();
         forged.properties.insert("fp".into(), "00".repeat(32));
         assert!(!matches_endpoint(&forged, &fingerprint));

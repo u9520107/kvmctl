@@ -2,6 +2,7 @@
 
 #include "client_auth.h"
 #include "device_identity.h"
+#include "esp_app_desc.h"
 #include "esp_heap_caps.h"
 #include "esp_https_server.h"
 #include "esp_log.h"
@@ -866,6 +867,8 @@ esp_err_t signaling_init(void)
             {.key = "fp", .value = service_fingerprint},
             {.key = "path", .value = "/v1/ws"},
             {.key = "v", .value = "1"},
+            {.key = "hb", .value = "1"},
+            {.key = "fw", .value = esp_app_get_description()->version},
         };
         if (err == ESP_OK) err = mdns_init();
         if (err == ESP_OK) {
