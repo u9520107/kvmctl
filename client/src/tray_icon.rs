@@ -173,67 +173,67 @@ fn create_icon(size: usize, state: TrayState) -> Result<HICON, String> {
     // Dark under-stroke preserves contrast on light taskbars.
     let contrast_stroke = stroke + 2;
     canvas.outline(
-        canvas.scale(6),
-        canvas.scale(5),
-        canvas.scale(22),
-        canvas.scale(16),
+        canvas.scale(3),
+        canvas.scale(3),
+        canvas.scale(21),
+        canvas.scale(17),
         contrast_stroke,
         CONTRAST,
     );
     canvas.outline(
-        canvas.scale(11),
-        canvas.scale(10),
-        canvas.scale(28),
-        canvas.scale(21),
+        canvas.scale(9),
+        canvas.scale(8),
+        canvas.scale(30),
+        canvas.scale(23),
         contrast_stroke,
         CONTRAST,
     );
-    let center = canvas.scale(19);
+    let center = canvas.scale(20);
     canvas.line(
-        (center, canvas.scale(21)),
-        (center, canvas.scale(25)),
+        (center, canvas.scale(23)),
+        (center, canvas.scale(28)),
         contrast_stroke,
         CONTRAST,
     );
     canvas.line(
-        (canvas.scale(15), canvas.scale(25)),
-        (canvas.scale(23), canvas.scale(25)),
+        (canvas.scale(14), canvas.scale(28)),
+        (canvas.scale(26), canvas.scale(28)),
         contrast_stroke,
         CONTRAST,
     );
 
     // Rear display first; front display overlaps its lower-right corner.
     canvas.outline(
-        canvas.scale(6),
-        canvas.scale(5),
-        canvas.scale(22),
-        canvas.scale(16),
+        canvas.scale(3),
+        canvas.scale(3),
+        canvas.scale(21),
+        canvas.scale(17),
         stroke,
         WHITE,
     );
     canvas.outline(
-        canvas.scale(11),
-        canvas.scale(10),
-        canvas.scale(28),
-        canvas.scale(21),
+        canvas.scale(9),
+        canvas.scale(8),
+        canvas.scale(30),
+        canvas.scale(23),
         stroke,
         WHITE,
     );
     canvas.line(
-        (center, canvas.scale(21)),
-        (center, canvas.scale(25)),
+        (center, canvas.scale(23)),
+        (center, canvas.scale(28)),
         stroke,
         WHITE,
     );
     canvas.line(
-        (canvas.scale(15), canvas.scale(25)),
-        (canvas.scale(23), canvas.scale(25)),
+        (canvas.scale(14), canvas.scale(28)),
+        (canvas.scale(26), canvas.scale(28)),
         stroke,
         WHITE,
     );
 
     // External badge stays visible without competing with the display glyph.
-    let accent = (canvas.scale(28), canvas.scale(23));
+    let accent = (canvas.scale(29), canvas.scale(23));
     let accent_width = (size as i32 / 16).max(1);
     match state {
         TrayState::NoTarget => {}

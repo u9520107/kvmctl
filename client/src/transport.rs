@@ -1292,6 +1292,16 @@ enum SessionExit {
     OwnershipLost(String),
 }
 
+fn session_error_exit(code: &str, response_epoch: u32) -> SessionExit {
+    if code == "lease_expired" {
+        SessionExit::Lost(format!(
+            "endpoint lease expired (endpoint epoch {response_epoch})"
+        ))
+    } else {
+        SessionExit::OwnershipLost(format!("{code} (endpoint epoch {response_epoch})"))
+    }
+}
+
 fn resolve_for_recovery(
     control: &SessionControl,
     resolve: impl FnOnce() -> Result<Option<crate::discovery::Service>, String> + Send + 'static,
@@ -1666,9 +1676,7 @@ where
                             takeover_epoch = response_epoch;
                         }
                         EndpointResponse::Error { code } => {
-                            return Ok(SessionExit::OwnershipLost(format!(
-                                "{code} (endpoint epoch {response_epoch})"
-                            )));
+                            return Ok(session_error_exit(&code, response_epoch));
                         }
                         EndpointResponse::LeaseState { owner, .. }
                             if owner != Some(credential.fingerprint) =>
@@ -3544,6 +3552,18 @@ mod tests {
         });
         assert!(result.is_none());
         release.send(()).unwrap();
+    }
+
+    #[test]
+    fn lease_expiry_reenters_recovery_without_masking_ownership_loss() {
+        assert!(matches!(
+            session_error_exit("lease_expired", 7),
+            SessionExit::Lost(reason) if reason.contains("lease expired")
+        ));
+        assert!(matches!(
+            session_error_exit("stale_epoch", 7),
+            SessionExit::OwnershipLost(reason) if reason.contains("stale_epoch")
+        ));
     }
 
     #[test]

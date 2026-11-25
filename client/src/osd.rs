@@ -2,8 +2,9 @@ use std::cell::RefCell;
 
 use windows_sys::Win32::Foundation::{HWND, LPARAM, LRESULT, RECT, WPARAM};
 use windows_sys::Win32::Graphics::Gdi::{
-    BLACK_BRUSH, BeginPaint, DT_CENTER, DT_VCENTER, DT_WORDBREAK, DrawTextW, EndPaint, FillRect,
-    GetStockObject, InvalidateRect, SetBkMode, SetTextColor, TRANSPARENT,
+    BLACK_BRUSH, BeginPaint, DEFAULT_GUI_FONT, DT_CALCRECT, DT_CENTER, DT_NOPREFIX, DT_WORDBREAK,
+    DrawTextW, EndPaint, FillRect, GetStockObject, InvalidateRect, SelectObject, SetBkMode,
+    SetTextColor, TRANSPARENT,
 };
 use windows_sys::Win32::System::LibraryLoader::GetModuleHandleW;
 use windows_sys::Win32::UI::WindowsAndMessaging::{
@@ -16,8 +17,10 @@ use windows_sys::Win32::UI::WindowsAndMessaging::{
 
 const CLASS_NAME: &str = "kvmctl-osd";
 const TIMER: usize = 1;
-const WIDTH: i32 = 560;
-const HEIGHT: i32 = 72;
+const WIDTH: i32 = 520;
+const HEIGHT: i32 = 80;
+const PADDING_X: i32 = 20;
+const PADDING_Y: i32 = 10;
 const DEFAULT_DURATION_MS: u32 = 5_000;
 const DEFAULT_OPACITY: f32 = 0.85;
 
@@ -140,18 +143,36 @@ unsafe fn paint(window: HWND) -> LRESULT {
     unsafe {
         let _ = GetClientRect(window, &mut rect);
         let _ = FillRect(dc, &rect, GetStockObject(BLACK_BRUSH) as _);
+        let old_font = SelectObject(dc, GetStockObject(DEFAULT_GUI_FONT));
         let _ = SetBkMode(dc, TRANSPARENT as i32);
         let _ = SetTextColor(dc, 0x00ff_ffff);
         STATE.with(|state| {
-            let text = &mut state.borrow_mut().text;
+            let text = &state.borrow().text;
+            let text_len = text.len().saturating_sub(1) as i32;
+            let mut text_rect = RECT {
+                left: rect.left + PADDING_X,
+                top: rect.top + PADDING_Y,
+                right: rect.right - PADDING_X,
+                bottom: rect.bottom - PADDING_Y,
+            };
+            let text_height = DrawTextW(
+                dc,
+                text.as_ptr(),
+                text_len,
+                &mut text_rect,
+                DT_CENTER | DT_WORDBREAK | DT_NOPREFIX | DT_CALCRECT,
+            );
+            text_rect.top = rect.top + ((rect.bottom - rect.top - text_height) / 2).max(PADDING_Y);
+            text_rect.bottom = text_rect.top + text_height;
             let _ = DrawTextW(
                 dc,
                 text.as_ptr(),
-                text.len().saturating_sub(1) as i32,
-                &mut rect,
-                DT_CENTER | DT_VCENTER | DT_WORDBREAK,
+                text_len,
+                &mut text_rect,
+                DT_CENTER | DT_WORDBREAK | DT_NOPREFIX,
             );
         });
+        let _ = SelectObject(dc, old_font);
         let _ = EndPaint(window, &paint);
     }
     0
