@@ -1750,8 +1750,11 @@ fn run_target_command(args: &[String]) -> Result<(), String> {
             target.name
         );
         let status = saved_status(&target);
-        let address = transport::run_foreground_session(&service, status, credential)
-            .map_err(|error| error.to_string())?;
+        let target_for_resolve = target.clone();
+        let address = transport::run_foreground_session(&service, status, credential, move || {
+            target_service(&target_for_resolve, manual_address)
+        })
+        .map_err(|error| error.to_string())?;
         if let std::net::SocketAddr::V4(address) = address {
             targets::update_address(&target.name, *address.ip())?;
         }
@@ -2044,24 +2047,30 @@ fn run() -> Result<(), String> {
                 wifi_name(status.wifi_state)
             ));
         }
-        let credential = credentials::ClientCredential::load_existing(false).map_err(|error| {
-            format!(
-                "{error}; run `cargo run --offline -p kvmctl -- enroll {}` first",
-                selected.name
-            )
-        })?;
         let enrolled = port.list_clients()?;
-        if !enrolled.contains(&credential.fingerprint) {
-            return Err(format!(
-                "this Windows client is not enrolled; run `cargo run --offline -p kvmctl -- enroll {}` first",
-                selected.name
-            ));
-        }
         let direct_only = params.len() == 1 && params[0].parse::<std::net::Ipv4Addr>().is_ok();
         let scenario = if direct_only {
             "success"
         } else {
             params.first().map(String::as_str).unwrap_or("success")
+        };
+        let credential = if scenario == "takeover-request" {
+            None
+        } else {
+            let credential =
+                credentials::ClientCredential::load_existing(false).map_err(|error| {
+                    format!(
+                        "{error}; run `cargo run --offline -p kvmctl -- enroll {}` first",
+                        selected.name
+                    )
+                })?;
+            if !enrolled.contains(&credential.fingerprint) {
+                return Err(format!(
+                    "this Windows client is not enrolled; run `cargo run --offline -p kvmctl -- enroll {}` first",
+                    selected.name
+                ));
+            }
+            Some(credential)
         };
         let takeover_peer = if matches!(scenario, "takeover" | "takeover-zero" | "takeover-request")
         {
@@ -2155,6 +2164,8 @@ fn run() -> Result<(), String> {
             return transport::run_takeover_request(&service, status, requester)
                 .map_err(|error| error.to_string());
         }
+        let credential =
+            credential.ok_or_else(|| "primary credential is unavailable".to_owned())?;
         let endpoint_fingerprint = status.identity_fingerprint;
         let address = transport::run_signaling_test(
             port,

@@ -41,25 +41,25 @@ impl Log for CertificateLog {
 
     fn log(&self, record: &Record<'_>) {
         if self.enabled(record.metadata()) {
-            RTC_ERROR_LOGS.fetch_add(1, Ordering::Relaxed);
-            let _ = RTC_ERROR_LOCATION.set((
-                record.module_path().unwrap_or(record.target()).to_owned(),
-                record.line(),
-            ));
-            let message = record.args().to_string().to_ascii_lowercase();
-            let class = if message.contains("fingerprint") {
-                1
-            } else if message.contains("certificate") {
-                2
-            } else if message.contains("dtls") {
-                3
-            } else {
-                4
-            };
-            let _ =
-                RTC_ERROR_CLASS.compare_exchange(0, class, Ordering::Relaxed, Ordering::Relaxed);
-            if message.contains("remote certificate does not match any fingerprint") {
-                CERTIFICATE_REJECTED.store(true, Ordering::Release);
+            let message = record.args().to_string();
+            if let Some(class) = rtc_error_class(record.level(), &message) {
+                RTC_ERROR_LOGS.fetch_add(1, Ordering::Relaxed);
+                let _ = RTC_ERROR_LOCATION.set((
+                    record.module_path().unwrap_or(record.target()).to_owned(),
+                    record.line(),
+                ));
+                let _ = RTC_ERROR_CLASS.compare_exchange(
+                    0,
+                    class,
+                    Ordering::Relaxed,
+                    Ordering::Relaxed,
+                );
+                if message
+                    .to_ascii_lowercase()
+                    .contains("remote certificate does not match any fingerprint")
+                {
+                    CERTIFICATE_REJECTED.store(true, Ordering::Release);
+                }
             }
             let line = format!(
                 "{} [{}] {}: {}\n",
@@ -87,6 +87,22 @@ impl Log for CertificateLog {
 }
 
 static CERTIFICATE_LOG: CertificateLog = CertificateLog;
+
+fn rtc_error_class(level: log::Level, message: &str) -> Option<u8> {
+    if !matches!(level, log::Level::Error | log::Level::Warn) {
+        return None;
+    }
+    let message = message.to_ascii_lowercase();
+    Some(if message.contains("fingerprint") {
+        1
+    } else if message.contains("certificate") {
+        2
+    } else if message.contains("dtls") {
+        3
+    } else {
+        4
+    })
+}
 
 fn diagnostic_log_level() -> LevelFilter {
     std::env::var("KVMCTL_LOG")
@@ -1114,11 +1130,15 @@ async fn exchange_signaling(
     Ok(proof)
 }
 
-pub(crate) fn run_foreground_session(
+pub(crate) fn run_foreground_session<R>(
     service: &crate::discovery::Service,
     status: crate::Status,
     credential: crate::credentials::ClientCredential,
-) -> Result<SocketAddr> {
+    resolve: R,
+) -> Result<SocketAddr>
+where
+    R: FnMut() -> Result<crate::discovery::Service, String>,
+{
     let control = SessionControl::new();
     let input = control.clone();
     std::thread::spawn(move || {
@@ -1137,14 +1157,12 @@ pub(crate) fn run_foreground_session(
             }
         }
     });
-    let service = service.clone();
-    let resolver_service = service.clone();
     run_session(
-        service,
+        service.clone(),
         status,
         credential,
         control,
-        move || Ok(resolver_service.clone()),
+        resolve,
         |event| match event {
             SessionEvent::Connecting => println!("Connecting/local…"),
             SessionEvent::ConnectedLocal => {
@@ -3485,6 +3503,17 @@ pub(crate) fn run_signaling_test(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn rtc_error_class_ignores_lower_log_levels() {
+        assert_eq!(rtc_error_class(log::Level::Info, "dtls failed"), None);
+        assert_eq!(
+            rtc_error_class(log::Level::Debug, "certificate failed"),
+            None
+        );
+        assert_eq!(rtc_error_class(log::Level::Warn, "dtls failed"), Some(3));
+        assert_eq!(rtc_error_class(log::Level::Error, "other failure"), Some(4));
+    }
 
     #[test]
     fn session_control_only_accepts_decision_for_pending_request() {

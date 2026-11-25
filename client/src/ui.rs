@@ -2,6 +2,7 @@ use super::*;
 use std::cell::RefCell;
 use std::ffi::OsStr;
 use std::os::windows::ffi::OsStrExt;
+use std::sync::OnceLock;
 use std::sync::mpsc::{self, Receiver, TryRecvError};
 use windows_sys::Win32::Foundation::{HINSTANCE, HWND, LPARAM, LRESULT, WPARAM};
 use windows_sys::Win32::Graphics::Gdi::{COLOR_WINDOW, UpdateWindow};
@@ -17,10 +18,10 @@ use windows_sys::Win32::UI::WindowsAndMessaging::{
     CreateWindowExW, DefWindowProcW, DestroyMenu, DestroyWindow, DispatchMessageW, GetCursorPos,
     GetMessageW, GetWindowTextLengthW, GetWindowTextW, IDI_APPLICATION, IDI_ERROR, IDI_HAND,
     IDI_INFORMATION, IDI_WARNING, KillTimer, LoadIconW, MF_GRAYED, MF_SEPARATOR, MF_STRING, MSG,
-    PostMessageW, PostQuitMessage, RegisterClassW, SendMessageW, SetForegroundWindow, SetTimer,
-    SetWindowTextW, ShowWindow, TrackPopupMenu, TranslateMessage, WM_APP, WM_CLOSE, WM_COMMAND,
-    WM_DESTROY, WM_LBUTTONUP, WM_NULL, WM_RBUTTONUP, WM_TIMER, WNDCLASSW, WS_BORDER, WS_CHILD,
-    WS_OVERLAPPEDWINDOW, WS_TABSTOP, WS_VISIBLE, WS_VSCROLL,
+    PostMessageW, PostQuitMessage, RegisterClassW, RegisterWindowMessageW, SendMessageW,
+    SetForegroundWindow, SetTimer, SetWindowTextW, ShowWindow, TrackPopupMenu, TranslateMessage,
+    WM_APP, WM_CLOSE, WM_COMMAND, WM_DESTROY, WM_LBUTTONUP, WM_NULL, WM_RBUTTONUP, WM_TIMER,
+    WNDCLASSW, WS_BORDER, WS_CHILD, WS_OVERLAPPEDWINDOW, WS_TABSTOP, WS_VISIBLE, WS_VSCROLL,
 };
 
 const PORTS: u16 = 1;
@@ -102,6 +103,8 @@ thread_local! {
     static STATE: RefCell<Option<UiState>> = const { RefCell::new(None) };
 }
 
+static TASKBAR_CREATED: OnceLock<u32> = OnceLock::new();
+
 fn wide(value: &str) -> Vec<u16> {
     OsStr::new(value).encode_wide().chain(Some(0)).collect()
 }
@@ -157,8 +160,8 @@ fn update_tray(tray: &TrayIcon, state: TrayState, target: Option<&str>) {
     unsafe { Shell_NotifyIconW(NIM_MODIFY, &data) };
 }
 
-fn add_tray(tray: &TrayIcon, target: Option<&str>) {
-    let data = tray_data(tray, TrayState::NoTarget, target);
+fn add_tray(tray: &TrayIcon, state: TrayState, target: Option<&str>) {
+    let data = tray_data(tray, state, target);
     unsafe { Shell_NotifyIconW(NIM_ADD, &data) };
 }
 
@@ -843,6 +846,18 @@ unsafe extern "system" fn window_proc(
     wparam: WPARAM,
     lparam: LPARAM,
 ) -> LRESULT {
+    if TASKBAR_CREATED
+        .get()
+        .is_some_and(|registered| *registered == message)
+    {
+        STATE.with(|cell| {
+            if let Some(state) = cell.borrow().as_ref() {
+                let target = selected_target_name(state).map(str::to_owned);
+                add_tray(&state.tray, state.tray_state, target.as_deref());
+            }
+        });
+        return 0;
+    }
     if message == WM_CLOSE {
         unsafe { ShowWindow(window, 0) };
         return 0;
@@ -1172,6 +1187,11 @@ fn create_controls(instance: HINSTANCE, window: HWND) -> UiState {
 
 pub fn run() -> Result<(), String> {
     transport::init_logging();
+    let taskbar_created = unsafe { RegisterWindowMessageW(wide("TaskbarCreated").as_ptr()) };
+    if taskbar_created == 0 {
+        return Err("cannot register TaskbarCreated message".into());
+    }
+    let _ = TASKBAR_CREATED.set(taskbar_created);
     let instance = unsafe { GetModuleHandleW(std::ptr::null()) };
     if instance.is_null() {
         return Err("cannot load Windows application instance".into());
@@ -1218,6 +1238,7 @@ pub fn run() -> Result<(), String> {
         .and_then(|targets| targets.into_iter().next());
     add_tray(
         &state.tray,
+        state.tray_state,
         first_target.as_ref().map(|target| target.name.as_str()),
     );
     STATE.with(|cell| *cell.borrow_mut() = Some(state));
