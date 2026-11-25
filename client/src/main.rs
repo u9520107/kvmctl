@@ -11,6 +11,8 @@ mod flash;
 #[cfg(windows)]
 mod hid_protocol;
 #[cfg(windows)]
+mod osd;
+#[cfg(windows)]
 mod protocol;
 #[cfg(windows)]
 mod raw_input;
@@ -20,6 +22,8 @@ mod signaling;
 mod targets;
 #[cfg(windows)]
 mod transport;
+#[cfg(windows)]
+mod tray_icon;
 
 const MAX_FRAME: usize = 4096;
 const WIFI_SET_COMMAND: u64 = 0x60;

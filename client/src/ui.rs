@@ -1,3 +1,5 @@
+use super::osd;
+use super::tray_icon::{TrayIcon, TrayState};
 use super::*;
 use std::cell::RefCell;
 use std::ffi::OsStr;
@@ -9,19 +11,19 @@ use windows_sys::Win32::Graphics::Gdi::{COLOR_WINDOW, UpdateWindow};
 use windows_sys::Win32::System::LibraryLoader::GetModuleHandleW;
 use windows_sys::Win32::UI::Controls::BST_CHECKED;
 use windows_sys::Win32::UI::Shell::{
-    NIF_ICON, NIF_INFO, NIF_MESSAGE, NIF_TIP, NIM_ADD, NIM_DELETE, NIM_MODIFY, NOTIFYICONDATAW,
+    NIF_ICON, NIF_MESSAGE, NIF_TIP, NIM_ADD, NIM_DELETE, NIM_MODIFY, NOTIFYICONDATAW,
     Shell_NotifyIconW,
 };
 use windows_sys::Win32::UI::WindowsAndMessaging::{
     AppendMenuW, BM_GETCHECK, BM_SETCHECK, CB_ADDSTRING, CB_GETCURSEL, CB_RESETCONTENT,
     CB_SETCURSEL, CBN_SELCHANGE, CS_HREDRAW, CS_VREDRAW, CW_USEDEFAULT, CreatePopupMenu,
     CreateWindowExW, DefWindowProcW, DestroyMenu, DestroyWindow, DispatchMessageW, GetCursorPos,
-    GetMessageW, GetWindowTextLengthW, GetWindowTextW, IDI_APPLICATION, IDI_ERROR, IDI_HAND,
-    IDI_INFORMATION, IDI_WARNING, KillTimer, LoadIconW, MF_GRAYED, MF_SEPARATOR, MF_STRING, MSG,
-    PostMessageW, PostQuitMessage, RegisterClassW, RegisterWindowMessageW, SendMessageW,
-    SetForegroundWindow, SetTimer, SetWindowTextW, ShowWindow, TrackPopupMenu, TranslateMessage,
-    WM_APP, WM_CLOSE, WM_COMMAND, WM_DESTROY, WM_LBUTTONUP, WM_NULL, WM_RBUTTONUP, WM_TIMER,
-    WNDCLASSW, WS_BORDER, WS_CHILD, WS_OVERLAPPEDWINDOW, WS_TABSTOP, WS_VISIBLE, WS_VSCROLL,
+    GetMessageW, GetWindowTextLengthW, GetWindowTextW, KillTimer, MF_GRAYED, MF_SEPARATOR,
+    MF_STRING, MSG, PostMessageW, PostQuitMessage, RegisterClassW, RegisterWindowMessageW,
+    SendMessageW, SetForegroundWindow, SetTimer, SetWindowTextW, ShowWindow, TrackPopupMenu,
+    TranslateMessage, WM_APP, WM_CLOSE, WM_COMMAND, WM_DESTROY, WM_LBUTTONUP, WM_NULL,
+    WM_RBUTTONUP, WM_TIMER, WNDCLASSW, WS_BORDER, WS_CHILD, WS_OVERLAPPEDWINDOW, WS_TABSTOP,
+    WS_VISIBLE, WS_VSCROLL,
 };
 
 const PORTS: u16 = 1;
@@ -53,10 +55,6 @@ const ES_PASSWORD: u32 = 0x0020;
 const BS_AUTOCHECKBOX: u32 = 0x0003;
 const BS_GROUPBOX: u32 = 0x0007;
 
-struct TrayIcon {
-    window: HWND,
-}
-
 struct TraySession {
     target: String,
     control: transport::SessionControl,
@@ -66,17 +64,6 @@ struct TraySession {
 enum TrayMessage {
     Event(transport::SessionEvent),
     Finished(Result<(), String>),
-}
-
-#[derive(Clone, Copy)]
-enum TrayState {
-    NoTarget,
-    Connecting,
-    ConnectedLocal,
-    OwnershipPending,
-    Recovering,
-    Unavailable,
-    OwnershipLost,
 }
 
 struct UiState {
@@ -118,18 +105,6 @@ fn copy_wide(destination: &mut [u16], value: &str) {
     }
 }
 
-fn icon_for(state: TrayState) -> windows_sys::Win32::UI::WindowsAndMessaging::HICON {
-    let resource = match state {
-        TrayState::NoTarget => IDI_APPLICATION,
-        TrayState::ConnectedLocal => IDI_INFORMATION,
-        TrayState::Connecting | TrayState::Recovering => IDI_WARNING,
-        TrayState::OwnershipPending => IDI_HAND,
-        TrayState::Unavailable => IDI_ERROR,
-        TrayState::OwnershipLost => IDI_HAND,
-    };
-    unsafe { LoadIconW(std::ptr::null_mut(), resource) }
-}
-
 fn tray_data(tray: &TrayIcon, state: TrayState, target: Option<&str>) -> NOTIFYICONDATAW {
     let mut data: NOTIFYICONDATAW = unsafe { std::mem::zeroed() };
     data.cbSize = std::mem::size_of::<NOTIFYICONDATAW>() as u32;
@@ -137,7 +112,7 @@ fn tray_data(tray: &TrayIcon, state: TrayState, target: Option<&str>) -> NOTIFYI
     data.uID = 1;
     data.uFlags = NIF_MESSAGE | NIF_ICON | NIF_TIP;
     data.uCallbackMessage = TRAY_MESSAGE;
-    data.hIcon = icon_for(state);
+    data.hIcon = tray.icon(state);
     let status = match state {
         TrayState::NoTarget => "No active target; input local",
         TrayState::Connecting => "Connecting; input local",
@@ -174,11 +149,8 @@ fn remove_tray(tray: &TrayIcon) {
 }
 
 fn tray_notice(tray: &TrayIcon, title: &str, message: &str) {
-    let mut data = tray_data(tray, TrayState::ConnectedLocal, None);
-    data.uFlags = NIF_INFO;
-    copy_wide(&mut data.szInfoTitle, title);
-    copy_wide(&mut data.szInfo, message);
-    unsafe { Shell_NotifyIconW(NIM_MODIFY, &data) };
+    let _ = tray;
+    let _ = osd::show(title, message);
 }
 
 fn target_menu_text(target: &targets::Target) -> String {
@@ -961,7 +933,7 @@ unsafe extern "system" fn window_proc(
     unsafe { DefWindowProcW(window, message, wparam, lparam) }
 }
 
-fn create_controls(instance: HINSTANCE, window: HWND) -> UiState {
+fn create_controls(instance: HINSTANCE, window: HWND) -> Result<UiState, String> {
     let basic = WS_TABSTOP;
     control(instance, window, "STATIC", "Board", 0, 0, 18, 18, 48, 22);
     let ports = control(
@@ -1172,7 +1144,7 @@ fn create_controls(instance: HINSTANCE, window: HWND) -> UiState {
         wifi_scan_rx: None,
         wifi_scan_frame: 1,
         wifi_scan_summary_stale: false,
-        tray: TrayIcon { window },
+        tray: TrayIcon::new(window)?,
         tray_session: None,
         tray_state: TrayState::NoTarget,
         selected_target: None,
@@ -1181,7 +1153,7 @@ fn create_controls(instance: HINSTANCE, window: HWND) -> UiState {
         Ok(ports) => update_port_list(&mut state, ports),
         Err(error) => set_text(state.summary, &format!("Board scan failed: {error}")),
     }
-    state
+    Ok(state)
 }
 
 pub fn run() -> Result<(), String> {
@@ -1231,7 +1203,8 @@ pub fn run() -> Result<(), String> {
     if window.is_null() {
         return Err("cannot create control window".into());
     }
-    let state = create_controls(instance, window);
+    osd::initialize()?;
+    let state = create_controls(instance, window)?;
     let first_target = targets::load()
         .ok()
         .and_then(|targets| targets.into_iter().next());
