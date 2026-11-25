@@ -252,6 +252,20 @@ pub fn browse() -> Result<Vec<Service>, String> {
     Ok(services)
 }
 
+pub(crate) fn discover_target(fingerprint: &[u8; 32]) -> Result<Option<Service>, String> {
+    let mut matches = browse()
+        .map_err(|error| {
+            format!("DNS-SD browse failed: {error}; pass an IPv4 address to use manual-IP fallback")
+        })?
+        .into_iter()
+        .filter(|service| matches_endpoint(service, fingerprint));
+    let service = matches.next();
+    if matches.next().is_some() {
+        return Err("multiple DNS-SD services claim this saved target identity".into());
+    }
+    Ok(service)
+}
+
 pub fn socket_address(service: &Service) -> Result<SocketAddr, String> {
     if !(1..=65535).contains(&service.port) {
         return Err("discovered service has invalid port".into());

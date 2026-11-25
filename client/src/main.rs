@@ -1669,16 +1669,7 @@ fn target_service(
         );
         return Ok(service_at_ipv4(address, &target.endpoint_fingerprint));
     }
-    let services = discovery::browse().map_err(|error| {
-        format!("DNS-SD browse failed: {error}; pass an IPv4 address to use manual-IP fallback")
-    })?;
-    let mut matches = services
-        .into_iter()
-        .filter(|service| discovery::matches_endpoint(service, &target.endpoint_fingerprint));
-    if let Some(service) = matches.next() {
-        if matches.next().is_some() {
-            return Err("multiple DNS-SD services claim this saved target identity".into());
-        }
+    if let Some(service) = discovery::discover_target(&target.endpoint_fingerprint)? {
         return Ok(service);
     }
     if let Some(address) = target.last_ipv4 {
@@ -1750,10 +1741,12 @@ fn run_target_command(args: &[String]) -> Result<(), String> {
             target.name
         );
         let status = saved_status(&target);
-        let target_for_resolve = target.clone();
-        let address = transport::run_foreground_session(&service, status, credential, move || {
-            target_service(&target_for_resolve, manual_address)
-        })
+        let address = transport::run_foreground_session(
+            service,
+            status,
+            credential,
+            manual_address.is_none(),
+        )
         .map_err(|error| error.to_string())?;
         if let std::net::SocketAddr::V4(address) = address {
             targets::update_address(&target.name, *address.ip())?;

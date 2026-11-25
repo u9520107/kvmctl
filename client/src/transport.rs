@@ -1130,15 +1130,12 @@ async fn exchange_signaling(
     Ok(proof)
 }
 
-pub(crate) fn run_foreground_session<R>(
-    service: &crate::discovery::Service,
+pub(crate) fn run_foreground_session(
+    service: crate::discovery::Service,
     status: crate::Status,
     credential: crate::credentials::ClientCredential,
-    resolve: R,
-) -> Result<SocketAddr>
-where
-    R: FnMut() -> Result<crate::discovery::Service, String>,
-{
+    rediscover: bool,
+) -> Result<SocketAddr> {
     let control = SessionControl::new();
     let input = control.clone();
     std::thread::spawn(move || {
@@ -1158,11 +1155,11 @@ where
         }
     });
     run_session(
-        service.clone(),
+        service,
         status,
         credential,
         control,
-        resolve,
+        rediscover,
         |event| match event {
             SessionEvent::Connecting => println!("Connecting/local…"),
             SessionEvent::ConnectedLocal => {
@@ -1295,17 +1292,42 @@ enum SessionExit {
     OwnershipLost(String),
 }
 
-pub(crate) fn run_session<F, R>(
+fn resolve_for_recovery(
+    control: &SessionControl,
+    resolve: impl FnOnce() -> Result<Option<crate::discovery::Service>, String> + Send + 'static,
+) -> Option<(crate::discovery::Service, SocketAddr)> {
+    let (sender, receiver) = std::sync::mpsc::channel();
+    // Dropping the receiver lets the session exit while the DNS calls finish.
+    std::thread::Builder::new()
+        .name("session-discovery".into())
+        .spawn(move || {
+            let resolved = resolve().ok().flatten().and_then(|service| {
+                let address = crate::discovery::socket_address(&service).ok()?;
+                Some((service, address))
+            });
+            let _ = sender.send(resolved);
+        })
+        .ok()?;
+    while !control.is_cancelled() {
+        match receiver.recv_timeout(Duration::from_millis(100)) {
+            Ok(resolved) => return resolved,
+            Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => break,
+            Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {}
+        }
+    }
+    None
+}
+
+pub(crate) fn run_session<F>(
     initial_service: crate::discovery::Service,
     status: crate::Status,
     credential: crate::credentials::ClientCredential,
     control: SessionControl,
-    mut resolve: R,
+    rediscover: bool,
     mut on_event: F,
 ) -> Result<SocketAddr>
 where
     F: FnMut(SessionEvent),
-    R: FnMut() -> Result<crate::discovery::Service, String>,
 {
     install_certificate_log()?;
     log::info!("session connecting to {}", initial_service.hostname);
@@ -1335,7 +1357,8 @@ where
             exit = Some(
                 run_session_once(
                     runtime.clone(),
-                    &service,
+                    last_address,
+                    &service.hostname,
                     &status,
                     &credential,
                     &control,
@@ -1396,10 +1419,15 @@ where
             });
             return Err(anyhow::anyhow!(reason));
         }
-        if let Ok(next) = resolve() {
+        let fingerprint = status.identity_fingerprint;
+        if rediscover
+            && let Some((next, address)) = resolve_for_recovery(&control, move || {
+                crate::discovery::discover_target(&fingerprint)
+            })
+            && !control.is_cancelled()
+        {
             service = next;
-            last_address =
-                crate::discovery::socket_address(&service).map_err(anyhow::Error::msg)?;
+            last_address = address;
         }
         let wait_until = Instant::now() + retry_delay;
         while Instant::now() < wait_until {
@@ -1508,7 +1536,8 @@ pub(crate) fn run_takeover_request(
 
 async fn run_session_once<F>(
     runtime: Arc<dyn Runtime>,
-    service: &crate::discovery::Service,
+    address: SocketAddr,
+    hostname: &str,
     status: &crate::Status,
     credential: &crate::credentials::ClientCredential,
     control: &SessionControl,
@@ -1518,12 +1547,11 @@ async fn run_session_once<F>(
 where
     F: FnMut(SessionEvent),
 {
-    let address = crate::discovery::socket_address(service).map_err(anyhow::Error::msg)?;
     let mut peer = match open_signaling_peer(
         runtime.clone(),
         device_status,
         address,
-        &service.hostname,
+        hostname,
         status,
         credential,
     )
@@ -1532,7 +1560,7 @@ where
         Ok(peer) => peer,
         Err(error) => return Ok(SessionExit::Unavailable(error.to_string())),
     };
-    log::debug!("session signaling authenticated for {}", service.hostname);
+    log::debug!("session signaling authenticated for {hostname}");
     let mut connected = false;
     let session_result: Result<SessionExit> = async {
         peer.session
@@ -3503,6 +3531,20 @@ pub(crate) fn run_signaling_test(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn recovery_cancellation_does_not_wait_for_discovery() {
+        let control = SessionControl::new();
+        let worker_control = control.clone();
+        let (release, blocked) = std::sync::mpsc::channel();
+        let result = resolve_for_recovery(&control, move || {
+            worker_control.cancel();
+            let _ = blocked.recv_timeout(Duration::from_secs(5));
+            Ok(None)
+        });
+        assert!(result.is_none());
+        release.send(()).unwrap();
+    }
 
     #[test]
     fn rtc_error_class_ignores_lower_log_levels() {

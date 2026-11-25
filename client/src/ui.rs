@@ -640,7 +640,6 @@ fn start_tray_session(state: &mut UiState, index: usize) {
         }
     };
     let status = saved_status(&target);
-    let target_for_resolve = target.clone();
     let control = transport::SessionControl::new();
     let worker_control = control.clone();
     let (sender, events) = mpsc::channel();
@@ -653,7 +652,7 @@ fn start_tray_session(state: &mut UiState, index: usize) {
                 status,
                 credential,
                 worker_control,
-                move || target_service(&target_for_resolve, None),
+                true,
                 move |event| {
                     let _ = event_sender.send(TrayMessage::Event(event));
                 },
