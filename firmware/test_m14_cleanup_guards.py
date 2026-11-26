@@ -1,10 +1,12 @@
-"""Small source guards for M1.4 cleanup ordering and bounded HID recovery."""
+"""Source guards for M1.4 cleanup, HID recovery, and lease compatibility."""
+import re
 from pathlib import Path
 
 
 root = Path(__file__).parent
 transport = (root / "main/transport.c").read_text()
 hid = (root / "hid_bench/hid_bench.c").read_text()
+protocol = (root / "main/hid_protocol.c").read_text()
 
 
 def block(source: str, name: str) -> str:
@@ -35,4 +37,11 @@ assert failed_recovery.count("return false;") == 1
 assert "hid_bench_cleanup_complete" in hid
 assert "KVMCTL_HID_BENCH_FAIL_TRANSFER_ONCE" in hid
 
-print("M1.4 cleanup ordering and transfer-failure guards passed")
+lease_request = protocol.split("case KVMCTL_HID_LEASE_REQUEST:", 1)[1].split("case ", 1)[0]
+assert re.search(
+    r"if \(field_count == 1\) \{[^{}]*event->heartbeat_ack_supported = true;\s*\}\s*return true;",
+    lease_request,
+)
+assert "slot->heartbeat_ack_supported = false;" in block(transport, "transport_offer_internal")
+
+print("M1.4 cleanup, transfer-failure, and lease compatibility guards passed")

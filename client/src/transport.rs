@@ -25,6 +25,7 @@ static LOG_LEVEL: OnceLock<LevelFilter> = OnceLock::new();
 
 const HEARTBEAT_INTERVAL: Duration = Duration::from_secs(3);
 const LEGACY_HEARTBEAT_INTERVAL: Duration = Duration::from_secs(1);
+const LEGACY_HEARTBEAT_RESPONSE_TIMEOUT: Duration = Duration::from_millis(100);
 const HEARTBEAT_MISS_LIMIT: u8 = 3;
 
 #[derive(Default)]
@@ -2173,6 +2174,30 @@ async fn send_hid_event(
     Ok(())
 }
 
+async fn drain_legacy_heartbeat_response(
+    runtime: &dyn Runtime,
+    control: &Arc<dyn DataChannel>,
+    responses: &mut ResponseCursor,
+    epoch: u32,
+) -> Result<()> {
+    match timeout(runtime, LEGACY_HEARTBEAT_RESPONSE_TIMEOUT, control.poll()).await {
+        Ok(Some(DataChannelEvent::OnMessage(message))) => {
+            ensure!(
+                matches!(
+                    responses.decode(&message.data, epoch)?,
+                    EndpointResponse::LeaseState { .. }
+                ),
+                "unexpected legacy heartbeat response"
+            );
+        }
+        Ok(Some(DataChannelEvent::OnClose)) | Ok(None) => {
+            bail!("scripted control channel closed")
+        }
+        Ok(_) | Err(_) => {}
+    }
+    Ok(())
+}
+
 async fn send_heartbeat(
     runtime: &dyn Runtime,
     control: &Arc<dyn DataChannel>,
@@ -2184,6 +2209,7 @@ async fn send_heartbeat(
 ) -> Result<()> {
     send_hid_event(control, event).await?;
     if !heartbeat_ack_supported {
+        drain_legacy_heartbeat_response(runtime, control, responses, epoch).await?;
         return Ok(());
     }
     require_response(
@@ -2668,6 +2694,8 @@ impl<'a> TakeoverClient<'a> {
         )
         .await?;
         if !self.heartbeat_ack_supported {
+            drain_legacy_heartbeat_response(self.runtime, self.control, &mut self.responses, epoch)
+                .await?;
             return Ok(());
         }
         loop {
