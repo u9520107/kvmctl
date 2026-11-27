@@ -589,8 +589,8 @@ Redacted UART evidence is local in
 
 Product transport code is integrated in `firmware/main/transport.c` and
 `client/src/transport.rs`. The device is the answerer and echoes bounded
-payloads on `control` and `motion`; the Rust client creates reliable ordered
-`control` and unordered zero-retransmission `motion`, checks those settings,
+payloads on `control`, `input`, and `motion`; the Rust client creates reliable
+ordered `control` and `input` plus unordered zero-retransmission `motion`, checks those settings,
 tests malformed-SDP active-session invalidation, and exercises a fresh-session
 reconnect. A USB status request reports a captured backend fingerprint
 rejection to the Windows test client while keeping UART logs suppressed. HID
@@ -1622,3 +1622,249 @@ stale connected state appeared.
 
 Closure decision: M2.2 is closed for the defined resident-tray and session
 lifecycle acceptance fields. Live physical-input capture remains gated to M2.3.
+
+### M2.3 live input source implementation (2026-11-26)
+
+Starting revision: local `main` `4ff8aa0`, clean before this change. The existing
+Raw Input observer in `client/src/raw_input.rs` was inspected first and remains
+bench-only: it continues to filter the board's native HID collections and does
+not suppress the physical keyboard or mouse.
+
+Source implementation now includes:
+
+- a shared `%LOCALAPPDATA%\\kvmctl\\settings.tsv` escape-binding store with a
+  usable default `CTRL+SHIFT+F10`, multiple bindings, optional `COPILOT`, and
+  CLI management through `settings escape list|add|remove|reset`;
+- Windows low-level keyboard/mouse hooks that consume configured escape keys,
+  emit sorted full keyboard/button snapshots plus relative motion and wheel
+  events, and fail closed on queue overflow or hook failure;
+- explicit `HID_BENCH_ARM` activation only after authenticated signaling,
+  current lease epoch, and installed escape hooks; tray escape neutralizes and
+  returns local while keeping the session/lease, while CLI escape neutralizes,
+  releases, and exits;
+- local disarm plus event-drain on lease release, heartbeat degradation/expiry,
+  disconnect, peer cleanup, takeover, ownership loss, endpoint error/restart,
+  target switch, and reconnect; recovery starts local and does not re-enable
+  remote capture;
+- a distinct remote-control tray icon, destination tooltip, centered OSD
+  notices, and a switch barrier that waits for the old worker to finish before
+  starting the new target local.
+
+Passed source checks:
+
+```text
+cargo fmt --all -- --check       passed
+git diff --check                 passed
+cargo test --workspace --offline 58 passed, 0 failed
+```
+
+The pre-change COM6 baseline was rechecked with source-built Rust and physical
+capture disabled. The board completed two authenticated sessions with clean
+reconnect, request/response heartbeat support, and zero HID reports:
+
+```text
+M1.2 TRANSPORT COMPLETE sessions=2 reconnect=clean hid_reports=0
+```
+
+The baseline is transport evidence only; transient ICE route errors were logged
+before the board path connected. No firmware was flashed, and no bootloader,
+partition table, data partition, or standalone executable was written or
+delivered.
+
+Still requires user-led Windows/hardware verification before removing the
+pre-acceptance gate: actual hook installation and local consumption outside the
+client window; usability of `CTRL+SHIFT+F10`; optional Copilot binding; CLI
+escape neutralize/disconnect/exit; tray escape neutralize/local with heartbeats
+retained; physical keyboard/mouse/motion/wheel delivery on a HID-capable app;
+all-up reports on every listed failure path; takeover/revoke/endpoint restart;
+and two-target switching with no held state on the old target. After heartbeat
+recovery the capture hook is local-ready, but remote control still requires a
+new explicit escape activation. The normal COM6
+firmware baseline is not a live-HID acceptance image, so these checks must use
+the approved HID-capable factory-app-only workflow and remain interactive.
+
+
+### M2.3 live-input review verification (2026-11-27)
+
+Live input starts shortcut observation by default. The Windows low-level hooks and Raw Input backend keeps physical routing local until remote input is explicitly activated. `RIDEV_INPUTSINK` gives the registering application background receipt. `RIDEV_NOLEGACY` affects legacy messages for that application. Neither establishes cross-process Raw Input exclusion. The low-level hook and Raw Input message streams also lack a verified shared ordering, and Windows can silently remove timed-out hooks. A future exclusive backend must establish keyboard and pointing-device ownership, ordered reports and failure detection before live activation can be enabled. [Raw Input flags](https://learn.microsoft.com/en-us/windows/win32/api/winuser/ns-winuser-rawinputdevice), [keyboard hook behavior](https://learn.microsoft.com/en-us/windows/win32/winmsg/lowlevelkeyboardproc), [mouse hook behavior](https://learn.microsoft.com/en-us/windows/win32/winmsg/lowlevelmouseproc).
+
+#### Exclusive-backend decision (2026-11-27)
+
+Platform review found no supported user-mode backend satisfying all three requirements:
+exclusive keyboard and mouse delivery across processes, one ordered keyboard/mouse
+stream, and detectable capture loss. `RIDEV_INPUTSINK` enables background Raw Input
+receipt; `RIDEV_NOLEGACY` suppresses legacy messages for the registered device class
+and does not exclude other Raw Input consumers. `RIDEV_DEVNOTIFY` reports device
+arrival/removal, not ownership loss. [Raw Input device flags](https://learn.microsoft.com/en-us/windows/win32/api/winuser/ns-winuser-rawinputdevice),
+[Raw Input overview](https://learn.microsoft.com/en-us/windows/win32/inputdev/about-raw-input),
+[RegisterRawInputDevices](https://learn.microsoft.com/en-us/windows/win32/api/winuser/nf-winuser-registerrawinputdevices).
+
+Low-level hooks can return nonzero to suppress legacy target-window delivery, but do
+not suppress Raw Input readers. Keyboard and mouse hooks remain separate streams;
+Microsoft documents no shared total ordering. A hook that exceeds `LowLevelHooksTimeout`
+can be silently removed with no application notification. [LowLevelKeyboardProc](https://learn.microsoft.com/en-us/windows/win32/winmsg/lowlevelkeyboardproc),
+[LowLevelMouseProc](https://learn.microsoft.com/en-us/windows/win32/winmsg/lowlevelmouseproc).
+DirectInput exclusive mode does not solve this: nonexclusive access remains permitted,
+and background exclusive access is not guaranteed to retain the device. [IDirectInputDevice8::SetCooperativeLevel](https://learn.microsoft.com/en-us/previous-versions/windows/desktop/ee417921%28v%3Dvs.85%29).
+`BlockInput` is a global suppression primitive without a physical report stream, so it
+cannot provide ordered forwarding, escape, or recovery. [BlockInput](https://learn.microsoft.com/en-us/windows/win32/api/winuser/nf-winuser-blockinput).
+
+Only a custom keyboard/mouse filter path appears capable of meeting the routing
+contract. Microsoft allows upper filters at `kbdhid`/`mouhid` or `kbdclass`/`mouclass`,
+but advises avoiding filters unless critical. Such a backend would be a system-wide
+kernel component with INF/PnP integration, elevated installation, explicit PnP removal
+and service-health handling, held-input cleanup, and a shared sequencer/status channel.
+Production x64 deployment requires a driver signature accepted by Windows; development
+requires test signing and administrator control, with reboot and Secure Boot policy
+implications. [Keyboard and mouse HID client drivers](https://learn.microsoft.com/en-us/windows-hardware/drivers/hid/keyboard-and-mouse-hid-client-drivers),
+[driver signing](https://learn.microsoft.com/en-us/windows-hardware/drivers/install/driver-signing),
+[kernel-mode code-signing requirements](https://learn.microsoft.com/en-us/windows-hardware/drivers/install/kernel-mode-code-signing-requirements--windows-vista-and-later-).
+
+No driver was introduced because global cross-process suppression is not part of the
+current product scope. The earlier fail-closed gate protected that stronger contract;
+the focused-session scope below enables application capture without claiming that
+other Raw Input observers are blocked.
+
+#### Focused-session scope decision (2026-11-27)
+
+The requirement was narrowed to JetKVM-style application capture. Global suppression
+of every other Raw Input observer is not required. The client now enables its existing
+Win32 capture path by default, uses `Ctrl+Shift+F10` as a
+toggle, and shows a 300x32 topmost status surface only while remote input is active.
+The surface has no video and does not activate itself, so a board session does not
+cover the desktop or pause background video playback. Raw Input observers may still
+see physical reports; that is expected under this scope. Escape, the configured
+toggle, cleanup, or session loss returns input local and hides the surface.
+
+The earlier global-exclusivity review remains relevant only if the product later
+requires other Windows processes to stop observing physical input. It is not a gate
+for current focused-session acceptance.
+
+Host regression uses the production C lease, codec and transport arm/disarm/USB-service rules with simulated USB completion. The Rust fixture consumer checks correlated replies, physical capture state transitions using production state logic, held keyboard state and destination order. It does not drive RTC, a real Win32 hook, or USB hardware.
+
+The performance revision keeps keyboard, button, wheel, and cleanup events on a
+dedicated reliable ordered `input` path with one bounded USB completion credit;
+lease and heartbeat traffic remains on `control`. Relative motion uses the
+unordered, zero-retransmit `motion` DataChannel and no per-report completion
+wait; firmware drops motion only when its bounded HID queue is full.
+The peer service loop, HID service loop, and USB HID polling interval are 1 ms,
+with `CONFIG_FREERTOS_HZ=1000` in the rebuilt configuration.
+
+Run from the repo root in an x64 Visual Studio Developer PowerShell:
+
+```powershell
+python firmware/test_live_input.py --fixture firmware/build/live-input-fixture.bin
+$env:KVMCTL_LIVE_FIXTURE=(Resolve-Path firmware/build/live-input-fixture.bin).Path
+cargo test --workspace --locked --offline firmware_rule_rearm_and_capture_handoff -- --ignored
+cargo test --workspace --locked --offline
+cargo fmt --all -- --check
+git diff --check
+```
+
+The workspace Cargo suite passed 77 tests (prior baseline 63) and reported one ignored fixture test. `cargo check --workspace --tests --examples --locked --offline`, formatting, and the diff check also passed. The current shell has no `cl.exe`, so fixture regeneration and the ignored C fixture test were not rerun in this verification.
+
+Additional firmware commands run in x64 Visual Studio Developer PowerShell:
+
+```powershell
+python firmware/test_signaling_guards.py --msvc (Get-Command cl.exe).Source
+python firmware/test_usb_admin.py
+python firmware/test_m14_cleanup_guards.py
+python firmware/test_m15_recovery_guards.py
+python firmware/test_wifi_setup_guards.py
+```
+
+The current shell reran `test_m14_cleanup_guards.py`, `test_m15_recovery_guards.py`,
+and `test_wifi_setup_guards.py`; all three passed. `test_live_input.py`,
+`test_signaling_guards.py`, and `test_usb_admin.py` require `cl.exe` here and
+were not rerun. The fixture model remains the required check for held drag at
+125 Hz and 2 kHz, exact signed displacement, heartbeat during report backpressure,
+button-up ordering, and USB detach with a healthy lease.
+
+ESP-IDF 6.1.1 configured and built the ESP32-S3 HID firmware with
+`KVMCTL_HID_BENCH=1` and cached local dependencies from staged source. The
+rebuilt configuration reports `CONFIG_FREERTOS_HZ=1000` and produced a
+1,256,784-byte app image with 18% partition free. The staging copy and output
+stayed under `firmware/build/`.
+
+```powershell
+python "$env:IDF_PATH/tools/idf.py" -C firmware/build/m23-source -B firmware/build/m23-hid-managed --no-ccache -DIDF_TARGET=esp32s3 reconfigure build
+```
+
+Current source-only rerun in this workspace passed `cargo check --workspace
+--tests --examples --locked --offline`, `cargo test --workspace --locked
+--offline` (77 passed, 1 ignored), `cargo fmt --all -- --check`, and
+`git diff --check`. The three non-compiler firmware guards listed above passed.
+Fixture regeneration, the ignored C fixture test, `test_signaling_guards.py`,
+and `test_usb_admin.py` require `cl.exe`; this shell has no MSVC compiler. No
+physical routing test or standalone executable delivery occurred.
+
+Board verification and app-only flash in the current workspace found recognized board
+`e145e029` on `COM6`, matching USB identity and Wi-Fi discovery at
+`192.168.50.137`. App-only flash of the managed HID image completed and verified
+at factory app offset `0x10000`; bootloader, partition table, NVS, PHY, and VFS
+were not written. The pre-flash factory app backup is
+`firmware/backups/m23-preflash-COM6-20261127.bin`, 2,031,616 bytes, SHA-256
+`9ca72cf656a050c96f25bffc497d7604437933783949473b1fa6c387f2333257`. The
+current flash also created and verified
+`firmware/backups/m23-fast-input-COM6-20261127.bin`, 2,031,616 bytes, SHA-256
+`be3a05c246e85580bb2c736df74745282fbeff5fa2027bc467d95242798d0733`. The
+current 1,256,784-byte image was flashed and verified with SHA-256
+`445aa63495fc9881844ef5d99061b4c1bbca724e0eaf53efcaae6f9eb7b64dbc`.
+Post-reset `status COM6` reports firmware `4ff8aa0-dirty`; `telemetry COM6`
+reports `state=0`, `lease_epoch=0`, `hid_reports=0`, `normalized_keys=0`, and
+`normalized_buttons=0`. A live-input session attempt with
+`KVMCTL_ENABLE_LIVE_INPUT=1` stopped before signaling because this Windows user
+has no usable DPAPI enrollment (`Windows DPAPI operation failed; enroll this
+Windows user over USB before opening a session`). These checks prove board
+reachability and installed HID firmware, not live-HID routing capability.
+
+The remote-wake revision was subsequently built and flashed app-only to the same
+board. Image `firmware/build/m23-hid-managed/kvmctl_firmware.bin` is 1,256,944
+bytes with SHA-256
+`cbbd9ae02c922b9c37aba38f986b2d7c9623844b1cc1cfefccf910e9888d6bcb`. The
+pre-flash factory app backup is
+`firmware/backups/m23-remote-wake-COM6-20261127.bin`, 2,031,616 bytes, with
+SHA-256 `a3099aab85fd28526f4e749cb8569b07f48dfc344f69c85ee5ff2141c585453c`.
+The app write and post-write digest verification passed; bootloader, partition
+table, NVS, PHY, and VFS were not written. Post-reset status retained the same
+board identity and TLS pin, with Wi-Fi connected. Physical sleep/wake and live
+input acceptance remain untested.
+
+#### Pending interactive Windows checks
+
+Use a physical Windows desktop, a keyboard, a relative mouse with selectable 125 Hz and 2 kHz rates, an absolute device, and an enrolled endpoint with USB HID attached to a second host. Save two endpoints if checking switching. Close other kvmctl sessions. Verify the configured shortcut first. The default is Ctrl+Shift+F10.
+
+```powershell
+cargo run --locked --offline -p kvmctl -- settings escape list
+cargo run --locked --offline -p kvmctl -- target list
+```
+
+In one PowerShell start the independent reader. Its foreground window and console are separate. Focus the reader window for the foreground run, then focus a different application for the background run. The console identifies foreground/background, source device, keyboard make/break and mouse deltas/buttons.
+
+```powershell
+cargo run --locked --offline -p kvmctl --example raw_input_reader
+```
+
+In another PowerShell run the CLI, replacing `TARGET` with a saved name. Then repeat with the tray by running the application without arguments and selecting the saved target from the tray menu.
+
+```powershell
+$env:KVMCTL_LOG='debug'
+cargo run --locked --offline -p kvmctl -- session TARGET
+cargo run --locked --offline -p kvmctl
+```
+
+For each focus condition, tap A, move and click, drag, scroll, and press and release the shortcut including both modifier sides. Hold Ctrl+Shift after F10, then release in either order. Repeat with short relative-motion bursts at 125 Hz and 2 kHz and with the absolute device. With this revision the reader should continue to receive local device input, including shortcut events. Endpoint USB reports should remain neutral. CLI should report remote input unavailable, release the lease and exit. Tray should show one unavailable notice per shortcut attempt, stay connected local and keep heartbeats. There should be zero remote destination OSDs.
+
+For switching, select B while connected to A. In a separate PowerShell remove B during A's shutdown using the following command. If removal reaches disk before revalidation, expect an unavailable notice, no connection to B or any replacement, and A's cleanup before the switch can proceed. If shutdown wins the race, repeat. The current source orders old-worker cleanup before new-target startup, but no integrated test currently proves held-drag neutralization, exactly-one OSD, and explicit activation on the new target.
+
+```powershell
+cargo run --locked --offline -p kvmctl -- target remove TARGET_B
+```
+
+Physical remote acceptance requires an exclusive backend. Once available, use the same reader and CLI/tray Cargo commands. Check foreground and background readers on both activation and escape. Once handoff completes, remote-owned events must reach only endpoint USB. Locally owned downs must receive local ups before the remote OSD. Escape must return local without leaking its remote-owned chord, duplicate OSDs, or typing repeats from held remote keys. CLI exits. Tray retains its lease and re-arms only on explicit request. Repeat while holding a drag at both mouse rates, on first heartbeat miss, during USB detach/reattach, and while switching. Check endpoint reports and lease telemetry from its USB-UART port:
+
+```powershell
+cargo run --locked --offline -p kvmctl -- telemetry COMx
+```
+
+Expect one local destination OSD on each remote fallback, an amber tray state on heartbeat miss, no destination event for a miss while already local, neutral HID on the old endpoint before a switch, and explicit reactivation after recovery. These observations remain pending.

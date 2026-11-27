@@ -34,6 +34,7 @@ extern bool esp_peer_remote_fingerprint_rejected(esp_peer_handle_t peer);
 #define CONTROL_CAPACITY 512
 #define MOTION_CAPACITY 64
 #define RESPONSE_QUEUE_DEPTH 4
+#define INPUT_SEQUENCE_BASE 0x8000000000000000ULL
 #define BIT_ANSWER BIT0
 #define BIT_FAILED BIT1
 #define BIT_CLOSED BIT2
@@ -73,13 +74,16 @@ typedef struct {
     peer_sdp_t *sdp;
     size_t answer_len;
     echo_channel_t control;
+    echo_channel_t input;
     echo_channel_t motion;
     response_queue_t responses;
     atomic_uchar open_channels;
     uint64_t control_sequence;
     uint64_t response_sequence;
+    uint64_t input_sequence;
     uint64_t motion_sequence;
     bool heartbeat_ack_supported;
+    bool live_input_protocol;
     bool motion_sequence_seen;
     bool session_id_seen;
     uint8_t session_id[16];
@@ -132,6 +136,14 @@ static bool s_lease_cleanup_pending;
  * must not call the USB driver with interrupts masked. */
 static SemaphoreHandle_t s_lease_mux;
 static transport_peer_t *s_bench_owner;
+static bool s_live_report_pending;
+static uint64_t s_live_report_sequence;
+static struct {
+    transport_peer_t *peer;
+    uint32_t epoch;
+    uint32_t generation;
+    uint64_t sequence;
+} s_live_disarm;
 #define lease_lock() xSemaphoreTake(s_lease_mux, portMAX_DELAY)
 #define lease_unlock() xSemaphoreGive(s_lease_mux)
 #else
@@ -252,6 +264,7 @@ static void bench_disarm_locked(void)
 {
     if (!s_bench_owner) return;
     s_bench_owner = NULL;
+    s_live_report_pending = false;
     hid_bench_disarm();
 }
 #endif
@@ -350,7 +363,7 @@ static bool queue_response(transport_peer_t *slot, const kvmctl_hid_event_t *eve
     return queued;
 }
 
-static bool queue_state_locked(transport_peer_t *slot, const kvmctl_hid_event_t *request)
+static bool queue_state_reply_locked(transport_peer_t *slot, const uint64_t *request_sequence)
 {
     if (!slot || !slot->session_id_seen) return false;
     kvmctl_hid_event_t state = {0};
@@ -360,10 +373,16 @@ static bool queue_state_locked(transport_peer_t *slot, const kvmctl_hid_event_t 
     state.owner_present = s_lease.active;
     if (state.owner_present) memcpy(state.owner, s_lease.owner, sizeof(state.owner));
     state.state = s_lease.pending ? 2 : s_lease.active ? 1 : 0;
-    state.request_sequence_present = slot->heartbeat_ack_supported &&
-                                    request && request->type == KVMCTL_HID_HEARTBEAT;
-    if (state.request_sequence_present) state.request_sequence = request->sequence;
+    state.request_sequence_present = request_sequence != NULL;
+    if (request_sequence) state.request_sequence = *request_sequence;
     return queue_response(slot, &state);
+}
+
+static bool queue_state_locked(transport_peer_t *slot, const kvmctl_hid_event_t *request)
+{
+    bool echo = request && (request->type == KVMCTL_HID_LIVE_INPUT_ARM ||
+                            (slot->heartbeat_ack_supported && request->type == KVMCTL_HID_HEARTBEAT));
+    return queue_state_reply_locked(slot, echo ? &request->sequence : NULL);
 }
 
 static void queue_state_to_peers_locked(void)
@@ -405,6 +424,10 @@ static void queue_error_locked(transport_peer_t *slot, const kvmctl_hid_event_t 
     error.type = KVMCTL_HID_ERROR;
     memcpy(error.session_id, slot->session_id, sizeof(error.session_id));
     error.lease_epoch = s_lease.epoch;
+    if (event->type == KVMCTL_HID_LIVE_INPUT_ARM || event->type == KVMCTL_HID_LIVE_INPUT_DISARM) {
+        error.request_sequence_present = true;
+        error.request_sequence = event->sequence;
+    }
     strncpy(error.error_code, code, sizeof(error.error_code) - 1);
     (void)queue_response(slot, &error);
 }
@@ -442,8 +465,31 @@ static bool event_is_current_locked(int slot, const kvmctl_hid_event_t *event)
     return lease_can_emit(&s_lease, lease_slot_identity(slot), event->lease_epoch);
 }
 
+#ifdef KVMCTL_HID_BENCH
+static transport_peer_t *live_disarm_owner_locked(void)
+{
+    transport_peer_t *peer = s_live_disarm.peer;
+    if (peer && (!s_lease.active || s_live_disarm.epoch != s_lease.epoch ||
+                 s_live_disarm.generation != peer->generation)) {
+        s_live_disarm.peer = NULL;
+    }
+    return s_live_disarm.peer;
+}
+
+static void revoke_bench_owner_locked(uint64_t now, lease_log_snapshot_t *log)
+{
+    transport_peer_t *owner = s_bench_owner ? s_bench_owner : live_disarm_owner_locked();
+    s_live_disarm.peer = NULL;
+    if (owner && lease_revoke(&s_lease, owner->client_fingerprint, now) == LEASE_REVOKED) {
+        begin_lease_cleanup_locked(log);
+    } else {
+        bench_disarm_locked();
+    }
+}
+#endif
+
 /* 1 apply, 0 stale/drop, -1 reject. */
-static int accept_scripted_event(int slot, const kvmctl_hid_event_t *event)
+static int accept_scripted_event(int slot, const kvmctl_hid_event_t *event, bool motion_channel)
 {
     if (!event || slot < 0 || slot >= MAX_TRANSPORT_PEERS) return -1;
     if (!event_session_matches(&s_peers[slot], event)) return -1;
@@ -547,18 +593,47 @@ static int accept_scripted_event(int slot, const kvmctl_hid_event_t *event)
         else { queue_error_locked(&s_peers[slot], event, s_lease.active ? "stale_epoch" : "lease_expired"); result = 2; }
         break;
     case KVMCTL_HID_BENCH_ARM:
+    case KVMCTL_HID_LIVE_INPUT_ARM:
         result = 2;
         if (!event_is_current_locked(slot, event)) {
             queue_error_locked(&s_peers[slot], event, "stale_epoch");
             break;
         }
 #ifdef KVMCTL_HID_BENCH
+        if (event->type == KVMCTL_HID_LIVE_INPUT_ARM && s_bench_owner != &s_peers[slot])
+            s_peers[slot].live_input_protocol = true;
         if (!s_peers[slot].usb && !s_bench_owner && !s_lease.pending &&
+            !s_lease_cleanup_pending &&
+            (event->type == KVMCTL_HID_LIVE_INPUT_ARM || !s_peers[slot].live_input_protocol) &&
             lease_held_empty(&s_lease) && hid_bench_can_arm() &&
             !atomic_load(&s_peers[slot].close_requested) &&
             atomic_load(&s_peers[slot].application_authorized)) {
             if (queue_state_locked(&s_peers[slot], event)) s_bench_owner = &s_peers[slot];
             else result = -1;
+            break;
+        }
+#endif
+        queue_error_locked(&s_peers[slot], event, "invalid_capability");
+        break;
+    case KVMCTL_HID_LIVE_INPUT_DISARM:
+        result = 2;
+        if (!event_is_current_locked(slot, event)) {
+            queue_error_locked(&s_peers[slot], event, "stale_epoch");
+            break;
+        }
+#ifdef KVMCTL_HID_BENCH
+        if (s_peers[slot].live_input_protocol &&
+            (!s_bench_owner || s_bench_owner == &s_peers[slot])) {
+            bench_disarm_locked();
+            (void)lease_set_held(&s_lease, lease_slot_identity(slot), event->lease_epoch, false, false);
+            if (hid_bench_cleanup_complete()) {
+                if (!queue_state_reply_locked(&s_peers[slot], &event->sequence)) result = -1;
+            } else {
+                s_live_disarm.peer = &s_peers[slot];
+                s_live_disarm.epoch = event->lease_epoch;
+                s_live_disarm.generation = s_peers[slot].generation;
+                s_live_disarm.sequence = event->sequence;
+            }
             break;
         }
 #endif
@@ -570,13 +645,33 @@ static int accept_scripted_event(int slot, const kvmctl_hid_event_t *event)
     case KVMCTL_HID_MOTION:
         result = event_is_current_locked(slot, event) ? 1 : 2;
         if (result == 2) queue_error_locked(&s_peers[slot], event, s_lease.active ? "stale_epoch" : "lease_expired");
+        if (result == 1 && event->type == KVMCTL_HID_MOTION && !motion_channel) {
+            queue_error_locked(&s_peers[slot], event, "invalid_capability");
+            result = 2;
+        }
 #ifdef KVMCTL_HID_BENCH
+        if (result == 1 && s_peers[slot].live_input_protocol && s_bench_owner != &s_peers[slot]) {
+            queue_error_locked(&s_peers[slot], event, "invalid_capability");
+            result = 2;
+        }
         if (result == 1 && s_bench_owner == &s_peers[slot]) {
-            const char *error = hid_bench_enqueue(event);
+            bool live = s_peers[slot].live_input_protocol;
+            bool live_motion = live && motion_channel && event->type == KVMCTL_HID_MOTION;
+            const char *error = !live_motion && live && s_live_report_pending
+                                    ? "resource_exhausted"
+                                    : hid_bench_enqueue(event);
             if (error) {
+                if (live_motion && strcmp(error, "resource_exhausted") == 0) {
+                    result = 2;
+                    break;
+                }
                 queue_error_locked(&s_peers[slot], event, error);
-                bench_disarm_locked();
+                if (live) revoke_bench_owner_locked(now, &lease_log);
+                else bench_disarm_locked();
                 result = 2;
+            } else if (live && !live_motion) {
+                s_live_report_pending = true;
+                s_live_report_sequence = event->sequence;
             }
         }
 #endif
@@ -676,7 +771,7 @@ static void peer_disconnected(transport_peer_t *slot)
 {
     if (!slot || atomic_load(&slot->close_requested)) return;
     /* Close callbacks can arrive before signaling teardown requests close. */
-    if (atomic_load(&slot->open_channels) == 2) {
+    if (atomic_load(&slot->open_channels) == 3) {
         atomic_store(&slot->close_requested, true);
     } else {
         fail_session(slot);
@@ -711,8 +806,10 @@ static int on_channel(esp_peer_data_channel_info_t *channel, void *ctx)
     transport_peer_t *slot = ctx;
     if (!slot || !channel || !channel->label) { if (slot) fail_session(slot); return -1; }
     echo_channel_t *target = strcmp(channel->label, "control") == 0 ? &slot->control :
+                             strcmp(channel->label, "input") == 0 ? &slot->input :
                              strcmp(channel->label, "motion") == 0 ? &slot->motion : NULL;
     if (!target || target->open || (slot->control.open && channel->stream_id == slot->control.stream) ||
+        (slot->input.open && channel->stream_id == slot->input.stream) ||
         (slot->motion.open && channel->stream_id == slot->motion.stream)) { fail_session(slot); return -1; }
     target->stream = channel->stream_id;
     target->open = true;
@@ -736,8 +833,9 @@ static int on_data(esp_peer_data_frame_t *frame, void *ctx)
         !atomic_load(&slot->application_authorized)) return 0;
     if (!frame || !frame->data) { if (slot) fail_session(slot); return -1; }
     bool motion_channel = slot->motion.open && frame->stream_id == slot->motion.stream;
+    bool input_channel = slot->input.open && frame->stream_id == slot->input.stream;
     bool control_channel = slot->control.open && frame->stream_id == slot->control.stream;
-    if (!control_channel && !motion_channel) { fail_session(slot); return -1; }
+    if (!control_channel && !input_channel && !motion_channel) { fail_session(slot); return -1; }
     if (frame->size > 0 && (frame->data[0] >> 5) == 5) {
         uint64_t processing_started_us = (uint64_t)esp_timer_get_time();
         kvmctl_hid_event_t event;
@@ -745,18 +843,28 @@ static int on_data(esp_peer_data_frame_t *frame, void *ctx)
             finish_event_timing(processing_started_us);
             atomic_fetch_add(&s_scripted_rejections, 1); fail_session(slot); return -1;
         }
+        bool state_event = event.type == KVMCTL_HID_KEYBOARD_STATE ||
+                           event.type == KVMCTL_HID_MOUSE_BUTTONS ||
+                           event.type == KVMCTL_HID_WHEEL;
+        if ((motion_channel && event.type != KVMCTL_HID_MOTION) ||
+            (input_channel && !state_event) || (control_channel && state_event)) {
+            finish_event_timing(processing_started_us);
+            atomic_fetch_add(&s_scripted_rejections, 1); fail_session(slot); return -1;
+        }
         if ((control_channel && event.sequence != slot->control_sequence) ||
+            (input_channel && event.sequence != slot->input_sequence) ||
             (motion_channel && slot->motion_sequence_seen && event.sequence <= slot->motion_sequence)) {
             finish_event_timing(processing_started_us);
             atomic_fetch_add(&s_scripted_drops, 1);
             atomic_fetch_add(&s_scripted_reorders, 1);
             return 0;
         }
-        int accepted = accept_scripted_event((int)(slot - s_peers), &event);
+        int accepted = accept_scripted_event((int)(slot - s_peers), &event, motion_channel);
         finish_event_timing(processing_started_us);
         if (accepted < 0) { atomic_fetch_add(&s_scripted_rejections, 1); fail_session(slot); return -1; }
         if (accepted == 0) return 0;
         if (control_channel) ++slot->control_sequence;
+        if (input_channel) ++slot->input_sequence;
         if (motion_channel) { slot->motion_sequence = event.sequence; slot->motion_sequence_seen = true; }
         atomic_fetch_add(&s_scripted_events, 1);
         atomic_fetch_add(&s_application_bytes_received, (uint32_t)frame->size);
@@ -767,8 +875,9 @@ static int on_data(esp_peer_data_frame_t *frame, void *ctx)
         /* Scripted CBOR is input, not an application echo. */
         return 0;
     }
-    echo_channel_t *target = control_channel ? &slot->control : &slot->motion;
-    size_t capacity = control_channel ? CONTROL_CAPACITY : MOTION_CAPACITY;
+    echo_channel_t *target = control_channel ? &slot->control :
+                             input_channel ? &slot->input : &slot->motion;
+    size_t capacity = motion_channel ? MOTION_CAPACITY : CONTROL_CAPACITY;
     if (target->pending || frame->size <= 0 || (size_t)frame->size > capacity) { fail_session(slot); return -1; }
     memcpy(target->data, frame->data, (size_t)frame->size);
     atomic_fetch_add(&s_application_bytes_received, (uint32_t)frame->size);
@@ -860,6 +969,7 @@ static void peer_cleanup(transport_peer_t *slot)
     atomic_fetch_sub(&s_open_channels, slot->open_channels);
     mbedtls_platform_zeroize(slot->sdp, sizeof(*slot->sdp));
     memset(&slot->control, 0, sizeof(slot->control));
+    memset(&slot->input, 0, sizeof(slot->input));
     memset(&slot->motion, 0, sizeof(slot->motion));
     int response_peer = peer_index(slot);
     if (response_peer >= 0) {
@@ -926,8 +1036,9 @@ static void peer_task(void *arg)
             lease_tick_locked((uint64_t)esp_timer_get_time() / 1000ULL, &lease_log);
             lease_unlock();
             emit_lease_log(&lease_log);
-            if (!send_response(peer, slot) || !send_echo(peer, &slot->control) || !send_echo(peer, &slot->motion)) fail_session(slot);
-            vTaskDelay(pdMS_TO_TICKS(10));
+            if (!send_response(peer, slot) || !send_echo(peer, &slot->control) ||
+                !send_echo(peer, &slot->input) || !send_echo(peer, &slot->motion)) fail_session(slot);
+            vTaskDelay(pdMS_TO_TICKS(1));
         }
     }
     if (peer && esp_peer_remote_fingerprint_rejected(peer)) {
@@ -952,35 +1063,47 @@ static void certificate_task(void *arg)
 }
 
 #ifdef KVMCTL_HID_BENCH
+static void service_bench_locked(uint64_t now, lease_log_snapshot_t *log)
+{
+    if (s_bench_owner) {
+        if (!atomic_load(&s_bench_owner->active) ||
+            !atomic_load(&s_bench_owner->application_authorized) ||
+            atomic_load(&s_bench_owner->close_requested) ||
+            atomic_load(&s_bench_owner->failed)) {
+            bench_disarm_locked();
+        }
+        lease_tick_locked(now, log);
+    }
+    transport_peer_t *disarm_owner = live_disarm_owner_locked();
+    bool detached;
+    if (!hid_bench_service(&detached) ||
+        (s_live_report_pending && hid_bench_releasing()) ||
+        (detached && ((s_bench_owner && s_bench_owner->live_input_protocol) || disarm_owner))) {
+        revoke_bench_owner_locked(now, log);
+    } else if (detached) {
+        bench_disarm_locked();
+    } else if (s_live_report_pending && hid_bench_cleanup_complete()) {
+        if (!queue_state_reply_locked(s_bench_owner, &s_live_report_sequence))
+            fail_session(s_bench_owner);
+        s_live_report_pending = false;
+    } else if (disarm_owner && hid_bench_cleanup_complete()) {
+        if (!queue_state_reply_locked(disarm_owner, &s_live_disarm.sequence))
+            fail_session(disarm_owner);
+        s_live_disarm.peer = NULL;
+    }
+    finish_lease_cleanup_locked(log);
+}
+
 static void hid_bench_task(void *arg)
 {
     (void)arg;
     for (;;) {
         lease_log_snapshot_t lease_log = {0};
         lease_lock();
-        if (s_bench_owner) {
-            if (!atomic_load(&s_bench_owner->active) ||
-                !atomic_load(&s_bench_owner->application_authorized) ||
-                atomic_load(&s_bench_owner->close_requested) ||
-                atomic_load(&s_bench_owner->failed) || !hid_bench_attached()) {
-                bench_disarm_locked();
-            }
-            lease_tick_locked((uint64_t)esp_timer_get_time() / 1000ULL, &lease_log);
-        }
-        if (!hid_bench_service()) {
-            transport_peer_t *failed_owner = s_bench_owner;
-            bench_disarm_locked();
-            if (failed_owner && s_lease.active &&
-                memcmp(s_lease.owner, failed_owner->client_fingerprint, LEASE_ID_SIZE) == 0) {
-                (void)lease_revoke(&s_lease, failed_owner->client_fingerprint,
-                                   (uint64_t)esp_timer_get_time() / 1000ULL);
-                begin_lease_cleanup_locked(&lease_log);
-            }
-        }
-        finish_lease_cleanup_locked(&lease_log);
+        service_bench_locked((uint64_t)esp_timer_get_time() / 1000ULL, &lease_log);
         lease_unlock();
         emit_lease_log(&lease_log);
-        vTaskDelay(pdMS_TO_TICKS(10));
+        vTaskDelay(pdMS_TO_TICKS(1));
     }
 }
 #endif
@@ -1122,9 +1245,11 @@ static esp_err_t transport_offer_internal(const uint8_t *client_fingerprint,
     slot->answer_len = 0;
     slot->open_channels = 0;
     slot->control_sequence = 0;
+    slot->input_sequence = INPUT_SEQUENCE_BASE;
     slot->motion_sequence = 0;
     slot->motion_sequence_seen = false;
     slot->heartbeat_ack_supported = false;
+    slot->live_input_protocol = false;
     slot->session_id_seen = false;
     memset(slot->session_id, 0, sizeof(slot->session_id));
     if (session_id) {
@@ -1132,6 +1257,7 @@ static esp_err_t transport_offer_internal(const uint8_t *client_fingerprint,
         slot->session_id_seen = true;
     }
     memset(&slot->control, 0, sizeof(slot->control));
+    memset(&slot->input, 0, sizeof(slot->input));
     memset(&slot->motion, 0, sizeof(slot->motion));
     int response_peer = peer_index(slot);
     if (response_peer >= 0) {
@@ -1219,7 +1345,7 @@ esp_err_t transport_authorize_client(const uint8_t fingerprint[32], uint32_t gen
     portENTER_CRITICAL(&s_peer_mux);
     transport_peer_t *slot = find_slot(fingerprint, generation);
     bool ready = slot && !atomic_load(&slot->close_requested) && !atomic_load(&slot->failed) &&
-                 !atomic_load(&slot->identity_rejected) && slot->open_channels == 2;
+                 !atomic_load(&slot->identity_rejected) && slot->open_channels == 3;
     if (ready) atomic_store(&slot->application_authorized, true);
     portEXIT_CRITICAL(&s_peer_mux);
     return ready && client_auth_is_enrolled(fingerprint) ? ESP_OK : ESP_ERR_INVALID_STATE;
@@ -1253,7 +1379,7 @@ transport_status_t transport_status(void)
     for (size_t i = 0; i < MAX_TRANSPORT_PEERS; ++i) {
         if (atomic_load(&s_peers[i].active)) {
             any_active = true;
-            any_open |= s_peers[i].open_channels == 2;
+            any_open |= s_peers[i].open_channels == 3;
             any_failed |= atomic_load(&s_peers[i].failed);
             any_identity_rejected |= atomic_load(&s_peers[i].identity_rejected);
         } else {

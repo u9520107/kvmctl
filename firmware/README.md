@@ -50,6 +50,12 @@ M0 HID probe. Copy the bench app to the Windows build directory and use
 keyboard and mouse. It emits script reports only for the current authenticated
 lease after an explicit arm request. See the [Windows client bench command](../client/README.md#scripted-usb-hid-bench).
 
+The HID configuration advertises USB remote wake and the firmware requests
+remote wake when the first queued input arrives during USB suspend. The board
+must remain powered while the target sleeps, and the target firmware/BIOS must
+allow USB wake; hibernate, shutdown, or a target that removes USB power cannot
+be awakened by this path.
+
 Select the LED wiring under **kvmctl hardware profile** in `idf.py menuconfig`.
 GPIO48 is the default. Espressif documents GPIO48 for ESP32-S3-DevKitC-1 v1.0
 and GPIO38 for v1.1, so confirm the board revision/profile before flashing.
@@ -63,9 +69,9 @@ RGB LED**; firmware logs that LED controls are unavailable.
 The product adds a no-HID DataChannel echo endpoint. It accepts offer/close
 commands only over the USB administration protocol; USB SDP exchange is an
 internal test path, not production signaling. The firmware starts a peer only
-when Wi-Fi is associated. It supports a reliable ordered `control` channel and
-an unordered `motion` channel with zero retransmissions. No physical input is
-captured and no HID reports are emitted.
+when Wi-Fi is associated. It supports reliable ordered `control` and `input`
+channels plus an unordered `motion` channel with zero retransmissions. No
+physical input is captured and no HID reports are emitted.
 
 The transport build requires ESP-IDF 6.1.1 and the pinned Espressif
 `esp-webrtc-solution` checkout at commit

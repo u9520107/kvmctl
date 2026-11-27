@@ -36,6 +36,23 @@ impl Target {
             last_ipv4,
         })
     }
+
+    pub fn resolve_selection(&self, saved: Vec<Self>) -> Result<Self, String> {
+        saved
+            .into_iter()
+            .find(|target| {
+                target.name.eq_ignore_ascii_case(&self.name)
+                    && target.endpoint_fingerprint == self.endpoint_fingerprint
+                    && target.tls_spki_hash == self.tls_spki_hash
+                    && target.client_fingerprint == self.client_fingerprint
+            })
+            .ok_or_else(|| {
+                format!(
+                    "Saved target `{}` was removed or its identity changed. Input remains local.",
+                    self.name
+                )
+            })
+    }
 }
 
 fn path() -> Result<PathBuf, String> {
@@ -239,6 +256,34 @@ pub fn update_address(name: &str, address: Ipv4Addr) -> Result<(), String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn selection_survives_reordering_but_rejects_replacement() {
+        let selected = Target::new("board".into(), [1; 32], [2; 32], [3; 32], None).unwrap();
+        let other = Target::new("added".into(), [4; 32], [5; 32], [6; 32], None).unwrap();
+        let mut refreshed = selected.clone();
+        refreshed.last_ipv4 = Some(Ipv4Addr::LOCALHOST);
+        assert_eq!(
+            selected
+                .resolve_selection(vec![other.clone(), refreshed.clone()])
+                .unwrap(),
+            refreshed
+        );
+        assert!(selected.resolve_selection(vec![other.clone()]).is_err());
+        let mut replaced = selected.clone();
+        replaced.endpoint_fingerprint = other.endpoint_fingerprint;
+        assert!(
+            selected
+                .resolve_selection(vec![other.clone(), replaced])
+                .is_err()
+        );
+        let mut repinned = selected.clone();
+        repinned.tls_spki_hash = other.tls_spki_hash;
+        assert!(selected.resolve_selection(vec![repinned]).is_err());
+        let mut reenrolled = selected.clone();
+        reenrolled.client_fingerprint = other.client_fingerprint;
+        assert!(selected.resolve_selection(vec![reenrolled]).is_err());
+    }
 
     #[test]
     fn target_names_reject_file_delimiters() {

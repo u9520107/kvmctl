@@ -39,8 +39,9 @@ static const uint8_t s_report_descriptor[] = {
 };
 
 static const uint8_t s_config_descriptor[] = {
-    TUD_CONFIG_DESCRIPTOR(1, 1, 0, CONFIG_DESCRIPTOR_LEN, 0, 100),
-    TUD_HID_DESCRIPTOR(0, 4, false, sizeof(s_report_descriptor), 0x81, 16, 10),
+    TUD_CONFIG_DESCRIPTOR(1, 1, 0, CONFIG_DESCRIPTOR_LEN,
+                          TUSB_DESC_CONFIG_ATT_REMOTE_WAKEUP, 100),
+    TUD_HID_DESCRIPTOR(0, 4, false, sizeof(s_report_descriptor), 0x81, 16, 1),
 };
 
 static char s_serial[SERIAL_BYTES * 2 + 1];
@@ -110,8 +111,9 @@ void tud_hid_report_complete_cb(uint8_t instance, const uint8_t *report, uint16_
     (void)instance;
     (void)report;
     (void)length;
-    atomic_fetch_add(&s_completed_reports, 1);
-    atomic_store(&s_transfer, TRANSFER_COMPLETE);
+    int expected = TRANSFER_PENDING;
+    if (atomic_compare_exchange_strong(&s_transfer, &expected, TRANSFER_COMPLETE))
+        atomic_fetch_add(&s_completed_reports, 1);
 }
 
 void tud_hid_report_failed_cb(uint8_t instance, hid_report_type_t report_type,
@@ -120,7 +122,9 @@ void tud_hid_report_failed_cb(uint8_t instance, hid_report_type_t report_type,
     (void)instance;
     (void)report;
     (void)transferred;
-    if (report_type == HID_REPORT_TYPE_INPUT) atomic_store(&s_transfer, TRANSFER_FAILED);
+    int expected = TRANSFER_PENDING;
+    if (report_type == HID_REPORT_TYPE_INPUT)
+        (void)atomic_compare_exchange_strong(&s_transfer, &expected, TRANSFER_FAILED);
 }
 
 static void usb_event(tinyusb_event_t *event, void *argument)
@@ -151,7 +155,7 @@ bool hid_bench_attached(void)
 
 bool hid_bench_can_arm(void)
 {
-    return hid_bench_attached() && tud_hid_ready() && !s_releasing &&
+    return hid_bench_attached() && !s_releasing &&
            !s_cleanup_failed &&
            atomic_load(&s_transfer) == TRANSFER_IDLE;
 }
@@ -211,6 +215,7 @@ const char *hid_bench_enqueue(const kvmctl_hid_event_t *event)
     }
     push_report(&report);
     if (event->type == KVMCTL_HID_MOUSE_BUTTONS) s_queued_buttons = report.buttons;
+    if (tud_suspended()) (void)tud_remote_wakeup();
     return NULL;
 }
 
@@ -248,9 +253,10 @@ static bool submit_report(const bench_report_t *report)
     return queued;
 }
 
-bool hid_bench_service(void)
+bool hid_bench_service(bool *detached)
 {
-    if (atomic_exchange(&s_detached, false) || !tud_mounted()) {
+    *detached = atomic_exchange(&s_detached, false) || !tud_mounted();
+    if (*detached) {
         s_sent_keys = false;
         s_sent_buttons = 0;
         s_releasing = false;
@@ -312,6 +318,11 @@ bool hid_bench_cleanup_complete(void)
 {
     return !s_releasing && !s_cleanup_failed && s_count == 0 &&
            atomic_load(&s_transfer) == TRANSFER_IDLE;
+}
+
+bool hid_bench_releasing(void)
+{
+    return s_releasing;
 }
 
 uint32_t hid_bench_reports(void)

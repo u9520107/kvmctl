@@ -20,10 +20,10 @@ use windows_sys::Win32::UI::WindowsAndMessaging::{
     CreateWindowExW, DefWindowProcW, DestroyMenu, DestroyWindow, DispatchMessageW, GetCursorPos,
     GetMessageW, GetWindowTextLengthW, GetWindowTextW, KillTimer, MF_GRAYED, MF_SEPARATOR,
     MF_STRING, MSG, PostMessageW, PostQuitMessage, RegisterClassW, RegisterWindowMessageW,
-    SendMessageW, SetForegroundWindow, SetTimer, SetWindowTextW, ShowWindow, TrackPopupMenu,
-    TranslateMessage, WM_APP, WM_CLOSE, WM_COMMAND, WM_DESTROY, WM_LBUTTONUP, WM_NULL,
-    WM_RBUTTONUP, WM_TIMER, WNDCLASSW, WS_BORDER, WS_CHILD, WS_OVERLAPPEDWINDOW, WS_TABSTOP,
-    WS_VISIBLE, WS_VSCROLL,
+    SendMessageW, SetForegroundWindow, SetTimer, SetWindowTextW, ShowWindow, TPM_NONOTIFY,
+    TPM_RETURNCMD, TPM_RIGHTBUTTON, TrackPopupMenu, TranslateMessage, WM_APP, WM_CLOSE, WM_COMMAND,
+    WM_DESTROY, WM_LBUTTONUP, WM_NULL, WM_RBUTTONUP, WM_TIMER, WNDCLASSW, WS_BORDER, WS_CHILD,
+    WS_OVERLAPPEDWINDOW, WS_TABSTOP, WS_VISIBLE, WS_VSCROLL,
 };
 
 const PORTS: u16 = 1;
@@ -59,6 +59,7 @@ struct TraySession {
     target: String,
     control: transport::SessionControl,
     events: Receiver<TrayMessage>,
+    worker: std::thread::JoinHandle<()>,
 }
 
 enum TrayMessage {
@@ -84,6 +85,7 @@ struct UiState {
     tray_session: Option<TraySession>,
     tray_state: TrayState,
     selected_target: Option<targets::Target>,
+    pending_target: Option<targets::Target>,
 }
 
 thread_local! {
@@ -118,7 +120,8 @@ fn tray_data(tray: &TrayIcon, state: TrayState, target: Option<&str>) -> NOTIFYI
         TrayState::Starting => "Starting; input local",
         TrayState::Connecting => "Connecting; input local",
         TrayState::ConnectedLocal => "Connected/local",
-        TrayState::ConnectionDegraded => "Connection degraded; input local",
+        TrayState::RemoteControl => "Remote control",
+        TrayState::ConnectionDegraded => "Connection degraded; input state unchanged",
         TrayState::OwnershipPending => "Takeover pending; input local",
         TrayState::Recovering => "Recovering; input local",
         TrayState::Unavailable => "Unavailable; input local",
@@ -163,19 +166,23 @@ fn target_menu_text(target: &targets::Target) -> String {
     format!("{}  [{short}]", target.name)
 }
 
-fn show_tray_menu(window: HWND, has_disconnect: bool) {
+fn show_tray_menu(window: HWND, has_disconnect: bool) -> Option<targets::Target> {
     let Ok(saved) = targets::load() else {
-        return;
+        return None;
     };
     let menu = unsafe { CreatePopupMenu() };
     if menu.is_null() {
-        return;
+        return None;
     }
     if saved.is_empty() {
         let text = wide("No saved targets");
         unsafe { AppendMenuW(menu, MF_STRING | MF_GRAYED, 0, text.as_ptr()) };
     } else {
-        for (index, target) in saved.iter().enumerate() {
+        for (index, target) in saved
+            .iter()
+            .take(usize::from(DISCONNECT_MENU - TARGET_MENU_BASE))
+            .enumerate()
+        {
             let text = wide(&target_menu_text(target));
             unsafe {
                 AppendMenuW(
@@ -197,13 +204,31 @@ fn show_tray_menu(window: HWND, has_disconnect: bool) {
     let text = wide("Quit");
     unsafe { AppendMenuW(menu, MF_STRING, QUIT_MENU as usize, text.as_ptr()) };
     let mut point = windows_sys::Win32::Foundation::POINT { x: 0, y: 0 };
-    unsafe {
+    let command = unsafe {
         GetCursorPos(&mut point);
         SetForegroundWindow(window);
-        TrackPopupMenu(menu, 0x0002, point.x, point.y, 0, window, std::ptr::null());
+        let command = TrackPopupMenu(
+            menu,
+            TPM_RIGHTBUTTON | TPM_RETURNCMD | TPM_NONOTIFY,
+            point.x,
+            point.y,
+            0,
+            window,
+            std::ptr::null(),
+        );
         PostMessageW(window, WM_NULL, 0, 0);
         DestroyMenu(menu);
+        command as u16
+    };
+    if (TARGET_MENU_BASE..DISCONNECT_MENU).contains(&command) {
+        return saved
+            .into_iter()
+            .nth(usize::from(command - TARGET_MENU_BASE));
     }
+    if command != 0 {
+        unsafe { SendMessageW(window, WM_COMMAND, WPARAM::from(command), 0) };
+    }
+    None
 }
 
 fn control(
@@ -569,27 +594,20 @@ fn set_tray_state(state: &mut UiState, tray_state: TrayState) {
     update_tray(&state.tray, tray_state, selected_target_name(state));
 }
 
-fn start_tray_session(state: &mut UiState, index: usize) {
+fn start_tray_session(state: &mut UiState, selection: targets::Target) {
     if state.tray_session.is_some() {
-        tray_notice(
-            &state.tray,
-            "kvmctl",
-            "Disconnect current target before connecting another.",
-        );
+        state.pending_target = Some(selection);
+        disconnect_tray_session(state, true);
         return;
     }
     set_tray_state(state, TrayState::Starting);
-    let saved = match targets::load() {
-        Ok(saved) => saved,
+    let target = match targets::load().and_then(|saved| selection.resolve_selection(saved)) {
+        Ok(target) => target,
         Err(error) => {
             tray_notice(&state.tray, "kvmctl unavailable", &error);
             set_tray_state(state, TrayState::Unavailable);
             return;
         }
-    };
-    let Some(target) = saved.get(index).cloned() else {
-        set_tray_state(state, TrayState::NoTarget);
-        return;
     };
     state.selected_target = Some(target.clone());
     set_tray_state(state, TrayState::Starting);
@@ -627,10 +645,17 @@ fn start_tray_session(state: &mut UiState, index: usize) {
         }
     };
     let status = saved_status(&target);
-    let control = transport::SessionControl::new();
+    let control = match transport::SessionControl::new_live(transport::SessionMode::Tray) {
+        Ok(control) => control,
+        Err(error) => {
+            tray_notice(&state.tray, "kvmctl unavailable", &error.to_string());
+            set_tray_state(state, TrayState::Unavailable);
+            return;
+        }
+    };
     let worker_control = control.clone();
     let (sender, events) = mpsc::channel();
-    let spawned = std::thread::Builder::new()
+    let worker = match std::thread::Builder::new()
         .name("session".into())
         .spawn(move || {
             let event_sender = sender.clone();
@@ -648,20 +673,23 @@ fn start_tray_session(state: &mut UiState, index: usize) {
             .map(|_| ())
             .map_err(|error| error.to_string());
             let _ = sender.send(TrayMessage::Finished(result));
-        });
-    if let Err(error) = spawned {
-        set_tray_state(state, TrayState::Unavailable);
-        tray_notice(
-            &state.tray,
-            "kvmctl unavailable",
-            &format!("Cannot start session worker: {error}"),
-        );
-        return;
-    }
+        }) {
+        Ok(worker) => worker,
+        Err(error) => {
+            set_tray_state(state, TrayState::Unavailable);
+            tray_notice(
+                &state.tray,
+                "kvmctl unavailable",
+                &format!("Cannot start session worker: {error}"),
+            );
+            return;
+        }
+    };
     state.tray_session = Some(TraySession {
         target: target.name.clone(),
         control,
         events,
+        worker,
     });
     set_tray_state(state, TrayState::Connecting);
     tray_notice(
@@ -672,7 +700,10 @@ fn start_tray_session(state: &mut UiState, index: usize) {
     unsafe { SetTimer(state.window, SESSION_TIMER, 100, None) };
 }
 
-fn disconnect_tray_session(state: &mut UiState) {
+fn disconnect_tray_session(state: &mut UiState, preserve_pending_target: bool) {
+    if !preserve_pending_target {
+        state.pending_target = None;
+    }
     if let Some(session) = &state.tray_session {
         session.control.cancel();
         tray_notice(
@@ -681,8 +712,10 @@ fn disconnect_tray_session(state: &mut UiState) {
             "Releasing lease and closing session.",
         );
     }
-    state.selected_target = None;
-    set_tray_state(state, TrayState::NoTarget);
+    if state.tray_session.is_none() {
+        state.selected_target = None;
+        set_tray_state(state, TrayState::NoTarget);
+    }
 }
 
 fn takeover_prompt(
@@ -735,15 +768,43 @@ fn apply_session_event(
             );
         }
         transport::SessionEvent::InputLocalConfirmed => {
-            if !matches!(state.tray_state, TrayState::ConnectionDegraded) {
-                set_tray_state(state, TrayState::ConnectedLocal);
-            }
+            set_tray_state(state, TrayState::ConnectedLocal);
+            tray_notice(
+                &state.tray,
+                "kvmctl input local",
+                &format!(
+                    "{} — remote input released.",
+                    target.as_deref().unwrap_or("target")
+                ),
+            );
+        }
+        transport::SessionEvent::InputRemoteConfirmed => {
+            set_tray_state(state, TrayState::RemoteControl);
+            tray_notice(
+                &state.tray,
+                "kvmctl input remote",
+                &format!(
+                    "{} — keyboard and mouse routed remotely.",
+                    target.as_deref().unwrap_or("target")
+                ),
+            );
         }
         transport::SessionEvent::ConnectionDegraded { .. } => {
             set_tray_state(state, TrayState::ConnectionDegraded);
         }
         transport::SessionEvent::ConnectionRecovered { .. } => {
-            set_tray_state(state, TrayState::ConnectedLocal);
+            let remote = state
+                .tray_session
+                .as_ref()
+                .is_some_and(|session| session.control.input_is_remote());
+            set_tray_state(
+                state,
+                if remote {
+                    TrayState::RemoteControl
+                } else {
+                    TrayState::ConnectedLocal
+                },
+            );
         }
         transport::SessionEvent::TakeoverPending {
             request_id,
@@ -817,23 +878,33 @@ fn poll_session(
                     finished = Some(result);
                     break;
                 }
-                Err(TryRecvError::Empty | TryRecvError::Disconnected) => break,
+                Err(TryRecvError::Empty) => break,
+                Err(TryRecvError::Disconnected) => {
+                    finished = Some(Err("Session worker stopped unexpectedly".into()));
+                    break;
+                }
             }
         }
     }
     for event in events {
-        if prompt.is_none() {
-            prompt = apply_session_event(state, event);
-        }
+        let next_prompt = apply_session_event(state, event);
+        prompt = prompt.or(next_prompt);
     }
     if let Some(result) = finished {
-        state.tray_session = None;
+        if let Some(session) = state.tray_session.take() {
+            let _ = session.worker.join();
+        }
         unsafe { KillTimer(state.window, SESSION_TIMER) };
-        if let Err(error) = result {
-            if state.selected_target.is_some() {
+        let pending_target = state.pending_target.take();
+        state.selected_target = None;
+        set_tray_state(state, TrayState::NoTarget);
+        match (result, pending_target) {
+            (Err(error), _) => {
                 set_tray_state(state, TrayState::Unavailable);
                 tray_notice(&state.tray, "kvmctl unavailable", &error);
             }
+            (Ok(()), Some(target)) => start_tray_session(state, target),
+            (Ok(()), None) => {}
         }
     }
     prompt
@@ -862,16 +933,18 @@ unsafe extern "system" fn window_proc(
         return 0;
     }
     if message == WM_DESTROY {
-        STATE.with(|cell| {
-            if let Some(state) = cell.borrow_mut().take() {
-                unsafe { KillTimer(state.window, WIFI_SCAN_TIMER) };
-                unsafe { KillTimer(state.window, SESSION_TIMER) };
-                if let Some(session) = state.tray_session {
-                    session.control.cancel();
+        let state = STATE.with(|cell| cell.borrow_mut().take());
+        if let Some(state) = state {
+            unsafe { KillTimer(state.window, WIFI_SCAN_TIMER) };
+            unsafe { KillTimer(state.window, SESSION_TIMER) };
+            remove_tray(&state.tray);
+            if let Some(session) = state.tray_session {
+                session.control.cancel();
+                if session.worker.join().is_err() {
+                    log::error!("tray session worker panicked during shutdown");
                 }
-                remove_tray(&state.tray);
             }
-        });
+        }
         unsafe { PostQuitMessage(0) };
         return 0;
     }
@@ -897,25 +970,23 @@ unsafe extern "system" fn window_proc(
                     state.tray_session.is_some() || state.selected_target.is_some()
                 })
             });
-            show_tray_menu(window, has_disconnect);
+            if let Some(target) = show_tray_menu(window, has_disconnect) {
+                STATE.with(|cell| {
+                    if let Some(state) = cell.borrow_mut().as_mut() {
+                        start_tray_session(state, target);
+                    }
+                });
+            }
         }
         return 0;
     }
     if message == WM_COMMAND {
         let id = (wparam & 0xffff) as u16;
         let notification = ((wparam >> 16) & 0xffff) as u16;
-        if id >= TARGET_MENU_BASE && id < DISCONNECT_MENU {
-            STATE.with(|cell| {
-                if let Some(state) = cell.borrow_mut().as_mut() {
-                    start_tray_session(state, usize::from(id - TARGET_MENU_BASE));
-                }
-            });
-            return 0;
-        }
         if id == DISCONNECT_MENU {
             STATE.with(|cell| {
                 if let Some(state) = cell.borrow_mut().as_mut() {
-                    disconnect_tray_session(state);
+                    disconnect_tray_session(state, false);
                 }
             });
             return 0;
@@ -1176,6 +1247,7 @@ fn create_controls(instance: HINSTANCE, window: HWND) -> Result<UiState, String>
         tray_session: None,
         tray_state: TrayState::NoTarget,
         selected_target: None,
+        pending_target: None,
     };
     match serial::enumerate() {
         Ok(ports) => update_port_list(&mut state, ports),

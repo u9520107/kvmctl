@@ -80,6 +80,8 @@ static bool payload(reader_t *r, uint64_t type, kvmctl_hid_event_t *event)
     case KVMCTL_HID_HEARTBEAT:
     case KVMCTL_HID_LEASE_RELEASE:
     case KVMCTL_HID_BENCH_ARM:
+    case KVMCTL_HID_LIVE_INPUT_ARM:
+    case KVMCTL_HID_LIVE_INPUT_DISARM:
         if (!map(r, 0)) return false;
         return true;
     case KVMCTL_HID_TAKEOVER_REQUEST:
@@ -118,12 +120,18 @@ static bool payload(reader_t *r, uint64_t type, kvmctl_hid_event_t *event)
             event->response_window_ms > 30000) return false;
         return true;
     case KVMCTL_HID_ERROR: {
+        uint64_t field_count = 0;
         uint64_t length = 0;
-        if (!map(r, 1) || !uint_value(r, 0) || !head(r, 3, &length) || length > 32 ||
+        if (!head(r, 5, &field_count) || (field_count != 1 && field_count != 2) ||
+            !uint_value(r, 0) || !head(r, 3, &length) || length > 32 ||
             length > r->len - r->pos) return false;
         memcpy(event->error_code, r->data + r->pos, (size_t)length);
         event->error_code[length] = '\0';
         r->pos += (size_t)length;
+        if (field_count == 2) {
+            if (!uint_value(r, 1) || !head(r, 0, &event->request_sequence)) return false;
+            event->request_sequence_present = true;
+        }
         return strcmp(event->error_code, "unsupported_version") == 0 ||
                strcmp(event->error_code, "unauthorized") == 0 ||
                strcmp(event->error_code, "pin_mismatch") == 0 ||
@@ -185,7 +193,7 @@ bool kvmctl_hid_decode(const uint8_t *data, size_t length, bool motion_channel,
     if (any_session_byte == 0) return false;
     event->type = (kvmctl_hid_type_t)type;
     event->lease_epoch = (uint32_t)epoch;
-    if (motion_channel != (type == KVMCTL_HID_MOTION)) return false;
+    if (motion_channel && type != KVMCTL_HID_MOTION) return false;
     return true;
 }
 
@@ -272,7 +280,11 @@ size_t kvmctl_hid_encode(const kvmctl_hid_event_t *event, uint8_t *data,
         write_uint(&w, 1); write_bytes(&w, event->requester, sizeof(event->requester));
         write_uint(&w, 2); write_uint(&w, event->response_window_ms);
     } else {
-        write_head(&w, 5, 1); write_uint(&w, 0); write_text(&w, event->error_code);
+        write_head(&w, 5, event->request_sequence_present ? 2 : 1);
+        write_uint(&w, 0); write_text(&w, event->error_code);
+        if (event->request_sequence_present) {
+            write_uint(&w, 1); write_uint(&w, event->request_sequence);
+        }
     }
     return w.ok ? w.pos : 0;
 }

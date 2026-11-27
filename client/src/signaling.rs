@@ -543,7 +543,10 @@ impl Session {
         payload.expect_uint(1)?;
         session.device_nonce = payload.fixed::<32>()?;
         payload.expect_uint(2)?;
-        if payload.head(4)? != 2 || payload.text(32)? != "control" || payload.text(32)? != "motion"
+        if payload.head(4)? != 3
+            || payload.text(32)? != "control"
+            || payload.text(32)? != "input"
+            || payload.text(32)? != "motion"
         {
             return Err("endpoint capability list is invalid".into());
         }

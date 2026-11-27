@@ -7,6 +7,7 @@ use std::net::{SocketAddr, TcpStream};
 use std::path::PathBuf;
 use std::str::FromStr;
 use std::sync::atomic::{AtomicBool, AtomicU8, AtomicUsize, Ordering};
+use std::sync::mpsc::TryRecvError;
 use std::sync::{Arc, Mutex, OnceLock};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use webrtc::data_channel::{DataChannel, DataChannelEvent, RTCDataChannelInit};
@@ -26,7 +27,10 @@ static LOG_LEVEL: OnceLock<LevelFilter> = OnceLock::new();
 const HEARTBEAT_INTERVAL: Duration = Duration::from_secs(3);
 const LEGACY_HEARTBEAT_INTERVAL: Duration = Duration::from_secs(1);
 const LEGACY_HEARTBEAT_RESPONSE_TIMEOUT: Duration = Duration::from_millis(100);
-const HEARTBEAT_MISS_LIMIT: u8 = 3;
+const INPUT_SEND_BUDGET: Duration = Duration::from_millis(5);
+// Responses carry only the originating request sequence, not its channel.
+// Keep input-report credits disjoint from control replies while both can be in flight.
+const INPUT_SEQUENCE_BASE: u64 = 1 << 63;
 
 #[derive(Default)]
 struct ConnectionStates {
@@ -301,6 +305,7 @@ async fn exchange(
     let (closed_tx, mut closed_rx) = channel(1);
     let result = async {
         let control = pc.create_data_channel("control", None).await?;
+        let input = pc.create_data_channel("input", None).await?;
         let motion = pc
             .create_data_channel(
                 "motion",
@@ -320,6 +325,16 @@ async fn exchange(
             control.max_retransmits().await?.is_none()
                 && control.max_packet_life_time().await?.is_none(),
             "control channel must be reliable"
+        );
+        ensure!(
+            input.label().await? == "input",
+            "invalid input channel label"
+        );
+        ensure!(input.ordered().await?, "input channel must be ordered");
+        ensure!(
+            input.max_retransmits().await?.is_none()
+                && input.max_packet_life_time().await?.is_none(),
+            "input channel must be reliable"
         );
         ensure!(
             motion.label().await? == "motion",
@@ -433,6 +448,7 @@ async fn exchange(
         wait_open(
             &*runtime,
             &control,
+            &input,
             &motion,
             &peer_failed,
             &device_status,
@@ -487,6 +503,7 @@ async fn exchange(
 async fn wait_open(
     runtime: &dyn Runtime,
     control: &Arc<dyn DataChannel>,
+    input: &Arc<dyn DataChannel>,
     motion: &Arc<dyn DataChannel>,
     peer_failed: &AtomicBool,
     device_status: &AtomicU8,
@@ -494,8 +511,8 @@ async fn wait_open(
     expected_fingerprint_mismatch: bool,
 ) -> Result<()> {
     let started = Instant::now();
-    let mut open = [false, false];
-    while !open[0] || !open[1] {
+    let mut open = [false, false, false];
+    while !open[0] || !open[1] || !open[2] {
         if expected_fingerprint_mismatch && CERTIFICATE_REJECTED.load(Ordering::Acquire) {
             let opened = open.into_iter().filter(|value| *value).count();
             if opened != 0 {
@@ -544,7 +561,7 @@ async fn wait_open(
                 error_location,
             );
         }
-        for (index, channel) in [control, motion].into_iter().enumerate() {
+        for (index, channel) in [control, input, motion].into_iter().enumerate() {
             if open[index] {
                 continue;
             }
@@ -783,10 +800,11 @@ enum TranscriptProofCase<'a> {
 async fn send_before_authorization_and_reject_echo(
     runtime: &dyn Runtime,
     control: &Arc<dyn DataChannel>,
+    input: &Arc<dyn DataChannel>,
     motion: &Arc<dyn DataChannel>,
 ) -> Result<()> {
     let payload = b"kvmctl-m1.3-pre-auth-must-not-echo";
-    for channel in [control, motion] {
+    for channel in [control, input, motion] {
         channel
             .send(BytesMut::from(&payload[..]))
             .await
@@ -794,7 +812,7 @@ async fn send_before_authorization_and_reject_echo(
     }
     let deadline = Instant::now() + Duration::from_secs(2);
     while Instant::now() < deadline {
-        for channel in [control, motion] {
+        for channel in [control, input, motion] {
             match timeout(runtime, Duration::from_millis(200), channel.poll()).await {
                 Ok(Some(DataChannelEvent::OnMessage(message))) => {
                     bail!(
@@ -815,11 +833,12 @@ async fn send_before_authorization_and_reject_echo(
 async fn send_after_revocation_and_reject_echo(
     runtime: &dyn Runtime,
     control: &Arc<dyn DataChannel>,
+    input: &Arc<dyn DataChannel>,
     motion: &Arc<dyn DataChannel>,
     device_status: &AtomicU8,
 ) -> Result<()> {
     let payload = b"kvmctl-m1.3-revoked-must-not-echo";
-    for channel in [control, motion] {
+    for channel in [control, input, motion] {
         let _ = channel.send(BytesMut::from(&payload[..])).await;
     }
     let deadline = Instant::now() + Duration::from_secs(2);
@@ -828,7 +847,7 @@ async fn send_after_revocation_and_reject_echo(
             device_status.load(Ordering::Acquire) == 0,
             "ESP32 transport became active again after client revocation"
         );
-        for channel in [control, motion] {
+        for channel in [control, input, motion] {
             if let Ok(Some(DataChannelEvent::OnMessage(message))) =
                 timeout(runtime, Duration::from_millis(200), channel.poll()).await
             {
@@ -853,6 +872,7 @@ fn expect_busy(result: Result<String, String>) -> Result<()> {
 async fn test_competing_signaling(
     runtime: &dyn Runtime,
     control: &Arc<dyn DataChannel>,
+    input: &Arc<dyn DataChannel>,
     motion: &Arc<dyn DataChannel>,
     address: SocketAddr,
     hostname: &str,
@@ -876,9 +896,10 @@ async fn test_competing_signaling(
         }
     }
     echo_signaling(runtime, control, "control-after-unauthorized-client", 1).await?;
+    echo_signaling(runtime, input, "input-after-unauthorized-client", 1).await?;
     echo_signaling(runtime, motion, "motion-after-unauthorized-client", 1).await?;
     eprintln!(
-        "M1.3 ISOLATION unauthorized_client=rejected active_session=preserved control_echo=true motion_echo=true"
+        "M1.3 ISOLATION unauthorized_client=rejected active_session=preserved control_echo=true input_echo=true motion_echo=true"
     );
     crate::signaling::Session::expect_invalid_client_proof(
         address,
@@ -889,9 +910,10 @@ async fn test_competing_signaling(
     )
     .map_err(anyhow::Error::msg)?;
     echo_signaling(runtime, control, "control-after-invalid-client-proof", 1).await?;
+    echo_signaling(runtime, input, "input-after-invalid-client-proof", 1).await?;
     echo_signaling(runtime, motion, "motion-after-invalid-client-proof", 1).await?;
     eprintln!(
-        "M1.3 ISOLATION invalid_client_proof=rejected active_session=preserved control_echo=true motion_echo=true"
+        "M1.3 ISOLATION invalid_client_proof=rejected active_session=preserved control_echo=true input_echo=true motion_echo=true"
     );
     let mut competitor = crate::signaling::Session::connect(
         address,
@@ -908,9 +930,10 @@ async fn test_competing_signaling(
     )?;
     competitor.close();
     echo_signaling(runtime, control, "control-after-competing-offer", 1).await?;
+    echo_signaling(runtime, input, "input-after-competing-offer", 1).await?;
     echo_signaling(runtime, motion, "motion-after-competing-offer", 1).await?;
     eprintln!(
-        "M1.3 ISOLATION authenticated_competing_offer=busy active_session=preserved control_echo=true motion_echo=true"
+        "M1.3 ISOLATION authenticated_competing_offer=busy active_session=preserved control_echo=true input_echo=true motion_echo=true"
     );
     Ok(())
 }
@@ -919,6 +942,7 @@ struct SignalingPeer<P> {
     session: crate::signaling::Session,
     pc: P,
     control: Arc<dyn DataChannel>,
+    input: Arc<dyn DataChannel>,
     motion: Arc<dyn DataChannel>,
     offer_sdp: String,
     proof: Vec<u8>,
@@ -968,12 +992,15 @@ async fn open_signaling_peer(
         .await?;
     let result = async {
         let control = pc.create_data_channel("control", None).await?;
+        let input = pc.create_data_channel("input", None).await?;
         let motion = pc.create_data_channel(
             "motion",
             Some(RTCDataChannelInit { ordered: false, max_retransmits: Some(0), ..Default::default() }),
         ).await?;
         ensure!(control.ordered().await? && control.max_retransmits().await?.is_none(),
                 "control channel must be reliable and ordered");
+        ensure!(input.ordered().await? && input.max_retransmits().await?.is_none(),
+                "input channel must be reliable and ordered");
         ensure!(!motion.ordered().await? && motion.max_retransmits().await? == Some(0),
                 "motion channel must be unordered with zero retransmissions");
 
@@ -988,22 +1015,24 @@ async fn open_signaling_peer(
         wait_open(
             &*runtime,
             &control,
+            &input,
             &motion,
             &peer_failed,
             device_status,
             &connection_states,
             false,
         ).await?;
-        eprintln!("M1.3 DTLS_OPEN elapsed_ms={} control=ordered-reliable motion=unordered-zero-retransmit",
+        eprintln!("M1.3 DTLS_OPEN elapsed_ms={} control=ordered-reliable input=ordered-reliable motion=unordered-zero-retransmit",
                   started.elapsed().as_millis());
 
-        Ok((control, motion, offer_sdp, offer_exchange.client_transcript_proof))
+        Ok((control, input, motion, offer_sdp, offer_exchange.client_transcript_proof))
     }.await;
     match result {
-        Ok((control, motion, offer_sdp, proof)) => Ok(SignalingPeer {
+        Ok((control, input, motion, offer_sdp, proof)) => Ok(SignalingPeer {
             session,
             pc,
             control,
+            input,
             motion,
             offer_sdp,
             proof,
@@ -1038,6 +1067,7 @@ async fn exchange_signaling(
     )
     .await?;
     let control = &peer.control;
+    let input = &peer.input;
     let motion = &peer.motion;
     let offer_sdp = &peer.offer_sdp;
     let proof = &peer.proof;
@@ -1052,6 +1082,7 @@ async fn exchange_signaling(
                         &*runtime,
                         monitor,
                         control,
+                        input,
                         motion,
                         peer.session.session_id(),
                         credential.fingerprint,
@@ -1062,19 +1093,21 @@ async fn exchange_signaling(
                     .await?;
                 }
                 if check_isolation {
-                    test_competing_signaling(&*runtime, control, motion, address, hostname, status, credential, offer_sdp).await?;
+                    test_competing_signaling(&*runtime, control, input, motion, address, hostname, status, credential, offer_sdp).await?;
                 }
                 if check_resources {
                     run_resource_test(&*runtime, control, motion, monitor, address, hostname, status, credential).await?;
                 }
                 if revoke_after_authorization {
                     echo_signaling(&*runtime, control, "control-before-active-revoke", 1).await?;
+                    echo_signaling(&*runtime, input, "input-before-active-revoke", 1).await?;
                     echo_signaling(&*runtime, motion, "motion-before-active-revoke", 1).await?;
                     monitor.revoke_client(credential.fingerprint)?;
                     wait_device_closed(&monitor.device_status).await?;
                     send_after_revocation_and_reject_echo(
                         &*runtime,
                         control,
+                        input,
                         motion,
                         &monitor.device_status,
                     )
@@ -1093,18 +1126,19 @@ async fn exchange_signaling(
                     return Ok(proof.clone());
                 }
                 echo_signaling(&*runtime, control, "control", 10).await?;
+                echo_signaling(&*runtime, input, "input", 10).await?;
                 echo_signaling(&*runtime, motion, "motion", 10).await?;
                 Ok(proof.clone())
             }
             TranscriptProofCase::Missing => {
-                send_before_authorization_and_reject_echo(&*runtime, control, motion).await?;
+                send_before_authorization_and_reject_echo(&*runtime, control, input, motion).await?;
                 eprintln!("M1.3 PROOF negative=missing accepted_application_bytes=0 echoed=false");
                 Ok(proof.clone())
             }
             TranscriptProofCase::Invalid => {
                 let mut invalid = proof.clone();
                 *invalid.last_mut().ok_or_else(|| anyhow::anyhow!("empty transcript proof"))? ^= 1;
-                send_before_authorization_and_reject_echo(&*runtime, control, motion).await?;
+                send_before_authorization_and_reject_echo(&*runtime, control, input, motion).await?;
                 peer.session.send_transcript_proof_frame(&invalid).map_err(anyhow::Error::msg)?;
                 let rejection = peer.session.receive_rejection().map_err(anyhow::Error::msg)?;
                 ensure!(rejection.contains("unauthorized"), "invalid proof got unexpected error: {rejection}");
@@ -1112,7 +1146,7 @@ async fn exchange_signaling(
                 Ok(Vec::new())
             }
             TranscriptProofCase::Replayed(replayed) => {
-                send_before_authorization_and_reject_echo(&*runtime, control, motion).await?;
+                send_before_authorization_and_reject_echo(&*runtime, control, input, motion).await?;
                 peer.session.send_transcript_proof_frame(replayed).map_err(anyhow::Error::msg)?;
                 let rejection = peer.session.receive_rejection().map_err(anyhow::Error::msg)?;
                 ensure!(rejection.contains("unauthorized"), "replayed proof got unexpected error: {rejection}");
@@ -1167,7 +1201,7 @@ pub(crate) fn run_foreground_session_with_heartbeat_ack(
     rediscover: bool,
     heartbeat_ack_supported: bool,
 ) -> Result<SocketAddr> {
-    let control = SessionControl::new();
+    let control = SessionControl::new_live(SessionMode::Cli)?;
     let input = control.clone();
     std::thread::spawn(move || {
         let mut line = String::new();
@@ -1197,9 +1231,12 @@ pub(crate) fn run_foreground_session_with_heartbeat_ack(
             SessionEvent::ConnectedLocal => {
                 println!("Connected/local. Press Enter to disconnect.")
             }
-            SessionEvent::InputLocalConfirmed => {}
+            SessionEvent::InputLocalConfirmed => println!("Input local."),
+            SessionEvent::InputRemoteConfirmed => {
+                println!("Remote input active. Press Ctrl+Shift+F10 to toggle local.")
+            }
             SessionEvent::ConnectionDegraded { missed } => {
-                println!("Connection degraded; heartbeat misses={missed}")
+                println!("Connection degraded; heartbeat misses={missed}; input state unchanged")
             }
             SessionEvent::ConnectionRecovered { rtt_ms } => {
                 println!("Connection recovered; heartbeat RTT={rtt_ms}ms")
@@ -1223,6 +1260,7 @@ pub(crate) enum SessionEvent {
     Connecting,
     ConnectedLocal,
     InputLocalConfirmed,
+    InputRemoteConfirmed,
     ConnectionDegraded {
         missed: u8,
     },
@@ -1251,6 +1289,65 @@ pub(crate) enum SessionEvent {
 pub(crate) struct SessionControl {
     cancelled: Arc<AtomicBool>,
     takeover: Arc<Mutex<Option<([u8; 16], Option<bool>, Instant)>>>,
+    input: Arc<Mutex<Option<InputState>>>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum SessionMode {
+    Cli,
+    Tray,
+}
+
+struct InputState {
+    capture: crate::input_capture::Capture,
+    events: crate::input_capture::CapturedEvents,
+    motion_rate_hz: u32,
+    mode: SessionMode,
+    remote: bool,
+    epoch: Option<u32>,
+    keyboard: HeldKeyboard,
+    buttons: u8,
+}
+
+#[derive(Default)]
+struct HeldKeyboard {
+    modifiers: u8,
+    keys: Vec<(u16, u16)>,
+}
+
+impl HeldKeyboard {
+    fn update(&mut self, page: u16, usage: u16, down: bool) -> Option<crate::hid_protocol::Event> {
+        let previous_modifiers = self.modifiers;
+        let previous_keys = self.reported_keys();
+        if page == 7 && (0xe0..=0xe7).contains(&usage) {
+            let bit = 1 << (usage - 0xe0);
+            if down {
+                self.modifiers |= bit;
+            } else {
+                self.modifiers &= !bit;
+            }
+        } else if down {
+            if !self.keys.contains(&(page, usage)) {
+                self.keys.push((page, usage));
+            }
+        } else {
+            self.keys.retain(|key| *key != (page, usage));
+        }
+        let keys = self.reported_keys();
+        (keys != previous_keys || self.modifiers != previous_modifiers).then_some(
+            crate::hid_protocol::Event::KeyboardState {
+                modifiers: self.modifiers,
+                keys,
+            },
+        )
+    }
+
+    fn reported_keys(&self) -> Vec<(u16, u16)> {
+        // Choose slots by press order, then serialize in canonical wire order.
+        let mut keys: Vec<_> = self.keys.iter().copied().take(6).collect();
+        keys.sort_unstable();
+        keys
+    }
 }
 
 impl SessionControl {
@@ -1258,7 +1355,45 @@ impl SessionControl {
         Self {
             cancelled: Arc::new(AtomicBool::new(false)),
             takeover: Arc::new(Mutex::new(None)),
+            input: Arc::new(Mutex::new(None)),
         }
+    }
+
+    pub(crate) fn new_live(mode: SessionMode) -> Result<Self> {
+        let control = Self::new();
+        let bindings = crate::settings::load_escape_bindings().map_err(anyhow::Error::msg)?;
+        let motion_rate_hz = crate::settings::load_motion_rate_hz().map_err(anyhow::Error::msg)?;
+        let (capture, events) =
+            crate::input_capture::Capture::start(bindings).map_err(anyhow::Error::msg)?;
+        *control.input.lock().unwrap() = Some(InputState {
+            capture,
+            events,
+            motion_rate_hz,
+            mode,
+            remote: false,
+            epoch: None,
+            keyboard: HeldKeyboard::default(),
+            buttons: 0,
+        });
+        Ok(control)
+    }
+
+    fn input_enabled(&self) -> bool {
+        self.input.lock().unwrap().is_some()
+    }
+
+    fn input_motion_rate_hz(&self) -> u32 {
+        self.input
+            .lock()
+            .unwrap()
+            .as_ref()
+            .map_or(crate::settings::DEFAULT_MOTION_RATE_HZ, |input| {
+                input.motion_rate_hz
+            })
+    }
+
+    fn input_motion_interval(&self) -> Duration {
+        Duration::from_micros(1_000_000 / u64::from(self.input_motion_rate_hz()))
     }
 
     pub(crate) fn cancel(&self) {
@@ -1267,6 +1402,196 @@ impl SessionControl {
 
     pub(crate) fn is_cancelled(&self) -> bool {
         self.cancelled.load(Ordering::Acquire)
+    }
+
+    fn input_ready(&self, epoch: u32) -> Result<()> {
+        let mut input = self.input.lock().unwrap();
+        let Some(input) = input.as_mut() else {
+            return Ok(());
+        };
+        input.remote = false;
+        input.epoch = Some(epoch);
+        input.keyboard = HeldKeyboard::default();
+        input.buttons = 0;
+        input
+            .capture
+            .set_remote(false)
+            .map_err(anyhow::Error::msg)?;
+        input.capture.set_ready(true).map_err(anyhow::Error::msg)
+    }
+
+    fn input_epoch_matches(&self, epoch: u32) -> bool {
+        match self
+            .input
+            .lock()
+            .unwrap()
+            .as_ref()
+            .and_then(|input| input.epoch)
+        {
+            Some(current) => current == epoch,
+            None => true,
+        }
+    }
+
+    fn input_fail_closed(&self) {
+        if let Some(input) = self.input.lock().unwrap().as_mut() {
+            let _ = input.capture.set_remote(false);
+            for _ in 0..256 {
+                if input.events.try_recv().is_err() {
+                    break;
+                }
+            }
+            input.remote = false;
+            input.epoch = None;
+            input.keyboard = HeldKeyboard::default();
+            input.buttons = 0;
+        }
+    }
+
+    pub(crate) fn input_is_remote(&self) -> bool {
+        self.input
+            .lock()
+            .unwrap()
+            .as_ref()
+            .is_some_and(|input| input.remote)
+    }
+
+    fn input_faulted(&self) -> bool {
+        self.input
+            .lock()
+            .unwrap()
+            .as_ref()
+            .is_some_and(|input| input.capture.is_faulted())
+    }
+
+    fn check_input_health(&self) -> Result<()> {
+        ensure!(
+            !self.input_faulted(),
+            "Input capture stopped or overflowed. Input is local."
+        );
+        Ok(())
+    }
+
+    fn input_mode(&self) -> Option<SessionMode> {
+        self.input.lock().unwrap().as_ref().map(|input| input.mode)
+    }
+
+    fn take_escape(&self) -> bool {
+        let detected = self
+            .input
+            .lock()
+            .unwrap()
+            .as_ref()
+            .is_some_and(|input| input.events.take_escape());
+        if detected {
+            log::info!("Escape shortcut detected");
+        }
+        detected
+    }
+
+    fn discard_pre_lease_shortcuts(&self) {
+        // Each capture queue limits the count of waiting presses to u8.
+        for _ in 0..u8::MAX {
+            if !self.take_escape() {
+                break;
+            }
+            if self.input_mode() == Some(SessionMode::Cli) {
+                self.cancel();
+                break;
+            }
+        }
+    }
+
+    fn next_input_event(&self) -> Result<Option<crate::input_capture::InputEvent>> {
+        let input = self.input.lock().unwrap();
+        let Some(input) = input.as_ref() else {
+            return Ok(None);
+        };
+        match input.events.try_recv() {
+            Ok(event) => Ok(Some(event)),
+            Err(TryRecvError::Empty) => Ok(None),
+            Err(TryRecvError::Disconnected) => bail!("input capture worker exited"),
+        }
+    }
+
+    fn request_remote(&self, attempt: u64) -> Result<()> {
+        let input = self.input.lock().unwrap();
+        input
+            .as_ref()
+            .context("capture is unavailable")?
+            .capture
+            .request_remote(attempt)
+            .map_err(anyhow::Error::msg)
+    }
+
+    fn confirm_remote(&self, epoch: u32) -> bool {
+        if self.is_cancelled() {
+            return false;
+        }
+        let mut input = self.input.lock().unwrap();
+        let Some(input) = input.as_mut() else {
+            return false;
+        };
+        if input.epoch != Some(epoch) || input.capture.is_faulted() {
+            return false;
+        }
+        input.remote = true;
+        true
+    }
+
+    fn input_set_local(&self) -> Result<bool> {
+        let mut input = self.input.lock().unwrap();
+        let Some(input) = input.as_mut() else {
+            return Ok(false);
+        };
+        let changed = std::mem::take(&mut input.remote);
+        input.keyboard = HeldKeyboard::default();
+        input.buttons = 0;
+        let handoff = input.capture.set_remote(false).map_err(anyhow::Error::msg);
+        for _ in 0..256 {
+            if input.events.try_recv().is_err() {
+                break;
+            }
+        }
+        // An exited worker has already removed its hooks.
+        if !input.capture.is_faulted() {
+            handoff?;
+        }
+        Ok(changed)
+    }
+
+    fn input_update(
+        &self,
+        event: crate::input_capture::InputEvent,
+    ) -> Option<crate::hid_protocol::Event> {
+        use crate::{hid_protocol::Event, input_capture::InputEvent};
+        let mut input = self.input.lock().unwrap();
+        let input = input.as_mut()?;
+        if !input.remote {
+            return None;
+        }
+        match event {
+            InputEvent::Key { page, usage, down } => input.keyboard.update(page, usage, down),
+            InputEvent::MouseButton { mask, down } => {
+                let before = input.buttons;
+                if down {
+                    input.buttons |= mask;
+                } else {
+                    input.buttons &= !mask;
+                }
+                (before != input.buttons).then_some(Event::MouseButtons {
+                    mask: input.buttons,
+                })
+            }
+            InputEvent::Wheel {
+                vertical,
+                horizontal,
+            } => Some(Event::Wheel {
+                vertical,
+                horizontal,
+            }),
+            _ => None,
+        }
     }
 
     pub(crate) fn respond_to_takeover(&self, request_id: [u8; 16], accepted: bool) {
@@ -1337,12 +1662,14 @@ enum SessionExit {
 }
 
 fn session_error_exit(code: &str, response_epoch: u32) -> SessionExit {
-    if code == "lease_expired" {
-        SessionExit::Lost(format!(
+    match code {
+        "lease_expired" => SessionExit::Lost(format!(
             "endpoint lease expired (endpoint epoch {response_epoch})"
-        ))
-    } else {
-        SessionExit::OwnershipLost(format!("{code} (endpoint epoch {response_epoch})"))
+        )),
+        "invalid_capability" | "resource_exhausted" => SessionExit::Lost(format!(
+            "endpoint HID unavailable: {code} (endpoint epoch {response_epoch})"
+        )),
+        _ => SessionExit::OwnershipLost(format!("{code} (endpoint epoch {response_epoch})")),
     }
 }
 
@@ -1363,6 +1690,10 @@ fn resolve_for_recovery(
         })
         .ok()?;
     while !control.is_cancelled() {
+        if control.take_escape() && control.input_mode() == Some(SessionMode::Cli) {
+            control.cancel();
+            break;
+        }
         match receiver.recv_timeout(Duration::from_millis(100)) {
             Ok(resolved) => return resolved,
             Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => break,
@@ -1429,6 +1760,15 @@ where
     let mut last_address =
         crate::discovery::socket_address(&service).map_err(anyhow::Error::msg)?;
     loop {
+        if let Err(error) = control.check_input_health() {
+            on_event(SessionEvent::Unavailable {
+                reason: error.to_string(),
+            });
+            return Err(error);
+        }
+        if recovery_started.is_some() {
+            control.discard_pre_lease_shortcuts();
+        }
         if control.is_cancelled() {
             on_event(SessionEvent::Disconnected);
             return Ok(last_address);
@@ -1454,6 +1794,10 @@ where
                     &credential,
                     &control,
                     heartbeat_ack_supported,
+                    service
+                        .properties
+                        .get("live")
+                        .is_some_and(|value| value == "1"),
                     &mut |event| {
                         if matches!(event, SessionEvent::ConnectedLocal) {
                             connected_in_attempt = true;
@@ -1466,6 +1810,12 @@ where
             );
         }));
         let exit = exit.context("runtime did not execute")??;
+        if let Err(error) = control.check_input_health() {
+            on_event(SessionEvent::Unavailable {
+                reason: error.to_string(),
+            });
+            return Err(error);
+        }
         if connected_in_attempt {
             recovery_started = None;
             retry_delay = Duration::from_secs(1);
@@ -1492,11 +1842,12 @@ where
                 )));
             }
             SessionExit::Lost(reason) => {
+                if control.is_cancelled() {
+                    bail!("Old lease cleanup was not confirmed: {reason}");
+                }
                 log::warn!("session transport lost: {reason}");
                 recovery_started.get_or_insert_with(Instant::now);
-                on_event(SessionEvent::Notice(format!(
-                    "Connection lost; input remains local: {reason}"
-                )));
+                on_event(SessionEvent::Notice(format!("Connection lost: {reason}")));
             }
         }
         let started = recovery_started.expect("recovery start set before retry");
@@ -1526,6 +1877,9 @@ where
         }
         let wait_until = Instant::now() + retry_delay;
         while Instant::now() < wait_until {
+            if control.take_escape() && control.input_mode() == Some(SessionMode::Cli) {
+                control.cancel();
+            }
             if control.is_cancelled() {
                 on_event(SessionEvent::Disconnected);
                 return Ok(last_address);
@@ -1584,6 +1938,7 @@ pub(crate) fn run_takeover_request(
                 .await?;
                 eprintln!("M2.2 TAKEOVER_REQUEST sent; waiting for local-owner decision");
                 let deadline = Instant::now() + Duration::from_secs(60);
+                let mut pending_epoch = None;
                 loop {
                     ensure!(Instant::now() < deadline, "takeover request timed out");
                     match timeout(&*runtime, Duration::from_millis(250), peer.control.poll()).await
@@ -1601,10 +1956,17 @@ pub(crate) fn run_takeover_request(
                                     eprintln!("M2.2 TAKEOVER_REQUEST granted=true epoch={epoch}");
                                     return Ok(());
                                 }
-                                EndpointResponse::LeaseState { state: 2, .. } => {
+                                EndpointResponse::LeaseState {
+                                    owner: Some(owner),
+                                    state: 2,
+                                } if owner != credential.fingerprint => {
+                                    pending_epoch.get_or_insert(epoch);
                                     eprintln!("M2.2 TAKEOVER_REQUEST pending=true");
                                 }
-                                EndpointResponse::TakeoverResponse { accepted, .. } => {
+                                EndpointResponse::TakeoverResponse {
+                                    request_id: response_id,
+                                    accepted,
+                                } if response_id == request_id => {
                                     eprintln!("M2.2 TAKEOVER_REQUEST accepted={accepted}");
                                     if !accepted {
                                         return Ok(());
@@ -1638,6 +2000,7 @@ async fn run_session_once<F>(
     credential: &crate::credentials::ClientCredential,
     control: &SessionControl,
     heartbeat_ack_supported: bool,
+    live_protocol_supported: bool,
     on_event: &mut F,
     device_status: &AtomicU8,
 ) -> Result<SessionExit>
@@ -1659,11 +2022,19 @@ where
     };
     log::debug!("session signaling authenticated for {hostname}");
     let mut connected = false;
+    // The endpoint validates each DataChannel sequence independently. Input
+    // reports use a reserved sequence namespace because their completion ACKs
+    // share the control response stream with heartbeats.
+    let mut control_sequence = 0u64;
+    let mut input_sequence = INPUT_SEQUENCE_BASE;
+    let mut motion_sequence = 0u64;
+    let mut takeover_epoch = 0u32;
     let session_result: Result<SessionExit> = async {
         peer.session
             .send_transcript_proof(&peer.proof)
             .map_err(anyhow::Error::msg)
             .context("foreground session authorization")?;
+        control.discard_pre_lease_shortcuts();
         if control.is_cancelled() {
             return Ok(SessionExit::Disconnected);
         }
@@ -1691,10 +2062,32 @@ where
             },
         )?;
         log::info!("session lease granted epoch={epoch}");
-        eprintln!("M2.1 SESSION authenticated=true input_local=true physical_input_capture=off");
+        control.discard_pre_lease_shortcuts();
+        control.input_ready(epoch)?;
+        let motion_rate_hz = if control.input_enabled() {
+            control.input_motion_rate_hz().to_string()
+        } else {
+            "off".into()
+        };
+        eprintln!(
+            "M2.3 SESSION authenticated=true input_local=true physical_input_capture={} input_channels={} motion_rate_hz={} escape={}",
+            if control.input_enabled() {
+                "armed-local"
+            } else {
+                "off"
+            },
+            if control.input_enabled() {
+                "ordered-input+unordered-motion"
+            } else {
+                "off"
+            },
+            motion_rate_hz,
+            if control.input_enabled() { "ready" } else { "off" },
+        );
         connected = true;
         on_event(SessionEvent::ConnectedLocal);
-        let mut sequence = 1;
+        control_sequence = 1;
+
         let heartbeat_interval = if heartbeat_ack_supported {
             HEARTBEAT_INTERVAL
         } else {
@@ -1710,28 +2103,52 @@ where
         let mut heartbeat_request_sequence = None;
         let mut missed_heartbeats = 0u8;
         let mut degraded = false;
-        let mut takeover_epoch = epoch;
+        let mut live = LiveInput::default();
+        let poll_interval = if control.input_enabled() {
+            control
+                .input_motion_interval()
+                .min(Duration::from_millis(5))
+        } else {
+            Duration::from_millis(100)
+        };
+        let session_id = peer.session.session_id();
+        takeover_epoch = epoch;
         loop {
             if control.is_cancelled() {
-                let release = send_hid_event(
+                if control.input_set_local()? {
+                    on_event(SessionEvent::InputLocalConfirmed);
+                }
+                send_hid_event(
                     &peer.control,
                     crate::hid_protocol::Envelope {
                         message_type: crate::hid_protocol::LEASE_RELEASE,
-                        session_id: peer.session.session_id(),
+                        session_id,
                         lease_epoch: takeover_epoch,
-                        sequence,
+                        sequence: control_sequence,
                         event: crate::hid_protocol::Event::LeaseRelease,
                     },
                 )
-                .await;
-                if release.is_ok() {
-                    let _ = receive_endpoint_response(
-                        &*runtime,
-                        &peer.control,
-                        &mut responses,
-                        next_lease_epoch(takeover_epoch),
-                    )
-                    .await;
+                .await.context("send old lease release")?;
+                let deadline = Instant::now() + Duration::from_secs(5);
+                loop {
+                    let (response, epoch) = timeout(
+                        &*runtime, deadline.saturating_duration_since(Instant::now()),
+                        receive_endpoint_response_any_epoch(&*runtime, &peer.control, &mut responses),
+                    ).await.context("old lease cleanup timed out")??;
+                    let released_epoch = next_lease_epoch(takeover_epoch);
+                    let released = responses.take_request_sequence().is_none()
+                        && match response {
+                            EndpointResponse::LeaseState { owner: None, state: 0 } => epoch == released_epoch,
+                            EndpointResponse::LeaseState { owner: Some(owner), state: 1 }
+                                if owner != credential.fingerprint => epoch == next_lease_epoch(released_epoch),
+                            _ => false,
+                        };
+                    if released {
+                        break;
+                    }
+                    if let EndpointResponse::Error { code } = response {
+                        bail!("old lease release rejected: {code}");
+                    }
                 }
                 return Ok(SessionExit::Disconnected);
             }
@@ -1749,17 +2166,16 @@ where
                     on_event(SessionEvent::ConnectionDegraded {
                         missed: missed_heartbeats,
                     });
-                }
-                if missed_heartbeats >= HEARTBEAT_MISS_LIMIT {
-                    return Ok(SessionExit::Lost(format!(
-                        "heartbeat missed {missed_heartbeats} consecutive responses"
-                    )));
+                    // Keep the established remote route alive while the
+                    // connection is only degraded. Escape or confirmed loss
+                    // remains responsible for returning control locally.
                 }
             }
-            if (!heartbeat_ack_supported || heartbeat_sent_at.is_none()) && now >= heartbeat_due {
+            let heartbeat_can_send = !heartbeat_ack_supported || heartbeat_sent_at.is_none();
+            if heartbeat_can_send && now >= heartbeat_due {
                 let send_started = Instant::now();
                 log::debug!(
-                    "session heartbeat send epoch={} sequence={sequence}",
+                    "session heartbeat send epoch={} sequence={control_sequence}",
                     takeover_epoch
                 );
                 send_hid_event(
@@ -1768,25 +2184,57 @@ where
                         message_type: crate::hid_protocol::HEARTBEAT,
                         session_id: peer.session.session_id(),
                         lease_epoch: takeover_epoch,
-                        sequence,
+                        sequence: control_sequence,
                         event: crate::hid_protocol::Event::Heartbeat,
                     },
                 )
                 .await?;
                 let send_completed = Instant::now();
-                sequence += 1;
+                control_sequence += 1;
                 heartbeat_due += heartbeat_interval;
                 if heartbeat_ack_supported {
-                    heartbeat_request_sequence = Some(sequence - 1);
+                    heartbeat_request_sequence = Some(control_sequence - 1);
                     heartbeat_sent_at = Some(send_completed);
                 }
                 log::debug!(
                     "session heartbeat send-complete sequence={} enqueue_ms={}",
-                    sequence - 1,
+                    control_sequence - 1,
                     send_completed.duration_since(send_started).as_millis()
                 );
             }
-            match timeout(&*runtime, Duration::from_millis(100), peer.control.poll()).await {
+            // Heartbeat ACKs and live input use independent channels/sequence
+            // state. Keep capture and forwarding active while ACK is pending;
+            // Escape still returns input local through process_input_events.
+            process_input_events(
+                &*runtime,
+                &peer.control,
+                &peer.input,
+                &peer.motion,
+                control,
+                session_id,
+                takeover_epoch,
+                &mut control_sequence,
+                &mut input_sequence,
+                &mut motion_sequence,
+                &mut live,
+                // A missed heartbeat is degradation, not confirmed loss. The
+                // control channel can still carry an arm/disarm transition;
+                // keep the toggle responsive and let its correlated reply
+                // decide whether the endpoint is reachable.
+                control.pending_takeover().is_none(),
+                live_protocol_supported, on_event,
+            ).await?;
+            if control.is_cancelled() { continue; }
+            if live.arm.as_ref().is_some_and(|arm| !arm.acknowledged && now >= arm.deadline) {
+                bail!("input arm response timed out");
+            }
+            if live.report.is_some_and(|(_, deadline)| now >= deadline) {
+                bail!("input report completion timed out");
+            }
+            if live.disarm.is_some_and(|(_, deadline)| now >= deadline) {
+                bail!("input disarm completion timed out");
+            }
+            match timeout(&*runtime, poll_interval, peer.control.poll()).await {
                 Ok(Some(DataChannelEvent::OnMessage(message))) => {
                     let (response, response_epoch) = responses.decode_any_epoch(&message.data)?;
                     let response_request_sequence = responses.take_request_sequence();
@@ -1804,18 +2252,71 @@ where
                                 crate::hex(&request_id[..4]),
                                 response_window_ms
                             );
+                            stop_live_input(control, &peer.control, session_id, takeover_epoch,
+                                &mut control_sequence, &mut live, on_event).await?;
                             control.start_takeover(request_id, response_window_ms);
-                            on_event(SessionEvent::InputLocalConfirmed);
                             on_event(SessionEvent::TakeoverPending {
-                                request_id,
-                                requester,
-                                response_window_ms,
+                                request_id, requester, response_window_ms,
                             });
                         }
+                        response if live.arm.as_ref().is_some_and(|arm| {
+                            arm.matches_reply(&response, response_epoch, response_request_sequence,
+                                credential.fingerprint)
+                        }) => {
+                            // An escape queued while polling still belongs to
+                            // this attempt, even if its rejection arrived first.
+                            if live.arm.as_ref().is_some_and(|arm| !arm.cancelled) && control.take_escape() {
+                                stop_live_input(control, &peer.control, session_id, takeover_epoch,
+                                    &mut control_sequence, &mut live, on_event).await?;
+                            }
+                            let accepted = matches!(response, EndpointResponse::LeaseState { .. });
+                            let declined = live.arm_reply(accepted);
+                            log::debug!(
+                                "live input arm reply epoch={} request_sequence={:?} accepted={} declined={}",
+                                response_epoch, response_request_sequence, accepted, declined
+                            );
+                            if declined {
+                                on_event(SessionEvent::Notice(
+                                    "Endpoint declined remote input. Input remains local.".into(),
+                                ));
+                            }
+                        }
+                        EndpointResponse::LeaseState { owner: Some(owner), state }
+                            if response_epoch == takeover_epoch
+                                && owner == credential.fingerprint && matches!(state, 1 | 2) =>
+                        {
+                            if live.credit_reply(response_request_sequence) {
+                                log::debug!(
+                                    "live input completion acknowledged epoch={} request_sequence={:?}",
+                                    response_epoch, response_request_sequence
+                                );
+                                send_pending_disarm(
+                                    &peer.control,
+                                    session_id,
+                                    takeover_epoch,
+                                    &mut control_sequence,
+                                    &mut live,
+                                    false,
+                                    false,
+                                    false,
+                                )
+                                .await?;
+                            }
+                        }
+                        EndpointResponse::Error { code }
+                            if live.disarm.is_some_and(|(sent, _)| Some(sent) == response_request_sequence) =>
+                        {
+                            return Ok(SessionExit::Lost(format!("endpoint rejected input disarm: {code}")));
+                        }
+                        EndpointResponse::Error { .. } if response_request_sequence.is_some() => {}
                         EndpointResponse::LeaseState { owner, state }
                             if owner == Some(credential.fingerprint)
                                 && (state == 1 || state == 2) =>
                         {
+                            if response_epoch != takeover_epoch {
+                                if response_request_sequence.is_some() { continue; }
+                                return Ok(SessionExit::Lost("endpoint lease epoch changed".into()));
+                            }
                             let heartbeat_acknowledged = matches!(
                                 (response_request_sequence, heartbeat_request_sequence),
                                 (Some(received), Some(pending)) if received == pending
@@ -1842,39 +2343,20 @@ where
                                     "session state ignored as heartbeat ack response_request_sequence={response_request_sequence:?} pending_request_sequence={heartbeat_request_sequence:?}"
                                 );
                             }
-                            takeover_epoch = response_epoch;
                         }
                         EndpointResponse::Error { code } => {
-                            log::warn!(
-                                "session lease error epoch={} code={code}",
-                                response_epoch
-                            );
                             return Ok(session_error_exit(&code, response_epoch));
                         }
                         EndpointResponse::LeaseState { owner, state } => match owner {
                             Some(owner) if owner != credential.fingerprint => {
-                                log::warn!(
-                                    "session lease owner mismatch epoch={} state={} local={} remote={}",
-                                    response_epoch,
-                                    state,
-                                    crate::hex(&credential.fingerprint[..4]),
-                                    crate::hex(&owner[..4])
-                                );
                                 return Ok(SessionExit::OwnershipLost(format!(
                                     "another enrolled identity owns target (owner={} epoch={} state={})",
-                                    crate::hex(&owner[..4]),
-                                    response_epoch,
-                                    state
+                                    crate::hex(&owner[..4]), response_epoch, state
                                 )));
                             }
                             None => {
-                                log::warn!(
-                                    "session lease expired epoch={} state={} owner=none",
-                                    response_epoch,
-                                    state
-                                );
                                 return Ok(SessionExit::Lost(format!(
-                                    "endpoint lease expired (endpoint epoch {response_epoch})"
+                                    "endpoint lease expired or revoked (endpoint epoch {response_epoch})"
                                 )));
                             }
                             Some(_) => {
@@ -1883,12 +2365,8 @@ where
                                 )));
                             }
                         }
-                        EndpointResponse::TakeoverResponse { .. } => {}
-                        response => {
-                            return Ok(SessionExit::Lost(format!(
-                                "unexpected foreground response: {response:?}"
-                            )));
-                        }
+                        EndpointResponse::TakeoverResponse { .. }
+                        | EndpointResponse::TakeoverNotice { .. } => {}
                     }
                 }
                 Ok(Some(DataChannelEvent::OnClose)) | Ok(None) => {
@@ -1907,7 +2385,7 @@ where
                         message_type: crate::hid_protocol::TAKEOVER_RESPONSE,
                         session_id: peer.session.session_id(),
                         lease_epoch: takeover_epoch,
-                        sequence,
+                        sequence: control_sequence,
                         event: crate::hid_protocol::Event::TakeoverResponse {
                             request_id,
                             accepted,
@@ -1915,7 +2393,7 @@ where
                     },
                 )
                 .await?;
-                sequence += 1;
+                control_sequence += 1;
                 on_event(SessionEvent::Notice(if accepted {
                     "Takeover accepted; input remains local until ownership changes.".into()
                 } else {
@@ -1927,11 +2405,19 @@ where
                     "Takeover request expired; input remains local.".into(),
                 ));
             }
-            runtime.sleep(Duration::from_millis(50)).await;
         }
     }
     .await;
+    if control.input_set_local().unwrap_or(false) {
+        on_event(SessionEvent::InputLocalConfirmed);
+    }
+    control.input_fail_closed();
     peer.close(&*runtime).await;
+    // Switching must wait for confirmed lease cleanup. On failure the caller
+    // stays local and the endpoint's peer-close/lease-expiry path cleans up.
+    if control.is_cancelled() {
+        return session_result;
+    }
     match session_result {
         Ok(exit) => Ok(exit),
         Err(error) => {
@@ -2053,6 +2539,9 @@ impl ResponseCursor {
         match event {
             crate::hid_protocol::Event::LeaseState {
                 request_sequence, ..
+            }
+            | crate::hid_protocol::Event::Error {
+                request_sequence, ..
             } => *request_sequence,
             _ => None,
         }
@@ -2104,7 +2593,7 @@ impl ResponseCursor {
                 requester,
                 response_window_ms,
             },
-            crate::hid_protocol::Event::Error { code } => EndpointResponse::Error { code },
+            crate::hid_protocol::Event::Error { code, .. } => EndpointResponse::Error { code },
             _ => bail!("unexpected endpoint response event"),
         })
     }
@@ -2174,6 +2663,414 @@ async fn send_hid_event(
     Ok(())
 }
 
+#[derive(Default)]
+struct LiveInput {
+    arm: Option<PendingInputArm>,
+    pending: Option<(u64, crate::hid_protocol::Event)>,
+    report: Option<(u64, Instant)>,
+    disarm: Option<(u64, Instant)>,
+    disarm_requested: bool,
+    rearm_requested: bool,
+    motion: (i32, i32),
+    last_motion_sent: Option<Instant>,
+}
+
+impl LiveInput {
+    fn arm_reply(&mut self, accepted: bool) -> bool {
+        let Some(arm) = self.arm.as_mut() else {
+            return false;
+        };
+        if arm.cancelled {
+            self.arm = None;
+        } else if accepted {
+            arm.acknowledged = true;
+        } else {
+            self.arm = None;
+            return true;
+        }
+        false
+    }
+
+    fn complete_handoff(&mut self, epoch: u32, attempt: u64) -> bool {
+        if self.arm.as_ref().is_some_and(|arm| {
+            arm.epoch == epoch
+                && arm.sequence == attempt
+                && arm.acknowledged
+                && arm.handoff_requested
+                && !arm.cancelled
+        }) {
+            self.arm = None;
+            return true;
+        }
+        false
+    }
+
+    fn credit_reply(&mut self, request_sequence: Option<u64>) -> bool {
+        for pending in [&mut self.disarm, &mut self.report] {
+            if pending.is_some_and(|(sent, _)| Some(sent) == request_sequence) {
+                *pending = None;
+                return true;
+            }
+        }
+        false
+    }
+
+    fn cancel_pending(&mut self) -> bool {
+        self.rearm_requested = false;
+        self.pending = None;
+        self.motion = (0, 0);
+        self.last_motion_sent = None;
+        let Some(arm) = self.arm.as_mut() else {
+            return false;
+        };
+        let needs_disarm = !arm.cancelled;
+        arm.cancelled = true;
+        if arm.acknowledged {
+            self.arm = None;
+        }
+        needs_disarm
+    }
+}
+
+struct PendingInputArm {
+    epoch: u32,
+    sequence: u64,
+    deadline: Instant,
+    acknowledged: bool,
+    handoff_requested: bool,
+    cancelled: bool,
+}
+
+impl PendingInputArm {
+    fn matches_reply(
+        &self,
+        response: &EndpointResponse,
+        epoch: u32,
+        request_sequence: Option<u64>,
+        client_fingerprint: [u8; 32],
+    ) -> bool {
+        if epoch != self.epoch || request_sequence != Some(self.sequence) {
+            return false;
+        }
+        match response {
+            EndpointResponse::LeaseState {
+                owner: Some(owner),
+                state: 1,
+            } => *owner == client_fingerprint,
+            EndpointResponse::Error { .. } => true,
+            _ => false,
+        }
+    }
+}
+
+async fn send_live_event(
+    channel: &Arc<dyn DataChannel>,
+    session_id: [u8; 16],
+    epoch: u32,
+    sequence: &mut u64,
+    message_type: u64,
+    event: crate::hid_protocol::Event,
+) -> Result<u64> {
+    let current = *sequence;
+    let next = current.checked_add(1).context("input sequence exhausted")?;
+    send_hid_event(
+        channel,
+        crate::hid_protocol::Envelope {
+            message_type,
+            session_id,
+            lease_epoch: epoch,
+            sequence: current,
+            event,
+        },
+    )
+    .await?;
+    *sequence = next;
+    Ok(current)
+}
+
+async fn stop_live_input<F: FnMut(SessionEvent)>(
+    control: &SessionControl,
+    channel: &Arc<dyn DataChannel>,
+    session_id: [u8; 16],
+    epoch: u32,
+    sequence: &mut u64,
+    live: &mut LiveInput,
+    on_event: &mut F,
+) -> Result<()> {
+    let was_remote = control.input_set_local()?;
+    let had_arm = live.arm.is_some();
+    let had_report = live.report.is_some();
+    if was_remote {
+        on_event(SessionEvent::InputLocalConfirmed);
+    }
+    if live.cancel_pending() || was_remote {
+        // Input reports use another ordered channel. Do not let DISARM overtake
+        // the last report; wait for its completion credit before sending it on
+        // the control channel.
+        live.disarm_requested = true;
+        send_pending_disarm(
+            channel, session_id, epoch, sequence, live, was_remote, had_arm, had_report,
+        )
+        .await?;
+    }
+    Ok(())
+}
+
+async fn send_pending_disarm(
+    channel: &Arc<dyn DataChannel>,
+    session_id: [u8; 16],
+    epoch: u32,
+    sequence: &mut u64,
+    live: &mut LiveInput,
+    was_remote: bool,
+    had_arm: bool,
+    had_report: bool,
+) -> Result<()> {
+    if !live.disarm_requested || live.report.is_some() || live.disarm.is_some() {
+        return Ok(());
+    }
+    live.disarm_requested = false;
+    let sent = send_live_event(
+        channel,
+        session_id,
+        epoch,
+        sequence,
+        crate::hid_protocol::LIVE_INPUT_DISARM,
+        crate::hid_protocol::Event::LiveInputDisarm,
+    )
+    .await?;
+    live.disarm = Some((sent, Instant::now() + Duration::from_secs(5)));
+    log::debug!(
+        "live input disarm sent epoch={} sequence={} was_remote={} had_arm={} had_report={}",
+        epoch,
+        sent,
+        was_remote,
+        had_arm,
+        had_report
+    );
+    Ok(())
+}
+
+async fn process_input_events<F: FnMut(SessionEvent)>(
+    runtime: &dyn Runtime,
+    control_channel: &Arc<dyn DataChannel>,
+    input_channel: &Arc<dyn DataChannel>,
+    motion_channel: &Arc<dyn DataChannel>,
+    control: &SessionControl,
+    session_id: [u8; 16],
+    epoch: u32,
+    control_sequence: &mut u64,
+    input_sequence: &mut u64,
+    motion_sequence: &mut u64,
+    live: &mut LiveInput,
+    can_arm: bool,
+    protocol_supported: bool,
+    on_event: &mut F,
+) -> Result<()> {
+    use crate::{
+        hid_protocol as hid,
+        input_capture::{self, InputEvent},
+    };
+    control.check_input_health()?;
+    ensure!(
+        control.input_epoch_matches(epoch),
+        "input capture lease epoch changed"
+    );
+    if control.take_escape() {
+        if live.arm.as_ref().is_some_and(|arm| !arm.cancelled)
+            || control.input_is_remote()
+            || live.disarm_requested
+            || live.disarm.is_some()
+        {
+            stop_live_input(
+                control,
+                control_channel,
+                session_id,
+                epoch,
+                control_sequence,
+                live,
+                on_event,
+            )
+            .await?;
+            return Ok(());
+        }
+        if live.rearm_requested {
+            // A second press while activation is waiting for disarm/lease
+            // cleanup cancels that activation without issuing another disarm.
+            live.rearm_requested = false;
+            log::debug!("live input rearm cancelled by Escape");
+            return Ok(());
+        }
+        if !input_capture::capture_supported() || !protocol_supported {
+            on_event(SessionEvent::Notice(
+                if !input_capture::capture_supported() {
+                    "Remote input unavailable. Focused Windows capture is unavailable.".into()
+                } else {
+                    "Remote input unavailable. Endpoint lacks correlated live input support.".into()
+                },
+            ));
+            return Ok(());
+        }
+        live.rearm_requested = true;
+        log::debug!(
+            "live input rearm requested arm_allowed={} disarm_pending={} arm_pending={}",
+            can_arm,
+            live.disarm.is_some(),
+            live.arm.is_some()
+        );
+    }
+    if live.rearm_requested && can_arm && live.disarm.is_none() && live.arm.is_none() {
+        live.rearm_requested = false;
+        let sent = send_live_event(
+            control_channel,
+            session_id,
+            epoch,
+            control_sequence,
+            hid::LIVE_INPUT_ARM,
+            hid::Event::LiveInputArm,
+        )
+        .await?;
+        live.arm = Some(PendingInputArm {
+            epoch,
+            sequence: sent,
+            deadline: Instant::now() + Duration::from_secs(5),
+            acknowledged: false,
+            handoff_requested: false,
+            cancelled: false,
+        });
+        log::debug!(
+            "live input arm sent epoch={} sequence={} waiting_for_disarm={}",
+            epoch,
+            sent,
+            live.disarm.is_some()
+        );
+        return Ok(());
+    }
+    if let Some(arm) = live.arm.as_mut()
+        && arm.acknowledged
+        && !arm.cancelled
+        && !arm.handoff_requested
+    {
+        control.request_remote(arm.sequence)?;
+        arm.handoff_requested = true;
+    }
+    if live.report.is_some() {
+        return Ok(());
+    }
+
+    // Keep motion fast and coalesced. State changes retain one USB completion
+    // credit so button/key cleanup stays explicit.
+    for _ in 0..4 {
+        let (message_type, event) = if let Some((message_type, event)) = live.pending.take() {
+            (message_type, event)
+        } else if live.motion != (0, 0)
+            && live
+                .last_motion_sent
+                .is_none_or(|sent| sent.elapsed() >= control.input_motion_interval())
+        {
+            let (dx, dy) = take_motion_chunk(&mut live.motion);
+            (hid::MOTION, hid::Event::Motion { dx, dy })
+        } else {
+            let Some(input) = control.next_input_event()? else {
+                break;
+            };
+            match input {
+                InputEvent::RemoteReady(attempt) => {
+                    if live.complete_handoff(epoch, attempt) && control.confirm_remote(epoch) {
+                        log::debug!(
+                            "live input capture handoff complete epoch={} attempt={}",
+                            epoch,
+                            attempt
+                        );
+                        on_event(SessionEvent::InputRemoteConfirmed);
+                    }
+                    continue;
+                }
+                InputEvent::Motion { dx, dy } if control.input_is_remote() => {
+                    live.motion.0 += dx;
+                    live.motion.1 += dy;
+                    continue;
+                }
+                _ => {
+                    let Some(event) = control.input_update(input) else {
+                        continue;
+                    };
+                    let message_type = match &event {
+                        hid::Event::KeyboardState { .. } => hid::KEYBOARD_STATE,
+                        hid::Event::MouseButtons { .. } => hid::MOUSE_BUTTONS,
+                        hid::Event::Wheel { .. } => hid::WHEEL,
+                        hid::Event::Motion { .. } => hid::MOTION,
+                        _ => unreachable!(),
+                    };
+                    (message_type, event)
+                }
+            }
+        };
+        let is_motion = matches!(&event, hid::Event::Motion { .. });
+        // Control carries lease/heartbeat transitions, input carries ordered
+        // key/button/wheel state, and motion carries only relative deltas.
+        let use_motion_channel = is_motion;
+        let channel = if use_motion_channel {
+            motion_channel
+        } else {
+            input_channel
+        };
+        let channel_sequence = if use_motion_channel {
+            &mut *motion_sequence
+        } else {
+            &mut *input_sequence
+        };
+        let motion_delta = match &event {
+            hid::Event::Motion { dx, dy } => Some((*dx, *dy)),
+            _ => None,
+        };
+        let retry_event = (!is_motion).then(|| event.clone());
+        let sent = match timeout(
+            runtime,
+            INPUT_SEND_BUDGET,
+            send_live_event(
+                channel,
+                session_id,
+                epoch,
+                channel_sequence,
+                message_type,
+                event,
+            ),
+        )
+        .await
+        {
+            Ok(result) => result?,
+            Err(_) => {
+                if let Some(event) = retry_event {
+                    live.pending = Some((message_type, event));
+                }
+                if let Some((dx, dy)) = motion_delta {
+                    live.motion.0 += i32::from(dx);
+                    live.motion.1 += i32::from(dy);
+                }
+                log::debug!("live input send backpressured; prioritizing session heartbeat");
+                break;
+            }
+        };
+        if is_motion {
+            live.last_motion_sent = Some(Instant::now());
+        }
+        if !is_motion {
+            live.report = Some((sent, Instant::now() + Duration::from_secs(5)));
+            break;
+        }
+    }
+    Ok(())
+}
+
+fn take_motion_chunk(delta: &mut (i32, i32)) -> (i16, i16) {
+    let dx = delta.0.clamp(-127, 127);
+    let dy = delta.1.clamp(-127, 127);
+    delta.0 -= dx;
+    delta.1 -= dy;
+    (dx as i16, dy as i16)
+}
+
 async fn drain_legacy_heartbeat_response(
     runtime: &dyn Runtime,
     control: &Arc<dyn DataChannel>,
@@ -2240,7 +3137,7 @@ fn wait_for_scripted_telemetry(
     monitor: &PortMonitor,
     baseline: &crate::TransportMetrics,
     expected_events: u32,
-    expected_sequence: u64,
+    expected_sequence: Option<u64>,
 ) -> Result<()> {
     let target = baseline
         .scripted_events
@@ -2258,16 +3155,17 @@ fn wait_for_scripted_telemetry(
                 && metrics.scripted_reorders == baseline.scripted_reorders,
             "scripted event was dropped or reordered before telemetry barrier"
         );
-        if metrics.scripted_events >= target && metrics.last_event_sequence == expected_sequence {
+        if metrics.scripted_events >= target
+            && expected_sequence.is_none_or(|sequence| metrics.last_event_sequence == sequence)
+        {
             return Ok(());
         }
         if Instant::now() >= deadline {
             bail!(
-                "scripted telemetry barrier timed out: events={} target={} last_sequence={} expected_sequence={}",
+                "scripted telemetry barrier timed out: events={} target={} last_sequence={:?}",
                 metrics.scripted_events,
                 target,
-                metrics.last_event_sequence,
-                expected_sequence
+                expected_sequence.map(|sequence| metrics.last_event_sequence != sequence),
             );
         }
         std::thread::sleep(Duration::from_millis(25));
@@ -2307,6 +3205,7 @@ async fn scripted_transport(
     runtime: &dyn Runtime,
     monitor: &PortMonitor,
     control: &Arc<dyn DataChannel>,
+    input: &Arc<dyn DataChannel>,
     motion: &Arc<dyn DataChannel>,
     session_id: [u8; 16],
     client_fingerprint: [u8; 32],
@@ -2389,6 +3288,7 @@ async fn scripted_transport(
         let started = Instant::now();
         for repeat in 0..SUSTAIN_REPEAT_COUNT {
             let control_sequence = 2 + u64::from(repeat) * 4;
+            let input_sequence = INPUT_SEQUENCE_BASE + u64::from(repeat) * 3;
             send_heartbeat(
                 runtime,
                 control,
@@ -2405,11 +3305,11 @@ async fn scripted_transport(
             )
             .await?;
             send_hid_event(
-                control,
+                input,
                 event(
                     hid_protocol::KEYBOARD_STATE,
                     epoch,
-                    control_sequence + 1,
+                    input_sequence,
                     Event::KeyboardState {
                         modifiers: 2,
                         keys: vec![(7, 4)],
@@ -2418,21 +3318,21 @@ async fn scripted_transport(
             )
             .await?;
             send_hid_event(
-                control,
+                input,
                 event(
                     hid_protocol::MOUSE_BUTTONS,
                     epoch,
-                    control_sequence + 2,
+                    input_sequence + 1,
                     Event::MouseButtons { mask: 1 },
                 ),
             )
             .await?;
             send_hid_event(
-                control,
+                input,
                 event(
                     hid_protocol::WHEEL,
                     epoch,
-                    control_sequence + 3,
+                    input_sequence + 2,
                     Event::Wheel {
                         vertical: 1,
                         horizontal: -1,
@@ -2513,11 +3413,11 @@ async fn scripted_transport(
     )
     .await?;
     send_timed_hid_event(
-        control,
+        input,
         event(
             hid_protocol::KEYBOARD_STATE,
             epoch,
-            2 + offset,
+            INPUT_SEQUENCE_BASE,
             Event::KeyboardState {
                 modifiers: 2,
                 keys: vec![(7, 4)],
@@ -2530,22 +3430,22 @@ async fn scripted_transport(
         observer.check_focus()?;
     }
     send_timed_hid_event(
-        control,
+        input,
         event(
             hid_protocol::MOUSE_BUTTONS,
             epoch,
-            3 + offset,
+            INPUT_SEQUENCE_BASE + 1,
             Event::MouseButtons { mask: 1 },
         ),
         hid_timing.as_ref(),
     )
     .await?;
     send_timed_hid_event(
-        control,
+        input,
         event(
             hid_protocol::WHEEL,
             epoch,
-            4 + offset,
+            INPUT_SEQUENCE_BASE + 2,
             Event::Wheel {
                 vertical: 1,
                 horizontal: -1,
@@ -2554,7 +3454,7 @@ async fn scripted_transport(
         hid_timing.as_ref(),
     )
     .await?;
-    wait_for_scripted_telemetry(monitor, &telemetry_baseline, 4, 4 + offset)
+    wait_for_scripted_telemetry(monitor, &telemetry_baseline, 4 + u32::from(hid_bench), None)
         .context("control telemetry barrier")?;
     if hid_bench {
         wait_for_hid_reports(monitor, hid_baseline.context("missing report count")?, 4)?;
@@ -2573,7 +3473,7 @@ async fn scripted_transport(
         hid_timing.as_ref(),
     )
     .await?;
-    wait_for_scripted_telemetry(monitor, &telemetry_baseline, 5, 0)
+    wait_for_scripted_telemetry(monitor, &telemetry_baseline, 5, None)
         .context("motion telemetry barrier")?;
     if hid_bench {
         wait_for_hid_reports(monitor, hid_baseline.context("missing report count")?, 5)?;
@@ -2642,8 +3542,10 @@ struct TakeoverClient<'a> {
     label: &'static str,
     runtime: &'a dyn Runtime,
     control: &'a Arc<dyn DataChannel>,
+    input: &'a Arc<dyn DataChannel>,
     responses: ResponseCursor,
     sequence: u64,
+    input_sequence: u64,
     heartbeat_ack_supported: bool,
 }
 
@@ -2658,8 +3560,10 @@ impl<'a> TakeoverClient<'a> {
             label,
             runtime,
             control: &peer.control,
+            input: &peer.input,
             responses: ResponseCursor::new(peer.session.session_id()),
             sequence: 0,
+            input_sequence: INPUT_SEQUENCE_BASE,
             heartbeat_ack_supported,
         }
     }
@@ -2670,18 +3574,34 @@ impl<'a> TakeoverClient<'a> {
         epoch: u32,
         event: crate::hid_protocol::Event,
     ) -> Result<()> {
+        let is_input = matches!(
+            message_type,
+            crate::hid_protocol::KEYBOARD_STATE
+                | crate::hid_protocol::MOUSE_BUTTONS
+                | crate::hid_protocol::WHEEL
+        );
+        let channel = if is_input { self.input } else { self.control };
+        let sequence = if is_input {
+            self.input_sequence
+        } else {
+            self.sequence
+        };
         send_hid_event(
-            self.control,
+            channel,
             crate::hid_protocol::Envelope {
                 message_type,
                 session_id: self.responses.session_id,
                 lease_epoch: epoch,
-                sequence: self.sequence,
+                sequence,
                 event,
             },
         )
         .await?;
-        self.sequence += 1;
+        if is_input {
+            self.input_sequence += 1;
+        } else {
+            self.sequence += 1;
+        }
         Ok(())
     }
 
@@ -2928,7 +3848,7 @@ async fn exercise_takeover(
         monitor,
         &baseline,
         3 + u32::from(hid_baseline.is_some()),
-        a.sequence - 1,
+        None,
     )?;
     let held = monitor.fresh_snapshot()?;
     ensure!(
@@ -3064,7 +3984,7 @@ async fn exercise_takeover(
     );
     let heartbeat_baseline = monitor.fresh_snapshot()?;
     b.heartbeat(b_epoch).await?;
-    wait_for_scripted_telemetry(monitor, &heartbeat_baseline, 1, b.sequence - 1)?;
+    wait_for_scripted_telemetry(monitor, &heartbeat_baseline, 1, Some(b.sequence - 1))?;
     if hid_baseline.is_some() {
         b.send(hid::HID_BENCH_ARM, b_epoch, Event::HidBenchArm)
             .await?;
@@ -3310,7 +4230,7 @@ async fn run_cleanup_path(
         monitor,
         &before,
         3 + u32::from(before.hid_reports.is_some()),
-        2 + u64::from(before.hid_reports.is_some()),
+        None,
     )?;
     match path {
         CleanupPath::Disconnect => peer.close(&*runtime).await,
@@ -3940,6 +4860,293 @@ mod tests {
     use super::*;
 
     #[test]
+    fn pending_input_arm_leaves_heartbeat_and_takeover_to_the_session() {
+        let fingerprint = [7; 32];
+        let epoch = 4;
+        let arm = PendingInputArm {
+            epoch,
+            deadline: Instant::now(),
+            sequence: 41,
+            acknowledged: false,
+            handoff_requested: false,
+            cancelled: false,
+        };
+        let state = EndpointResponse::LeaseState {
+            owner: Some(fingerprint),
+            state: 1,
+        };
+        let notice = EndpointResponse::TakeoverNotice {
+            request_id: [1; 16],
+            requester: [2; 32],
+            response_window_ms: 30_000,
+        };
+        let stale = EndpointResponse::Error {
+            code: "stale_epoch".into(),
+        };
+        let refused = EndpointResponse::Error {
+            code: "invalid_capability".into(),
+        };
+        assert!(!arm.matches_reply(&state, epoch, Some(42), fingerprint));
+        assert!(!arm.matches_reply(&notice, epoch, None, fingerprint));
+        assert!(!arm.matches_reply(&stale, epoch, None, fingerprint));
+        assert!(!arm.matches_reply(&state, epoch + 1, None, fingerprint));
+        assert!(!arm.matches_reply(&state, epoch, None, fingerprint));
+        assert!(!arm.matches_reply(&refused, epoch, None, fingerprint));
+        assert!(arm.matches_reply(&state, epoch, Some(41), fingerprint));
+        assert!(arm.matches_reply(&refused, epoch, Some(41), fingerprint));
+        assert!(!arm.matches_reply(&state, epoch + 1, Some(41), fingerprint));
+    }
+
+    fn live_attempt(epoch: u32, sequence: u64) -> PendingInputArm {
+        PendingInputArm {
+            epoch,
+            sequence,
+            deadline: Instant::now(),
+            acknowledged: false,
+            handoff_requested: false,
+            cancelled: false,
+        }
+    }
+
+    #[test]
+    fn pending_escape_cancels_success_and_rejection_without_new_arm() {
+        for accepted in [false, true] {
+            let mut live = LiveInput {
+                arm: Some(live_attempt(3, 9)),
+                ..Default::default()
+            };
+            assert!(live.cancel_pending());
+            assert!(!live.cancel_pending());
+            assert!(!live.arm_reply(accepted));
+            assert!(live.arm.is_none());
+            assert!(!live.rearm_requested);
+            assert!(!live.complete_handoff(3, 9));
+        }
+        let mut live = LiveInput {
+            arm: Some(live_attempt(3, 9)),
+            ..Default::default()
+        };
+        assert!(!live.arm_reply(true));
+        live.arm.as_mut().unwrap().handoff_requested = true;
+        assert!(!live.complete_handoff(4, 9));
+        assert!(!live.complete_handoff(3, 8));
+        assert!(live.cancel_pending());
+        assert!(!live.complete_handoff(3, 9));
+    }
+
+    #[test]
+    fn cancellation_clears_drag_motion_and_pending_rearm_but_keeps_report_credit() {
+        let mut live = LiveInput {
+            report: Some((17, Instant::now())),
+            motion: (610, -360),
+            rearm_requested: true,
+            ..Default::default()
+        };
+        assert!(!live.cancel_pending());
+        assert!(live.report.is_some());
+        assert_eq!(live.motion, (0, 0));
+        assert!(!live.rearm_requested);
+    }
+
+    #[test]
+    fn heartbeat_replies_cannot_mint_report_or_disarm_credit() {
+        let mut live = LiveInput {
+            report: Some((17, Instant::now())),
+            ..Default::default()
+        };
+        assert!(!live.credit_reply(None));
+        assert!(!live.credit_reply(Some(18)));
+        assert!(live.report.is_some());
+        assert!(live.credit_reply(Some(17)));
+        assert!(live.report.is_none());
+        live.disarm = Some((19, Instant::now()));
+        assert!(!live.credit_reply(Some(17)));
+        assert!(live.credit_reply(Some(19)));
+        assert!(live.disarm.is_none());
+    }
+
+    #[test]
+    fn motion_preserves_displacement_across_ordered_report_credits() {
+        for samples in [125, 2000] {
+            let mut drag = (samples * 5, -samples * 3);
+            let mut endpoint = (0, 0);
+            while drag != (0, 0) {
+                let (dx, dy) = take_motion_chunk(&mut drag);
+                assert!((-127..=127).contains(&dx) && (-127..=127).contains(&dy));
+                endpoint.0 += i32::from(dx);
+                endpoint.1 += i32::from(dy);
+            }
+            assert_eq!(endpoint, (samples * 5, -samples * 3));
+        }
+    }
+
+    #[test]
+    fn rollover_keeps_oldest_six_and_promotes_held_key() {
+        use crate::hid_protocol::Event::KeyboardState;
+        let mut keyboard = HeldKeyboard::default();
+        for usage in (4..10).rev() {
+            assert!(keyboard.update(7, usage, true).is_some());
+        }
+        assert!(keyboard.update(7, 10, true).is_none());
+        assert!(keyboard.update(7, 10, false).is_none());
+        assert!(keyboard.update(7, 10, true).is_none());
+        assert!(keyboard.update(7, 4, true).is_none());
+        assert!(keyboard.update(7, 0xe4, true).is_some());
+        assert_eq!(
+            keyboard.update(7, 7, false),
+            Some(KeyboardState {
+                modifiers: 16,
+                keys: [4, 5, 6, 8, 9, 10]
+                    .into_iter()
+                    .map(|usage| (7, usage))
+                    .collect(),
+            })
+        );
+        for usage in [9, 8, 6, 5, 4, 10] {
+            assert!(keyboard.update(7, usage, false).is_some());
+        }
+        assert_eq!(
+            keyboard.update(7, 0xe4, false),
+            Some(KeyboardState {
+                modifiers: 0,
+                keys: vec![]
+            })
+        );
+    }
+
+    #[test]
+    #[ignore = "requires C fixture from firmware/test_live_input.py --fixture"]
+    fn firmware_rule_rearm_and_capture_handoff() -> Result<()> {
+        use crate::{
+            hid_protocol::{self as hid, Event},
+            input_capture::{InputEvent, TestCapture},
+        };
+        let fixture = std::fs::read(
+            std::env::var_os("KVMCTL_LIVE_FIXTURE").context("set KVMCTL_LIVE_FIXTURE")?,
+        )?;
+        let mut frames = fixture.as_slice();
+        let mut arm_reply = |attempt: u64| -> Result<(EndpointResponse, u32)> {
+            let size = u16::from_le_bytes(frames[..2].try_into()?) as usize;
+            let (frame, rest) = frames[2..].split_at(size);
+            frames = rest;
+            let mut expected_session = [0; 16];
+            expected_session[0] = 1;
+            let envelope = hid::decode(frame).map_err(|e| anyhow::anyhow!("{e:?}"))?;
+            assert_eq!(envelope.session_id, expected_session);
+            assert_eq!(
+                ResponseCursor::request_sequence(&envelope.event),
+                Some(attempt)
+            );
+            Ok((
+                ResponseCursor::response(envelope.event)?,
+                envelope.lease_epoch,
+            ))
+        };
+        let mut owner = [0; 32];
+        owner[0] = 1;
+        let mut live = LiveInput::default();
+        let mut capture = TestCapture::new();
+        let mut keyboard = HeldKeyboard::default();
+        let mut destinations = Vec::new();
+        for attempt in [2, 6] {
+            assert!(!capture.key(0xa2, 0x1d, false, true));
+            assert!(!capture.key(0xa0, 0x2a, false, true));
+            assert!(capture.key(0x79, 0x44, false, true));
+            assert!(capture.take_escape());
+            assert!(capture.key(0x79, 0x44, false, false));
+            live.arm = Some(live_attempt(1, attempt));
+            let (response, epoch) = arm_reply(attempt)?;
+            assert!(live.arm.as_ref().unwrap().matches_reply(
+                &response,
+                epoch,
+                Some(attempt),
+                owner
+            ));
+            assert!(!live.arm_reply(true));
+            capture.request_remote(attempt);
+            live.arm.as_mut().unwrap().handoff_requested = true;
+            assert_eq!(capture.complete_handoff(), None);
+            assert!(!capture.is_remote());
+            assert!(!capture.key(0xa0, 0x2a, false, false));
+            assert_eq!(capture.complete_handoff(), None);
+            assert!(!capture.key(0xa2, 0x1d, false, false));
+            assert!(live.complete_handoff(epoch, capture.complete_handoff().unwrap()));
+            assert!(capture.is_remote());
+            destinations.push(SessionEvent::InputRemoteConfirmed);
+            if attempt == 2 {
+                assert!(capture.key(0x41, 0x1e, false, true));
+                let Some(InputEvent::Key { page, usage, down }) = capture.next_event() else {
+                    panic!("missing held A")
+                };
+                assert_eq!(
+                    keyboard.update(page, usage, down),
+                    Some(Event::KeyboardState {
+                        modifiers: 0,
+                        keys: vec![(7, 4)]
+                    })
+                );
+                assert!(capture.key(0xa2, 0x1d, false, true));
+                assert!(capture.key(0xa0, 0x2a, false, true));
+                assert!(capture.key(0x79, 0x44, false, true));
+                assert!(capture.take_escape());
+                capture.local();
+                assert!(!capture.is_remote());
+                destinations.push(SessionEvent::InputLocalConfirmed);
+                assert!(capture.key(0x41, 0x1e, false, true));
+                assert!(capture.key(0x41, 0x1e, false, false));
+                assert!(capture.key(0x79, 0x44, false, false));
+                assert!(capture.key(0xa0, 0x2a, false, false));
+                assert!(capture.key(0xa2, 0x1d, false, false));
+                live.disarm = Some((4, Instant::now()));
+                assert_eq!(
+                    arm_reply(4)?,
+                    (
+                        EndpointResponse::LeaseState {
+                            owner: Some(owner),
+                            state: 1
+                        },
+                        1
+                    )
+                );
+                assert!(live.credit_reply(Some(4)));
+                assert!(live.disarm.is_none());
+            }
+        }
+        assert!(matches!(
+            destinations.as_slice(),
+            [
+                SessionEvent::InputRemoteConfirmed,
+                SessionEvent::InputLocalConfirmed,
+                SessionEvent::InputRemoteConfirmed,
+            ]
+        ));
+        assert!(frames.is_empty());
+        Ok(())
+    }
+
+    #[test]
+    fn failed_capture_is_terminal_at_the_reconnect_boundary() {
+        let control = SessionControl::new();
+        let (capture, events) = crate::input_capture::Capture::exited_for_test();
+        *control.input.lock().unwrap() = Some(InputState {
+            capture,
+            events,
+            motion_rate_hz: crate::settings::DEFAULT_MOTION_RATE_HZ,
+            mode: SessionMode::Tray,
+            remote: true,
+            epoch: Some(3),
+            keyboard: HeldKeyboard::default(),
+            buttons: 1,
+        });
+        assert!(control.check_input_health().is_err());
+        assert!(control.next_input_event().is_err());
+        assert!(control.input_set_local().unwrap());
+        assert!(!control.input_set_local().unwrap());
+        control.input_fail_closed();
+        assert!(control.check_input_health().is_err());
+    }
+
+    #[test]
     fn recovery_cancellation_does_not_wait_for_discovery() {
         let control = SessionControl::new();
         let worker_control = control.clone();
@@ -4151,6 +5358,7 @@ mod tests {
             lease_epoch: 0,
             sequence: 0,
             event: crate::hid_protocol::Event::Error {
+                request_sequence: None,
                 code: "busy".to_owned(),
             },
         };

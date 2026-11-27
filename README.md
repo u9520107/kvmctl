@@ -44,6 +44,32 @@ cargo run --locked -p kvmctl
 For USB administration, connect the board's USB-UART port and confirm Windows
 assigns it a COM port. See the [client README](client/README.md) for commands.
 
+Live input is enabled by default with the current Windows capture backend;
+input remains local until the configured shortcut is pressed. See the
+[host regression and interactive checks](docs/evidence.md#m23-live-input-review-verification-2026-11-27).
+
+Live input uses three fixed channels: reliable ordered `control` for lease,
+heartbeat, and session transitions; reliable ordered `input` for keyboard,
+button, and wheel state; and unordered `motion` for relative mouse deltas.
+The former `input_route` setting is no longer used; legacy records are ignored
+and disappear when settings are rewritten.
+
+Motion cadence defaults to 125 Hz. Change it without recompiling:
+
+```powershell
+cargo run --locked --offline -p kvmctl -- settings motion-rate set 125
+```
+
+Use `settings motion-rate list` to inspect the active value and `reset` to
+restore 125 Hz.
+
+Keyboard remapping is deferred. On keyboards whose Copilot key emits
+`Win+Shift+F23`, bind the physical key as a kvmctl escape shortcut:
+
+```powershell
+cargo run --locked -p kvmctl -- settings escape add COPILOT
+```
+
 ## ESP32-S3 firmware
 
 Build from Windows PowerShell with ESP-IDF 6.1.1 for `esp32s3`, the pinned

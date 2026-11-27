@@ -3,12 +3,15 @@
 Compile the production decoder, without ESP-IDF dependencies, in a temporary
 directory. No firmware image or Windows executable is produced.
 """
+import ctypes
 from pathlib import Path
 import subprocess
+import sys
 import tempfile
 
 
-source = (Path(__file__).parent / "main/usb_admin.c").read_text()
+root = Path(__file__).resolve().parent
+source = (root / "main/usb_admin.c").read_text()
 decoder = source[source.index("#define ADMIN_UART"):source.index("static uint8_t s_request")]
 decoder += source[source.index("static bool read_head"):source.index("static bool put_head")]
 harness = r"""
@@ -36,7 +39,11 @@ static void check(const uint8_t *payload, size_t len, request_decode_result_t ex
 }
 #define CHECK(expected, ...) do { const uint8_t p[] = {__VA_ARGS__}; \
     check(p, sizeof(p), expected, 2, 0); check(p, sizeof(p), expected, 1, 1); } while (0)
+#ifdef _WIN32
+__declspec(dllexport) void run_checks(void)
+#else
 int main(void)
+#endif
 {
     const uint8_t empty_map[] = {0xa0};
     check(empty_map, 1, REQUEST_SUPPORTED, 1, 0);
@@ -74,9 +81,21 @@ int main(void)
     check(empty_map, 0, REQUEST_INVALID, 2, 0);
 }
 """.replace("DECODER", decoder)
-with tempfile.TemporaryDirectory() as temp:
+build = root / "build"
+build.mkdir(exist_ok=True)
+with tempfile.TemporaryDirectory(prefix="usb-admin-test-", dir=build) as temp:
     path = Path(temp)
     (path / "test.c").write_text(harness)
-    subprocess.run(["cc", "-std=c11", "-Wall", "-Wextra", "-Werror", str(path / "test.c"), "-o", str(path / "test")], check=True)
-    subprocess.run([str(path / "test")], check=True)
+    if sys.platform == "win32":
+        library = path / "test.dll"
+        subprocess.run(["cl", "/nologo", "/std:c11", "/LD", "test.c",
+                        "/Fe:" + str(library)], cwd=path, check=True)
+        loaded = ctypes.CDLL(str(library))
+        loaded.run_checks.restype = None
+        loaded.run_checks()
+        ctypes.windll.kernel32.FreeLibrary(ctypes.c_void_p(loaded._handle))
+    else:
+        subprocess.run(["cc", "-std=c11", "-Wall", "-Wextra", "-Werror",
+                        "test.c", "-o", "test"], cwd=path, check=True)
+        subprocess.run([str(path / "test")], check=True)
 print("USB decoder regression checks passed")

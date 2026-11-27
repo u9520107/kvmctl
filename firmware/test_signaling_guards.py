@@ -22,7 +22,7 @@ def function(source: str, name: str) -> str:
     return source[start:end]
 
 
-root = Path(__file__).parent
+root = Path(__file__).resolve().parent
 transport = (root / "main/transport.c").read_text()
 signaling = (root / "main/signaling.c").read_text()
 client_auth = (root / "main/client_auth.c").read_text()
@@ -89,6 +89,8 @@ static unsigned int waits;
 static bool s_ready = true;
 static bool s_revoke_persistence_pending;
 static int s_lock;
+static void recovery_storage_write_lock(void) {}
+static void recovery_storage_write_unlock(void) {}
 static struct { unsigned int count; uint8_t spki[CLIENT_AUTH_MAX_CLIENTS][CLIENT_AUTH_SPKI_BYTES]; } s_store;
 static esp_err_t persist_error = ESP_FAIL;
 static unsigned int persist_calls, signaling_invalidations;
@@ -137,7 +139,7 @@ int run_checks(void) {
     CHECK(find_offer_slot(client_a, &any_active) == NULL && any_active);
     CHECK(find_offer_slot(client_b, &any_active) == peer_b && any_active);
 
-    peer_a->open_channels = 2;
+    peer_a->open_channels = 3;
     on_state(ESP_PEER_STATE_DATA_CHANNEL_DISCONNECTED, peer_a);
     CHECK(peer_a->close_requested && !peer_a->failed);
     peer_a->close_requested = false;
@@ -160,7 +162,7 @@ int run_checks(void) {
     peer_a->active = true; peer_a->generation = 3; peer_a->client_fingerprint[0] = 1;
     peer_b->active = true; peer_b->generation = 2; peer_b->client_fingerprint[0] = 2;
     peer_a->application_authorized = peer_b->application_authorized = true;
-    peer_a->open_channels = peer_b->open_channels = 2;
+    peer_a->open_channels = peer_b->open_channels = 3;
     CHECK(transport_client_session_active(client_a, 3));
     CHECK(transport_client_session_active(client_b, 2));
     CHECK(!transport_client_session_active(client_a, 1));
@@ -183,7 +185,7 @@ int run_checks(void) {
     CHECK(transport_authorize_client(client_b, 2) == ESP_OK && peer_b->application_authorized);
     peer_b->application_authorized = false; peer_b->open_channels = 1;
     CHECK(transport_authorize_client(client_b, 2) == ESP_ERR_INVALID_STATE && !peer_b->application_authorized);
-    peer_b->open_channels = 2; peer_b->identity_rejected = true;
+    peer_b->open_channels = 3; peer_b->identity_rejected = true;
     CHECK(transport_authorize_client(client_b, 2) == ESP_ERR_INVALID_STATE && !peer_b->application_authorized);
     peer_b->identity_rejected = false; enrolled = false;
     CHECK(transport_authorize_client(client_b, 2) == ESP_ERR_INVALID_STATE && !peer_b->application_authorized);
@@ -234,7 +236,9 @@ parser = argparse.ArgumentParser()
 parser.add_argument("--clang", default="clang")
 parser.add_argument("--msvc", help="path to MSVC cl.exe (Windows alternative to clang/lld)")
 args = parser.parse_args()
-with tempfile.TemporaryDirectory(prefix="kvmctl-signaling-guards-") as temp:
+build = root / "build"
+build.mkdir(exist_ok=True)
+with tempfile.TemporaryDirectory(prefix="signaling-guards-", dir=build) as temp:
     temp = Path(temp)
     source = temp / "guards.c"
     source.write_text(harness)

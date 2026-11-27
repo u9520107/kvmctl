@@ -11,11 +11,15 @@ mod flash;
 #[cfg(windows)]
 mod hid_protocol;
 #[cfg(windows)]
+mod input_capture;
+#[cfg(windows)]
 mod osd;
 #[cfg(windows)]
 mod protocol;
 #[cfg(windows)]
 mod raw_input;
+#[cfg(windows)]
+mod settings;
 #[cfg(windows)]
 mod signaling;
 #[cfg(windows)]
@@ -1825,6 +1829,14 @@ fn target_service(
     manual_address: Option<std::net::Ipv4Addr>,
 ) -> Result<discovery::Service, String> {
     if let Some(address) = manual_address {
+        if let Some(mut service) = discovery::discover_target(&target.endpoint_fingerprint)? {
+            service.ipv4 = Some(address);
+            println!(
+                "Using manual IPv4 {address} with verified DNS-SD capabilities and pinned certificate name {}.",
+                discovery::endpoint_hostname(&target.endpoint_fingerprint)
+            );
+            return Ok(service);
+        }
         println!(
             "Using manual IPv4 {address} with pinned certificate name {}.",
             discovery::endpoint_hostname(&target.endpoint_fingerprint)
@@ -1847,6 +1859,64 @@ fn target_service(
 #[cfg(windows)]
 fn run_target_command(args: &[String]) -> Result<(), String> {
     let command = args.first().map(String::as_str).unwrap_or_default();
+    if command == "settings" {
+        if args.get(1).map(String::as_str) == Some("motion-rate") {
+            let action = args.get(2).map(String::as_str).unwrap_or("list");
+            match action {
+                "list" if args.len() == 3 => {
+                    println!("{}", settings::load_motion_rate_hz()?);
+                }
+                "set" if args.len() == 4 => {
+                    let rate = args[3]
+                        .parse::<u32>()
+                        .map_err(|_| "motion rate must be an integer".to_owned())?;
+                    settings::save_motion_rate_hz(rate)?;
+                }
+                "reset" if args.len() == 3 => {
+                    settings::save_motion_rate_hz(settings::default_motion_rate_hz())?;
+                }
+                _ => {
+                    return Err("usage: kvmctl settings motion-rate list|set <hz>|reset".into());
+                }
+            }
+            return Ok(());
+        }
+        if args.get(1).map(String::as_str) != Some("escape") {
+            return Err("usage: kvmctl settings escape ... | motion-rate ...".into());
+        }
+        let action = args.get(2).map(String::as_str).unwrap_or("list");
+        match action {
+            "list" if args.len() == 3 => {
+                for binding in settings::load_escape_bindings()? {
+                    println!("{}", binding.display());
+                }
+            }
+            "add" if args.len() == 4 => {
+                let binding = settings::EscapeBinding::parse(&args[3])?;
+                let mut bindings = settings::load_escape_bindings()?;
+                if !bindings.contains(&binding) {
+                    bindings.push(binding);
+                    settings::save_escape_bindings(&bindings)?;
+                }
+            }
+            "remove" if args.len() == 4 => {
+                let binding = settings::EscapeBinding::parse(&args[3])?;
+                let mut bindings = settings::load_escape_bindings()?;
+                bindings.retain(|candidate| candidate != &binding);
+                settings::save_escape_bindings(&bindings)?;
+            }
+            "reset" if args.len() == 3 => {
+                settings::save_escape_bindings(&settings::default_escape_bindings())?
+            }
+            _ => {
+                return Err(
+                    "usage: kvmctl settings escape list|add <binding>|remove <binding>|reset"
+                        .into(),
+                );
+            }
+        }
+        return Ok(());
+    }
     if command == "targets" || (command == "target" && args.get(1).is_some_and(|v| v == "list")) {
         let saved = targets::load()?;
         if saved.is_empty() {
@@ -1984,7 +2054,7 @@ fn run_target_command(args: &[String]) -> Result<(), String> {
         );
         return Ok(());
     }
-    Err("usage: kvmctl targets | target list | target save [COMx] <name> [IPv4] | target remove <name> | session <target> [IPv4]".into())
+    Err("usage: kvmctl targets | target list | target save [COMx] <name> [IPv4] | target remove <name> | settings escape list|add <binding>|remove <binding>|reset | settings motion-rate list|set <hz>|reset | session <target> [IPv4]".into())
 }
 
 #[cfg(windows)]
@@ -1996,11 +2066,12 @@ fn run() -> Result<(), String> {
     let command = args.first().map(String::as_str).unwrap_or("status");
     if command == "--help" || command == "-h" {
         println!(
-            "kvmctl [ports | status [COMx] | telemetry [COMx] | wifi [COMx] | wifi-test [COMx] | enroll [COMx] [takeover] | clients [COMx] | revoke [COMx] <fingerprint|all> | discover [COMx] | targets | target list | target save [COMx] <name> [IPv4] | target remove <name> | session <target> [IPv4] | signaling-test [COMx] [scenario [IPv4] | IPv4] | led [COMx] on|off <brightness> <RRGGBB> | transport-test [COMx] | flash [COMx] <firmware.bin> <backup.bin>]; signaling-test takeover-request uses takeover identity; KVMCTL_LOG=debug enables diagnostics; log file defaults to %LOCALAPPDATA%\\kvmctl\\kvmctl.log"
+            "kvmctl [ports | status [COMx] | telemetry [COMx] | wifi [COMx] | wifi-test [COMx] | enroll [COMx] [takeover] | clients [COMx] | revoke [COMx] <fingerprint|all> | discover [COMx] | targets | target list | target save [COMx] <name> [IPv4] | target remove <name> | settings escape list|add <binding>|remove <binding>|reset | session <target> [IPv4] | signaling-test [COMx] [scenario [IPv4] | IPv4] | led [COMx] on|off <brightness> <RRGGBB> | transport-test [COMx] | flash [COMx] <firmware.bin> <backup.bin>]; escape default CTRL+SHIFT+F10; signaling-test takeover-request uses takeover identity; KVMCTL_LOG=debug enables diagnostics; log file defaults to %LOCALAPPDATA%\\kvmctl\\kvmctl.log"
         );
         return Ok(());
     }
-    if command == "targets" || command == "session" || command == "target" {
+    if command == "targets" || command == "session" || command == "target" || command == "settings"
+    {
         return run_target_command(&args);
     }
     let ports = serial::enumerate()?;

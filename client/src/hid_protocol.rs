@@ -14,6 +14,8 @@ pub const TAKEOVER_NOTICE: u64 = 0x25;
 pub const ERROR: u64 = 0x26;
 pub const LEASE_RELEASE: u64 = 0x27;
 pub const HID_BENCH_ARM: u64 = 0x28;
+pub const LIVE_INPUT_ARM: u64 = 0x29;
+pub const LIVE_INPUT_DISARM: u64 = 0x2a;
 pub const KEYBOARD_STATE: u64 = 0x30;
 pub const MOUSE_BUTTONS: u64 = 0x31;
 pub const WHEEL: u64 = 0x32;
@@ -52,9 +54,12 @@ pub enum Event {
     },
     Error {
         code: String,
+        request_sequence: Option<u64>,
     },
     LeaseRelease,
     HidBenchArm,
+    LiveInputArm,
+    LiveInputDisarm,
     KeyboardState {
         modifiers: u8,
         keys: Vec<(u16, u16)>,
@@ -255,7 +260,11 @@ pub fn encode(envelope: &Envelope) -> Vec<u8> {
                 out.push(0xf5);
             }
         }
-        Event::Heartbeat | Event::LeaseRelease | Event::HidBenchArm => put_head(&mut out, 5, 0),
+        Event::Heartbeat
+        | Event::LeaseRelease
+        | Event::HidBenchArm
+        | Event::LiveInputArm
+        | Event::LiveInputDisarm => put_head(&mut out, 5, 0),
         Event::TakeoverRequest { request_id } => {
             put_head(&mut out, 5, 1);
             field(&mut out, 0);
@@ -336,11 +345,18 @@ pub fn encode(envelope: &Envelope) -> Vec<u8> {
             field(&mut out, 2);
             uint(&mut out, *response_window_ms);
         }
-        Event::Error { code } => {
-            put_head(&mut out, 5, 1);
+        Event::Error {
+            code,
+            request_sequence,
+        } => {
+            put_head(&mut out, 5, if request_sequence.is_some() { 2 } else { 1 });
             field(&mut out, 0);
             put_head(&mut out, 3, code.len() as u64);
             out.extend_from_slice(code.as_bytes());
+            if let Some(sequence) = request_sequence {
+                field(&mut out, 1);
+                uint(&mut out, *sequence);
+            }
         }
     }
     out
@@ -385,11 +401,13 @@ fn payload(reader: &mut Reader<'_>, message_type: u64) -> Result<Event, DecodeEr
                 heartbeat_ack_supported,
             })
         }
-        HEARTBEAT | LEASE_RELEASE | HID_BENCH_ARM => {
+        HEARTBEAT | LEASE_RELEASE | HID_BENCH_ARM | LIVE_INPUT_ARM | LIVE_INPUT_DISARM => {
             reader.map(0)?;
             Ok(match message_type {
                 HEARTBEAT => Event::Heartbeat,
                 LEASE_RELEASE => Event::LeaseRelease,
+                LIVE_INPUT_ARM => Event::LiveInputArm,
+                LIVE_INPUT_DISARM => Event::LiveInputDisarm,
                 _ => Event::HidBenchArm,
             })
         }
@@ -504,7 +522,10 @@ fn payload(reader: &mut Reader<'_>, message_type: u64) -> Result<Event, DecodeEr
             })
         }
         ERROR => {
-            reader.map(1)?;
+            let fields = reader.head(5)?;
+            if !matches!(fields, 1 | 2) {
+                return Err(DecodeError::WrongFieldCount);
+            }
             if reader.uint()? != 0 {
                 return Err(DecodeError::UnknownKey);
             }
@@ -525,7 +546,18 @@ fn payload(reader: &mut Reader<'_>, message_type: u64) -> Result<Event, DecodeEr
             ) {
                 return Err(DecodeError::InvalidValue);
             }
-            Ok(Event::Error { code })
+            let request_sequence = if fields == 2 {
+                if reader.uint()? != 1 {
+                    return Err(DecodeError::UnknownKey);
+                }
+                Some(reader.uint()?)
+            } else {
+                None
+            };
+            Ok(Event::Error {
+                code,
+                request_sequence,
+            })
         }
         KEYBOARD_STATE => {
             reader.map(2)?;
@@ -856,6 +888,8 @@ mod tests {
                 Event::Error { .. } => ERROR,
                 Event::LeaseRelease => LEASE_RELEASE,
                 Event::HidBenchArm => HID_BENCH_ARM,
+                Event::LiveInputArm => LIVE_INPUT_ARM,
+                Event::LiveInputDisarm => LIVE_INPUT_DISARM,
                 Event::KeyboardState { .. } => KEYBOARD_STATE,
                 Event::MouseButtons { .. } => MOUSE_BUTTONS,
                 Event::Wheel { .. } => WHEEL,
@@ -996,6 +1030,7 @@ mod tests {
             },
             Event::Error {
                 code: "busy".into(),
+                request_sequence: None,
             },
         ] {
             let message_type = match &event {

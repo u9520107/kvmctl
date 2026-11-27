@@ -19,6 +19,7 @@ pub(crate) enum TrayState {
     Starting,
     Connecting,
     ConnectedLocal,
+    RemoteControl,
     ConnectionDegraded,
     OwnershipPending,
     Recovering,
@@ -26,11 +27,12 @@ pub(crate) enum TrayState {
     OwnershipLost,
 }
 
-const STATES: [TrayState; 9] = [
+const STATES: [TrayState; 10] = [
     TrayState::NoTarget,
     TrayState::Starting,
     TrayState::Connecting,
     TrayState::ConnectedLocal,
+    TrayState::RemoteControl,
     TrayState::ConnectionDegraded,
     TrayState::OwnershipPending,
     TrayState::Recovering,
@@ -80,11 +82,12 @@ impl TrayState {
             Self::Starting => 1,
             Self::Connecting => 2,
             Self::ConnectedLocal => 3,
-            Self::ConnectionDegraded => 4,
-            Self::OwnershipPending => 5,
-            Self::Recovering => 6,
-            Self::Unavailable => 7,
-            Self::OwnershipLost => 8,
+            Self::RemoteControl => 4,
+            Self::ConnectionDegraded => 5,
+            Self::OwnershipPending => 6,
+            Self::Recovering => 7,
+            Self::Unavailable => 8,
+            Self::OwnershipLost => 9,
         }
     }
 }
@@ -247,6 +250,23 @@ fn create_icon(size: usize, state: TrayState) -> Result<HICON, String> {
         TrayState::ConnectedLocal => canvas.badge(accent, GREEN),
         TrayState::Connecting => canvas.badge(accent, AMBER),
         TrayState::ConnectionDegraded => canvas.badge(accent, AMBER),
+        TrayState::RemoteControl => {
+            canvas.badge(accent, VIOLET);
+            if size >= 24 {
+                canvas.line(
+                    (canvas.scale(24), canvas.scale(11)),
+                    (canvas.scale(30), canvas.scale(17)),
+                    accent_width,
+                    VIOLET,
+                );
+                canvas.line(
+                    (canvas.scale(30), canvas.scale(17)),
+                    (canvas.scale(24), canvas.scale(17)),
+                    accent_width,
+                    VIOLET,
+                );
+            }
+        }
         TrayState::OwnershipPending => canvas.badge(accent, VIOLET),
         TrayState::Recovering => {
             canvas.badge(accent, AMBER);
