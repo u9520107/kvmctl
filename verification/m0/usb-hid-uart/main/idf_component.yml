@@ -1,5 +1,0 @@
-dependencies:
-  espressif/esp_tinyusb:
-    version: "2.4.0"
-  espressif/mdns:
-    version: "1.14.0"

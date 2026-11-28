@@ -1,7 +1,0 @@
-dependencies:
-  idf: "==6.1.1"
-  espressif/esp_peer:
-    version: "==1.5.3"
-    override_path: "${KVMCTL_PEER_SOURCE}"
-  espressif/esp_libsrtp:
-    version: "==1.0.0"

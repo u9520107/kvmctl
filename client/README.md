@@ -1,8 +1,13 @@
 # Windows USB client
 
+This document covers original kvmctl Windows-client code and commands. Firmware
+components, imported peer code, and probe examples retain separate notices in
+the repository [third-party notices](../THIRD_PARTY_NOTICES.md).
+
 See the [Windows prerequisites](../README.md#windows-client). From the workspace
-root in Windows PowerShell, run `cargo run --locked -p kvmctl` to open the native
-control window. It identifies supported USB-UART boards through Plug and Play,
+root in Windows PowerShell, run `cargo run --locked --bin kvmctl-tray` to open
+the native control window. Run `cargo run --locked -p kvmctl -- <command>` for
+CLI commands. The client identifies supported USB-UART boards through Plug and Play,
 shows firmware/network/RGB status, provisions Wi-Fi with a masked passphrase
 field, and saves RGB settings. Credentials travel only over USB and are never
 logged or returned.

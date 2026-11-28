@@ -4,29 +4,22 @@ Native Windows client and ESP32-S3 firmware for a KVM controller. The client
 uses the board's USB-UART port for administration and Wi-Fi setup. See the
 [planning index](docs/plan.md) for architecture, milestones, and test evidence.
 
-## Optional WSL development
+Original kvmctl code is MIT-licensed. Imported firmware keeps its upstream
+notices in [THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md).
 
-WSL is optional for Linux-only host checks. Windows PowerShell is the primary
-ESP32-S3 firmware build environment; do not move the checkout into WSL for
-normal firmware builds. See [Microsoft's WSL setup guide](https://learn.microsoft.com/en-us/windows/wsl/setup/environment)
+## Host regression
 
-On Ubuntu, install the host-check dependencies:
+From the repository root in an x64 Visual Studio Developer PowerShell:
 
-```sh
-sudo apt update
-sudo apt install git python3 build-essential clang binutils
+```powershell
+powershell.exe -NoProfile -ExecutionPolicy Bypass -File .\scripts\test-host.ps1
 ```
 
-From the repository root:
-
-```sh
-python3 firmware/test_usb_admin.py
-python3 firmware/test_signaling_guards.py
-```
-
-Rust is optional in WSL for editing or formatting client code. Use Windows
-for client builds, tests, and COM-port access. See the
-[firmware host checks](firmware/README.md#host-side-firmware-guard-test).
+The same command runs all seven firmware host checks, generates its live-input
+fixture under `firmware/build/`, runs the ignored Rust fixture handoff test,
+and runs the locked Rust workspace suite. On Windows, use an x64 Visual Studio
+Developer PowerShell so missing `cl.exe`/`link.exe` is reported before checks
+start. It never builds or flashes firmware and never runs hardware checks.
 
 ## Windows client
 
@@ -38,7 +31,7 @@ From the repository root in PowerShell:
 
 ```powershell
 cargo check --workspace --tests --locked
-cargo run --locked -p kvmctl
+cargo run --locked --bin kvmctl-tray
 ```
 
 For USB administration, connect the board's USB-UART port and confirm Windows
@@ -69,6 +62,22 @@ Keyboard remapping is deferred. On keyboards whose Copilot key emits
 ```powershell
 cargo run --locked -p kvmctl -- settings escape add COPILOT
 ```
+
+## Portable Windows package
+
+From a Windows PowerShell with Rust, MSVC, and the Windows SDK installed:
+
+```powershell
+.\scripts\package.ps1
+powershell -ExecutionPolicy Bypass -File .\scripts\install.ps1
+```
+
+`package.ps1` creates a versioned portable package containing the CLI and
+tray binaries under `dist`. `install.ps1`
+installs the newest complete package into `%USERPROFILE%\tools\kvmctl`, adds
+that directory to the user `PATH`, creates a login-startup shortcut, and starts
+the client. Use `-NoStart`, `-NoStartup`, or `-InstallDirectory <path>` to
+change those defaults. Installation does not build source code.
 
 ## ESP32-S3 firmware
 

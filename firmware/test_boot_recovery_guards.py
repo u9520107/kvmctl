@@ -1,4 +1,4 @@
-"""Static guards for M1.5 reset timing, erase scope, and USB recovery wiring."""
+"""Static guards for BOOT reset timing, erase scope, and USB recovery wiring."""
 
 from pathlib import Path
 
@@ -28,4 +28,4 @@ for name, source in writers.items():
 assert '"recover"' in client
 assert "ClientCredential::generate()" in client
 assert "install_replacement(false)" in client
-print("M1.5 recovery timing, erase scope, and USB recovery guards passed")
+print("BOOT recovery timing, erase scope, and USB recovery guards passed")

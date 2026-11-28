@@ -17,34 +17,35 @@ snapshot. A cached `esp_libsrtp` component may still be supplied through
 ```powershell
 $env:PYTHONUTF8 = '1'
 powershell.exe -NoProfile -ExecutionPolicy Bypass -File .\firmware\build-transport.ps1
-certutil -hashfile .\firmware\build\kvmctl_firmware.bin SHA256
+certutil -hashfile .\firmware\build\windows-production\kvmctl_firmware.bin SHA256
 ```
 
-The script verifies the vendored Mini peer's SDP fingerprint enforcement and
-builds `firmware\build\kvmctl_firmware.bin`. The first build may fetch
+The script verifies ESP-IDF `v6.1.1`, uses the checked-in Mini peer source and
+builds `firmware\build\windows-production\kvmctl_firmware.bin`. The first build may fetch
 pinned components from the ESP Component Registry. The build does not flash a
 board.
 
 ## Scripted USB HID bench
 
 Use the same Windows setup with an explicit bench build. Copy the normal image
-first if it must be retained; the bench build reuses `firmware\build`.
+first if it must be retained; the bench build uses its own directory under
+`firmware\build`.
 
 ```powershell
-Copy-Item .\firmware\build\kvmctl_firmware.bin .\firmware\build\kvmctl_firmware-normal.bin
+Copy-Item .\firmware\build\windows-production\kvmctl_firmware.bin .\firmware\build\windows-production\kvmctl_firmware-normal.bin
 $env:PYTHONUTF8 = '1'
 $env:KVMCTL_HID_BENCH = '1'
 try {
-    powershell.exe -NoProfile -ExecutionPolicy Bypass -File .\firmware\build-transport.ps1
+    powershell.exe -NoProfile -ExecutionPolicy Bypass -File .\firmware\build-transport.ps1 -BuildDirectory .\firmware\build\windows-hid-bench
 } finally {
     Remove-Item Env:KVMCTL_HID_BENCH -ErrorAction SilentlyContinue
 }
-certutil -hashfile .\firmware\build\kvmctl_firmware.bin SHA256
+certutil -hashfile .\firmware\build\windows-hid-bench\kvmctl_firmware.bin SHA256
 ```
 
 For a build without registry access, set `KVMCTL_HID_BENCH_COMPONENTS` to a directory containing
-the pinned `espressif__esp_tinyusb` and `espressif__tinyusb` components from the
-M0 HID probe. Copy the bench app to the Windows build directory and use
+the pinned `espressif__esp_tinyusb` and `espressif__tinyusb` components. Copy the
+bench app to the Windows build directory and use
 `kvmctl flash` with a fresh backup path. The bench image enumerates a USB
 keyboard and mouse. It emits script reports only for the current authenticated
 lease after an explicit arm request. See the [Windows client bench command](../client/README.md#scripted-usb-hid-bench).
@@ -93,7 +94,7 @@ root and replace `COMx` with the already recognized board port:
 
 ```powershell
 cargo run -p kvmctl -- ports
-cargo run -p kvmctl -- flash COMx .\firmware\build\kvmctl_firmware.bin .\firmware\backups\factory-app-backup.bin
+cargo run -p kvmctl -- flash COMx .\firmware\build\windows-production\kvmctl_firmware.bin .\firmware\backups\factory-app-backup.bin
 cargo run -p kvmctl -- transport-test COMx
 ```
 
@@ -161,43 +162,22 @@ maximum board event-processing time, and maximum response-queue residence.
 These CPU and timing values use the ESP Timer runtime clock and are local to
 the measured transport session.
 
-Fixture mode is available only through `transport-test`. These public test
-keys remain on the Windows host and must never be installed on a device or used
-for enrollment. To calculate the old A fingerprint in SDP format:
+## Host-side firmware regression
+
+Run the complete host-only regression from an x64 Visual Studio Developer
+PowerShell at repository root:
 
 ```powershell
-$fixtures = Get-Content .\verification\m0\peer-fingerprint\fixtures\manifest.json -Raw | ConvertFrom-Json
-$fingerprintA = $fixtures.fixtures.certificate_a.certificate_der_sha256 -replace '([0-9a-fA-F]{2})(?=.)', '$1:'
+.\scripts\test-host.ps1
 ```
 
-Run matching-fingerprint baselines with fixture A and fixture B presented by
-Windows. In each run, the ESP32 verifies the presented fixture and Windows
-verifies the ESP32's generated certificate. Both should exchange payloads,
-close after the conflicting-SDP check, reconnect, then close on malformed SDP:
-
-```powershell
-$env:KVMCTL_TEST_CERT = '.\verification\m0\peer-fingerprint\fixtures\certificate_a.rtc.pem'
-cargo run -p kvmctl -- transport-test COMx
-$env:KVMCTL_TEST_CERT = '.\verification\m0\peer-fingerprint\fixtures\certificate_b.rtc.pem'
-cargo run -p kvmctl -- transport-test COMx
-Remove-Item Env:KVMCTL_TEST_CERT
-```
-
-For the ESP32 receiving-path negatives, set `KVMCTL_TEST_EXPECTED_FINGERPRINT`
-to `$fingerprintA` and use certificate B, then renewed A. The board must report
-an explicit fingerprint rejection before opening either channel. For the
-Windows receiving-path negative, set `KVMCTL_TEST_REMOTE_FINGERPRINT` to
-`$fingerprintA`; after a valid baseline, the client must report the explicit
-verifier rejection with zero opened channels and zero application messages.
-The board's production certificate is tested against fixture A; fixture keys
-are never installed on hardware. `KVMCTL_TEST_OFFER_FINGERPRINT_FAULT` and
-`KVMCTL_TEST_ANSWER_FINGERPRINT_FAULT` accept `missing`, `malformed`, or
-`duplicate` to exercise fail-closed SDP handling. Clear all `KVMCTL_TEST_*`
-environment variables after each run. Each negative run must be preceded by
-its valid matching baseline; timeout, missing valid baseline, or a generic
-connection failure is inconclusive.
-
-## Host-side firmware guard test
+This runs all seven firmware checks, writes
+`firmware\build\host-regression\live-input-fixture.bin`, sets
+`KVMCTL_LIVE_FIXTURE`, explicitly runs the ignored
+`firmware_rule_rearm_and_capture_handoff` test, and runs the locked Rust
+workspace suite. Use `-Online` only when locked dependencies are not available
+offline. The runner fails early with the missing compiler prerequisite instead
+of silently omitting C-backed checks. Hardware checks remain opt-in below.
 
 `test_signaling_guards.py` runs selected production C functions on the host. It
 uses Python's standard library to compile and load a temporary shared library;
@@ -238,7 +218,7 @@ From the workspace root in PowerShell, build the test image:
 ```powershell
 $env:KVMCTL_TEST_REVOKE_PERSIST_FAIL_ONCE = '1'
 try {
-    powershell.exe -NoProfile -ExecutionPolicy Bypass -File .\firmware\build-transport.ps1
+powershell.exe -NoProfile -ExecutionPolicy Bypass -File .\firmware\build-transport.ps1
     if ($LASTEXITCODE -ne 0) { throw 'Test firmware build failed.' }
 } finally {
     Remove-Item Env:KVMCTL_TEST_REVOKE_PERSIST_FAIL_ONCE -ErrorAction SilentlyContinue

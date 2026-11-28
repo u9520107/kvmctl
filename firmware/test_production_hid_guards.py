@@ -9,7 +9,6 @@ project = (ROOT / "CMakeLists.txt").read_text()
 main_cmake = (ROOT / "main" / "CMakeLists.txt").read_text()
 hid = (ROOT / "hid_bench" / "hid_bench.c").read_text()
 signaling = (ROOT / "main" / "signaling.c").read_text()
-build_script = (ROOT / "build-transport.sh").read_text()
 
 assert "#ifdef KVMCTL_HID_BENCH" not in transport
 assert "#if defined(KVMCTL_HID_BENCH)" not in transport
@@ -49,6 +48,4 @@ assert "hid_bench_fifo_overflows" in transport
 assert "hid_bench_reset_fifo_metrics()" in transport
 assert '{.key = "live", .value = "1"}' in signaling
 assert '#ifdef KVMCTL_HID_BENCH' not in signaling
-assert "if (($# > 0)); then" in build_script
-
 print("production Mini HID wiring guards passed")

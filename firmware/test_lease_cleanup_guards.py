@@ -1,4 +1,4 @@
-"""Source guards for M1.4 cleanup, HID recovery, and lease compatibility."""
+"""Source guards for lease cleanup, HID recovery, and lease compatibility."""
 import re
 from pathlib import Path
 
@@ -59,4 +59,4 @@ assert "s_peers[slot].live_input_protocol || s_bench_owner == &s_peers[slot]" in
 assert "hid_bench_cleanup_complete()" in disarm
 assert "slot->heartbeat_ack_supported = false;" in block(transport, "transport_offer_internal")
 
-print("M1.4 cleanup, transfer-failure, and lease compatibility guards passed")
+print("lease cleanup, transfer-failure, and lease compatibility guards passed")

@@ -84,7 +84,7 @@ The upstream peer demo README states that it uses SoftAP, audio, simulated SDP, 
 
 Procedure: read the board partition table at `0x8000` and read-only security eFuses. The existing table has NVS at `0x9000`, PHY data at `0xF000`, a `factory` app at `0x10000` sized 1,984 KiB, and VFS at `0x200000` sized 6 MiB. Secure boot is disabled and `SPI_BOOT_CRYPT_CNT=0`. Backed up the original factory-app region to `C:\Users\night\AppData\Local\Temp\kvmctl-m0-original-factory-app.bin` before writing.
 
-Built Espressif's [ESP-IDF v6.1.1 TinyUSB HID example](https://github.com/espressif/esp-idf/tree/v6.1.1/examples/peripherals/usb/device/tusb_hid) in a temporary directory, using `esp_tinyusb` 2.4.0 and TinyUSB 0.21.0~6. Removed the example's button read and every keyboard/mouse report send; static search confirmed no GPIO input calls or HID report-send calls remain. The first image is 193,552 bytes and fits the existing factory slot. A reproducible no-report UART/HID probe project is now in `verification/m0/usb-hid-uart`.
+Built Espressif's [ESP-IDF v6.1.1 TinyUSB HID example](https://github.com/espressif/esp-idf/tree/v6.1.1/examples/peripherals/usb/device/tusb_hid) in a temporary directory, using `esp_tinyusb` 2.4.0 and TinyUSB 0.21.0~6. Removed the example's button read and every keyboard/mouse report send; static search confirmed no GPIO input calls or HID report-send calls remain. The first image is 193,552 bytes and fits the existing factory slot. The temporary M0 probe source was later removed during initial-release cleanup.
 
 Flashed only the app image at `0x10000`; left the bootloader, partition table, NVS, and VFS unchanged. esptool verified the written image hash. The board initially stayed in ROM mode after the automatic RTS reset; after a manual RESET with BOOT released, it booted the test app.
 
@@ -102,7 +102,7 @@ After flashing the earlier Wi-Fi probe and the user's RESET, the first COM3 prom
 
 Created and built a repository ESP-IDF TinyUSB HID probe with GPIO input/report-send code absent and Wi-Fi, mDNS, and credential-input code disabled. Keyboard and mouse descriptors remain active. UART0 prints a ready marker and reports only the length of received lines. It does not read physical inputs or send HID reports; no credentials were entered.
 
-The reproducible project is in [verification/m0/usb-hid-uart](../verification/m0/usb-hid-uart). ESP-IDF v6.1.1 built it from the repository. The image is 204,560 bytes (0x31F10), with 80% of the temporary 1 MiB app slot free. SHA-256: e3fbb2d4e28570883b0b3de366c6aec2a243543737accd2e44f7327dc99161bf.
+The removed M0 probe project was built with ESP-IDF v6.1.1. The image was 204,560 bytes (0x31F10), with 80% of the temporary 1 MiB app slot free. SHA-256: e3fbb2d4e28570883b0b3de366c6aec2a243543737accd2e44f7327dc99161bf.
 
 Flashed the repository-built application at 0x10000 over COM3. esptool v5.6.0 connected to ESP32-S3 QFN56 rev 0.2, verified the written data hash, and hard-reset the board. Bootloader, partition table, NVS, and VFS were untouched. Opened COM3 at 115200 8-N-1 with DTR/RTS deasserted and sent the literal PING line. COM3 returned M0 UART0 received 4 bytes and the HID-only heap baseline: internal free 383,651 bytes, minimum internal free since boot 351,620 bytes, PSRAM free 8,386,128 of 8,388,608 bytes. This reading is with TinyUSB HID active and no Wi-Fi or WebRTC stack. The startup marker was not observed because the serial port was opened after the board had booted.
 
@@ -134,13 +134,13 @@ Before updating board 2, a read-only snapshot of `0x10000`–`0x41FFF` (204,800 
 
 Flashed only the new app at `0x10000` over COM6 with esptool v5.6.0. It erased within the factory app partition, wrote 852,592 bytes, reported `Hash of data verified`, and hard-reset the board. Bootloader, partition table, NVS, PHY data, and VFS were not written. After boot, COM6 `PING` returned `M0 UART0 received 4 bytes`; `STATUS` returned `wifi=disabled ip=0.0.0.0 mdns=off reason=0`. The post-PING idle reading with Wi-Fi code linked but not initialized was internal free 323,591 bytes, minimum internal free 291,560 bytes, and PSRAM free 8,386,128 of 8,388,608 bytes. This is a bench idle measurement, not a full-stack or Wi-Fi-started measurement; internal headroom is lower than the earlier HID-only baseline.
 
-The local Windows PowerShell 5.1 form is `verification/m0/wifi-setup.ps1`; it selects a COM port, accepts SSID/password locally, sends them over USB serial, and polls `STATUS`. Script parsing succeeded. Windows reports the form window as visible, but its layout was not visually inspected. No local credentials were entered and no Wi-Fi attempt occurred. A `mdns=on` status would indicate responder initialization only; network reachability still needs a host-side query. The firmware registers no DNS-SD service and provides no TLS/WSS or control listener.
+The local Windows PowerShell 5.1 M0 form selected a COM port, accepted SSID/password locally, sent them over USB serial, and polled `STATUS`. Script parsing succeeded. Windows reported the form window as visible, but its layout was not visually inspected. No local credentials were entered and no Wi-Fi attempt occurred. A `mdns=on` status would indicate responder initialization only; network reachability still needs a host-side query. The firmware registers no DNS-SD service and provides no TLS/WSS or control listener. The temporary form source was removed during initial-release cleanup.
 
 ### Earlier RAM-only Wi-Fi/mDNS probe attempt (2026-11-15; superseded)
 
 An earlier build of the temporary project used ESP-IDF v6.1.1, esp_tinyusb 2.4.0, TinyUSB 0.21.0~6, and Espressif mdns 1.14.0. It had a RAM-only Wi-Fi credential prompt; the prompt was not visible and the user entered no credentials. It did not initialize NVS. At that time both tested boards ran the no-Wi-Fi UART0/HID probe; board 2 was later updated to the repository bench image described above. Board 1 remains on the earlier no-Wi-Fi image.
 
-The earlier temporary source/build folder is under C:\Users\night\AppData\Local\Temp\kvmctl-m0-hid-enumeration; its app image was superseded and is not currently flashed. The original factory app backup remains at C:\Users\night\AppData\Local\Temp\kvmctl-m0-original-factory-app.bin. The current no-Wi-Fi probe source is in [verification/m0/usb-hid-uart](../verification/m0/usb-hid-uart); generated build output and component cache are ignored.
+The earlier temporary source/build folder is under C:\Users\night\AppData\Local\Temp\kvmctl-m0-hid-enumeration; its app image was superseded and is not currently flashed. The original factory app backup remains at C:\Users\night\AppData\Local\Temp\kvmctl-m0-original-factory-app.bin. The no-Wi-Fi probe source and generated build output were removed during initial-release cleanup.
 
 The earlier image enabled octal 8 MB PSRAM at 80 MHz and contained heap counters for HID-ready, Wi-Fi-started, and mDNS-ready phases. It was 854,000 bytes and fit the temporary 1 MiB app slot with 19% free. These are static build details only; no device heap/PSRAM readings were observed from that image. It was superseded by the 204,560-byte repository UART0 image above.
 
@@ -231,7 +231,7 @@ Firmware leaves the ESP-IDF default modem power-save setting unchanged. A contro
 
 ### Reproducible board security bench (2026-11-16)
 
-Added [peer-fingerprint](../verification/m0/peer-fingerprint/README.md), a no-media/no-HID two-peer S3 probe, and [mdns-probe.ps1](../verification/m0/mdns-probe.ps1). Source revision for the selected peer checkout is `3971094e2e7c2ab7cb4de59e4eae710e1902d2b4`; the build rejects implementation changes. The runner validates Board 2's factory partition, backs up the complete `0x1F0000`-byte slot at `0x10000`, and restores/verifies it after each test. The original current-app slot backup SHA-256 is `a81d415a34f955d440a166558dce5f1769001b08f5a75bcb2d605ae5e8e55718`; local evidence is under `verification/m0/peer-fingerprint/logs/`. Bootloader and partition table are not written. Restoring the app does not restore RAM-only Wi-Fi credentials.
+Added the historical peer-fingerprint and mDNS probes, a no-media/no-HID two-peer S3 probe. Source revision for the selected peer checkout is `3971094e2e7c2ab7cb4de59e4eae710e1902d2b4`; the build rejects implementation changes. The runner validates Board 2's factory partition, backs up the complete `0x1F0000`-byte slot at `0x10000`, and restores/verifies it after each test. The original current-app slot backup SHA-256 is `a81d415a34f955d440a166558dce5f1769001b08f5a75bcb2d605ae5e8e55718`. The probe source and local logs were removed during initial-release cleanup. Bootloader and partition table are not written. Restoring the app does not restore RAM-only Wi-Fi credentials.
 
 Initial bench corrections: use a normal EN reset instead of the ROM-download reset helper, and put certificate generation in a dedicated 24 KiB task because it overflowed the default 3.5 KiB main-task stack. These were harness failures, not fingerprint results. Corrected runner detects panics and always attempts verified app restoration.
 
@@ -251,19 +251,19 @@ Run `20261116-101724` used the sufficient receive-timeout margin and completed a
 | Source 0 SDP | One SHA-256 fingerprint changed | Both | 10 / 10 | Security failure; receiving peer is DTLS client |
 | Source 1 SDP | One SHA-256 fingerprint changed | Both | 10 / 10 | Security failure; receiving peer is DTLS server |
 
-Minimum internal heap reached 84,340 bytes across the three two-peer cases; internal free returned to 248,011 bytes after peers closed. These remain isolated SoftAP/two-peer measurements without HID/WSS/Windows/CPU/sustained load. Runner restored and verified the original complete factory-app backup. Raw redacted UART evidence is local at `verification/m0/peer-fingerprint/logs/20261116-101724/uart.log`; the same directory records the exact probe-image SHA-256.
+Minimum internal heap reached 84,340 bytes across the three two-peer cases; internal free returned to 248,011 bytes after peers closed. These remain isolated SoftAP/two-peer measurements without HID/WSS/Windows/CPU/sustained load. Runner restored and verified the original complete factory-app backup. Raw redacted UART evidence and the exact probe-image SHA-256 were recorded in the removed M0 logs.
 
 Unmodified `esp_peer` 1.5.3 from this pinned checkout/IDF combination is rejected for secure control. A separately identified source patch must pass valid-certificate and mismatch checks before reconsideration; do not describe a patched result as acceptance of the upstream binary unchanged. This finding now belongs to M1.2; M0 bootstrap closure does not accept the failing backend.
 
 ### Patched candidate and interop preparation (2026-11-16)
 
-The initial source hardening patch `verification/m0/peer-fingerprint/esp-peer-fingerprint.patch` adds strict SDP fingerprint parsing and required DTLS leaf-certificate matching in both roles. Its first candidate hash was `d238d5cd9d5e870ec1d2e87510282e7a1c14a2eaaf917df96e3baec66224ce47`; the final candidate and tested behavior are recorded below. It builds from an isolated export; linked firmware contains the parser, registry lookup, and verification callback. Extracted-C parser checks passed 1,306 cases. Independent review found no initial-handshake binding blocker; product callers must still disarm and close a session on subsequent SDP errors after callbacks unwind.
+The initial source hardening patch added strict SDP fingerprint parsing and required DTLS leaf-certificate matching in both roles. Its first candidate hash was `d238d5cd9d5e870ec1d2e87510282e7a1c14a2eaaf917df96e3baec66224ce47`; the final candidate and tested behavior are recorded below. It built from an isolated export; linked firmware contained the parser, registry lookup, and verification callback. Extracted-C parser checks passed 1,306 cases. Independent review found no initial-handshake binding blocker; product callers must still disarm and close a session on subsequent SDP errors after callbacks unwind. The patch source was removed during initial-release cleanup.
 
 The first patched board run, `20261116-102913`, did not establish a valid DataChannel baseline. That result was inconclusive and is superseded by the later verified run below. The original complete app slot was restored and verified against the recorded backup hash.
 
-A separate Rust peer and USB bridge in `verification/m0/rust-peer` build offline. Product firmware/client transport integration and actual ESP32-to-Windows traffic status are recorded below.
+A separate Rust peer and USB bridge built offline as an M0 probe. Product firmware/client transport integration and actual ESP32-to-Windows traffic status are recorded below. The probe source was removed during initial-release cleanup.
 
-The [certificate-fixture test design](../verification/m0/peer-fingerprint/certificate-tests.md) specifies unit and integration cases with synthetic certificates A/B, expected matching/mismatching identities, and explicit pass/fail evidence. DTLS fingerprints cover the full certificate; WSS pins cover SPKI and additionally enforce SAN, validity, and handshake signatures. Product DTLS fixture cases are recorded below; WSS certificate validation remains M1.3 work.
+The removed certificate-fixture test design specified unit and integration cases with synthetic certificates A/B, expected matching/mismatching identities, and explicit pass/fail evidence. DTLS fingerprints cover the full certificate; WSS pins cover SPKI and additionally enforce SAN, validity, and handshake signatures. Product DTLS fixture cases are recorded below; WSS certificate validation remains M1.3 work.
 
 ### M1.3 implementation progress (2026-11-17; open)
 
@@ -553,7 +553,7 @@ query listed the restored fingerprint alongside the other two enrolled clients.
 
 The backend remains Espressif `esp_peer` 1.5.3 from `esp-webrtc-solution`
 commit `3971094e2e7c2ab7cb4de59e4eae710e1902d2b4`, with the local patch
-`verification/m0/peer-fingerprint/esp-peer-fingerprint.patch` (current SHA-256
+The removed historical peer-fingerprint patch (current SHA-256
 `6631fed27750b4cf444c82bdf5afd1eb316674abd8bad97875166660aa5eb8ca`). The
 board probe used patch-file SHA-256
 `060214cb4e77cae952216eb7e8a23ad9ee0af12b9d9ef1b43b7ba3629e536f57`; patched
@@ -585,7 +585,7 @@ sustained-load measurements were not part of this probe. The runner restored
 the original full app slot and verified backup SHA-256
 `2a26bdfa8e4228f43607cb4baa00e23fb24d86f07d2ee56d6a09e6f5d7bfbbdd`.
 Redacted UART evidence is local in
-`verification/m0/peer-fingerprint/logs/20261116-202453/uart.log`.
+the removed M0 log `20261116-202453/uart.log`.
 
 Product transport code is integrated in `firmware/main/transport.c` and
 `client/src/transport.rs`. The device is the answerer and echoes bounded
@@ -606,7 +606,7 @@ status after flashing confirmed the board identity and saved settings remained
 available. The backend source and patch hashes are recorded above.
 
 Test-only certificate A, B, and renewed A are in
-`verification/m0/peer-fingerprint/fixtures`. Renewed A uses A's public key but
+the removed M0 certificate fixtures. Renewed A uses A's public key but
 has different DER. No fixture key was installed on hardware. On Board 2,
 `cargo run -p kvmctl -- transport-test COM6` completed valid fixture A and B
 sessions. Each session exchanged 10 payloads on each channel, rejected one
@@ -744,7 +744,7 @@ Closed 2026-11-16 after the user's report that the refreshed list omits a hotspo
 
 ### Wi-Fi refresh button animation
 
-The refresh request now runs on a worker thread while the Win32 message loop remains active. The button cycles through `Refreshing.`, `Refreshing..`, and `Refreshing...` until the host scan completes, then returns to `Refresh list`. This follow-up passed `cargo check --workspace --tests --offline --target x86_64-pc-windows-msvc`; interactive animation has not been run in this session. User can launch it with `cargo run --offline -p kvmctl`.
+The refresh request now runs on a worker thread while the Win32 message loop remains active. The button cycles through `Refreshing.`, `Refreshing..`, and `Refreshing...` until the host scan completes, then returns to `Refresh list`. This follow-up passed `cargo check --workspace --tests --offline --target x86_64-pc-windows-msvc`; interactive animation has not been run in this session. User can launch it with `cargo run --offline --bin kvmctl-tray`.
 
 ### M1.4 zero-HID slice started (2026-11-23)
 
@@ -855,20 +855,13 @@ On the prior image A opened both DataChannels and completed transcript authoriza
 B's signaling setup returned `identity_failed` before its DataChannels opened,
 so the original image produced no live lease ordering evidence.
 
-The diagnostic app was built in Ubuntu WSL from `5d123b1` plus the
+The diagnostic app was built historically in Ubuntu WSL from `5d123b1` plus the
 working-tree transport diagnostics, using ESP-IDF 6.1.1 and esp-webrtc-solution
-`3971094e2e7c2ab7cb4de59e4eae710e1902d2b4`.
+`3971094e2e7c2ab7cb4de59e4eae710e1902d2b4`. The retired WSL command and checkout
+paths are not retained.
 
-```bash
-source ~/esp/esp-idf-v6.1.1/export.sh
-export KVMCTL_LIBSRTP_SOURCE="$HOME/esp/espressif__esp_libsrtp"
-bash firmware/build-transport.sh "$HOME/esp/esp-webrtc-v1.3.0" build
-cp firmware/build/wsl/kvmctl_firmware.bin "$windows/firmware/build/kvmctl_firmware-m14-diagnostic.bin"
-sha256sum "$windows/firmware/build/kvmctl_firmware-m14-diagnostic.bin"
-```
-
-The build used `windows=/mnt/c/Users/night/workspace/kvmctl` and temporarily
-copied the Windows working-tree `firmware/main/transport.c` into the WSL checkout.
+The build used a Windows-mounted checkout and temporarily copied the Windows
+working-tree `firmware/main/transport.c` into the WSL checkout.
 The copied Windows app is 1,209,104 bytes, SHA-256
 `112be2cc267f26137f74492999c023cdba4e2ea4e2a2ab13d4c2b4f20c1aa0aa`.
 The WSL source file was restored after the build.
@@ -935,17 +928,12 @@ depth 0, empty held state, and zero rejections, drops, and reorders.
 The firmware has no USB HID emitter. The client reported `hid_reports=0`
 and `physical_input_capture=off`.
 
-The mbedTLS PSRAM app was built from the same WSL revision with the Windows
-transport and allocation changes. The build set `CONFIG_MBEDTLS_EXTERNAL_MEM_ALLOC=y`
-in the existing generated sdkconfig before the WSL command below and verified
-the effective setting. It restored the WSL sources and cached sdkconfig afterward.
+The mbedTLS PSRAM app was built historically from the same WSL revision with the
+Windows transport and allocation changes. The build set
+`CONFIG_MBEDTLS_EXTERNAL_MEM_ALLOC=y` in the existing generated sdkconfig and
+verified the effective setting. The retired WSL command is not retained.
 The Windows image is 1,209,088 bytes, SHA-256
 `7fdf67c70cbb581d3df4e2b6ba7c170c13602a0ad88a4d9b63fb5d758a73216d`.
-
-```bash
-bash firmware/build-transport.sh "$HOME/esp/esp-webrtc-v1.3.0" reconfigure build
-sha256sum "$windows/firmware/build/kvmctl_firmware-m14-tls-psram.bin"
-```
 
 ```powershell
 certutil -hashfile .\firmware\build\kvmctl_firmware-m14-tls-psram.bin SHA256
@@ -1003,14 +991,8 @@ The image is 1,240,608 bytes with SHA-256
 `346b273a211f99b0e55af204211891cd603b5d0906d61cd8ca43e875cb0d4f4d`.
 WSL inputs were restored after the build.
 
-```bash
-source ~/esp/esp-idf-v6.1.1/export.sh
-export KVMCTL_LIBSRTP_SOURCE="$HOME/esp/espressif__esp_libsrtp"
-export KVMCTL_HID_BENCH_COMPONENTS="$windows/verification/m0/usb-hid-uart/managed_components"
-KVMCTL_HID_BENCH=1 bash firmware/build-transport.sh "$HOME/esp/esp-webrtc-v1.3.0" reconfigure build
-cp firmware/build/wsl/hid-bench/kvmctl_firmware.bin "$windows/firmware/build/kvmctl_firmware-m14-hid-bench.bin"
-sha256sum "$windows/firmware/build/kvmctl_firmware-m14-hid-bench.bin"
-```
+The historical WSL HID-bench command and generated paths are retired and not
+retained. The recorded image remains evidence of the earlier bench run.
 
 ```powershell
 certutil -hashfile .\firmware\build\kvmctl_firmware-m14-hid-bench.bin SHA256
@@ -1122,7 +1104,7 @@ Permitted checks passed from the current worktree:
 ```powershell
 cargo test --workspace --offline                 # 42 passed
 cargo fmt --all -- --check                       # passed after formatting
-python firmware/test_m14_cleanup_guards.py       # passed
+python firmware/test_lease_cleanup_guards.py     # passed
 git diff --check                                 # passed
 ```
 
@@ -1197,7 +1179,7 @@ Final `cargo run --offline -p kvmctl -- status COM6` reported firmware
 The build/flash and bench commands were:
 
 ```powershell
-.\firmware\build-m14-hid.ps1
+.\firmware\build-transport.ps1 -BuildDirectory .\firmware\build\historical-m14-hid
 certutil -hashfile .\firmware\build\kvmctl_firmware.bin SHA256
 cargo run --offline -p kvmctl -- flash COM6 .\firmware\build\kvmctl_firmware.bin .\firmware\backups\before-m14-COM6-20261124.bin
 cargo run --offline -p kvmctl -- enroll COM6
@@ -1233,7 +1215,7 @@ one report was injected as failed, then bounded neutral cleanup completed. No
 grant occurred during unresolved cleanup. The source guard check passed:
 
 ```text
-python firmware/test_m14_cleanup_guards.py
+python firmware/test_lease_cleanup_guards.py
 M1.4 cleanup ordering and transfer-failure guards passed
 ```
 
@@ -1294,7 +1276,7 @@ Implemented behavior:
 Local checks run:
 
 ```powershell
-python .\firmware\test_m15_recovery_guards.py
+python .\firmware\test_boot_recovery_guards.py
 cargo fmt --all -- --check
 cargo test --workspace --offline
 git diff --check
@@ -1542,7 +1524,7 @@ Commands and checks:
 ```powershell
 cargo fmt --all -- --check
 cargo test --workspace --offline                 # 44 passed
-python firmware/test_m14_cleanup_guards.py      # passed
+python firmware/test_lease_cleanup_guards.py    # passed
 cargo run --offline -p kvmctl -- signaling-test COM6 hid-bench 192.168.50.137
 cargo run --offline -p kvmctl -- signaling-test COM6 hid-sustain 192.168.50.137
 cargo run --offline -p kvmctl -- transport-test COM6
@@ -1768,12 +1750,12 @@ Additional firmware commands run in x64 Visual Studio Developer PowerShell:
 ```powershell
 python firmware/test_signaling_guards.py --msvc (Get-Command cl.exe).Source
 python firmware/test_usb_admin.py
-python firmware/test_m14_cleanup_guards.py
-python firmware/test_m15_recovery_guards.py
+python firmware/test_lease_cleanup_guards.py
+python firmware/test_boot_recovery_guards.py
 python firmware/test_wifi_setup_guards.py
 ```
 
-The current shell reran `test_m14_cleanup_guards.py`, `test_m15_recovery_guards.py`,
+The current shell reran `test_lease_cleanup_guards.py`, `test_boot_recovery_guards.py`,
 and `test_wifi_setup_guards.py`; all three passed. `test_live_input.py`,
 `test_signaling_guards.py`, and `test_usb_admin.py` require `cl.exe` here and
 were not rerun. The fixture model remains the required check for held drag at
@@ -1850,7 +1832,7 @@ In another PowerShell run the CLI, replacing `TARGET` with a saved name. Then re
 ```powershell
 $env:KVMCTL_LOG='debug'
 cargo run --locked --offline -p kvmctl -- session TARGET
-cargo run --locked --offline -p kvmctl
+cargo run --locked --offline --bin kvmctl-tray
 ```
 
 For each focus condition, tap A, move and click, drag, scroll, and press and release the shortcut including both modifier sides. Hold Ctrl+Shift after F10, then release in either order. Repeat with short relative-motion bursts at 125 Hz and 2 kHz and with the absolute device. With this revision the reader should continue to receive local device input, including shortcut events. Endpoint USB reports should remain neutral. CLI should report remote input unavailable, release the lease and exit. Tray should show one unavailable notice per shortcut attempt, stay connected local and keep heartbeats. There should be zero remote destination OSDs.
@@ -1867,4 +1849,41 @@ Physical remote acceptance requires an exclusive backend. Once available, use th
 cargo run --locked --offline -p kvmctl -- telemetry COMx
 ```
 
-Expect one local destination OSD on each remote fallback, an amber tray state on heartbeat miss, no destination event for a miss while already local, neutral HID on the old endpoint before a switch, and explicit reactivation after recovery. These observations remain pending.
+Expect one local destination OSD on each remote fallback, an amber tray state on heartbeat miss, no destination event for a miss while already local, neutral HID on the old endpoint before a switch, and explicit reactivation after recovery. These observations remain pending for M2.4 comprehensive acceptance.
+
+### M2.3 live-input closure (2026-11-28)
+
+M2.3 focused-session implementation is closed. User end-to-end verification
+covered the available single-target capture, explicit activation, escape,
+cleanup, recovery, status, and input-routing paths. Source checks and the
+focused-session review passed; global cross-process suppression remains outside
+scope.
+
+Multi-target switching remains deferred because no second target is available.
+Real takeover/revoke across two active endpoints also belongs to M2.4; a mocked
+takeover scenario can supplement the state-machine regression checks but does
+not replace that hardware acceptance. M2.4 owns comprehensive Windows/ESP32
+verification and final packaging/install validation.
+
+### Initial-release cleanup audit (2026-11-28)
+
+The standard host command is:
+
+```powershell
+powershell.exe -NoProfile -ExecutionPolicy Bypass -File .\scripts\test-host.ps1
+```
+
+It generates `firmware/build/host-regression/live-input-fixture.bin`, sets
+`KVMCTL_LIVE_FIXTURE`, runs all seven firmware checks, explicitly runs the
+ignored Rust fixture handoff test, then runs the locked Rust workspace suite.
+Static lease-cleanup, BOOT-recovery, production-HID, and Wi-Fi checks passed.
+The Rust workspace passed `cargo check --workspace --tests --examples
+--locked --offline` and `cargo test --workspace --locked --offline`; the
+ignored fixture test passed with the existing fixture.
+
+The full command stopped before C-backed checks because this shell lacks
+`cl.exe` and `link.exe`; fixture regeneration, signaling guards, and USB-admin
+guards therefore remain pending in a Visual Studio Developer PowerShell. The
+ESP-IDF `6.1.1` clean S3 build was not run because the installed profile reports
+`ESP-IDF v6.1.1-dirty`, which the production builder rejects. No board checks,
+packaging, or flashing ran.

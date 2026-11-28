@@ -1,6 +1,6 @@
 # kvmctl design
 
-Status: evolving product design; implementation status is in the [planning index](plan.md), with hardware and test results in [evidence.md](evidence.md). The M0 probe source is in [verification/m0/usb-hid-uart](../verification/m0/usb-hid-uart).
+Status: evolving product design; implementation status is in the [planning index](plan.md), with hardware and test results in [evidence.md](evidence.md). Historical M0 probe source was removed during initial-release cleanup; its results remain in [evidence.md](evidence.md).
 
 ## Summary
 
