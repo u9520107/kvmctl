@@ -1558,7 +1558,7 @@ remain uncommitted.
 
 ### Resilient heartbeat and Wi-Fi diagnostics (2026-11-25)
 
-Resident-session timing changed after board power-loss testing showed one-second heartbeats and three-second lease expiry left too little room for transient Wi-Fi loss. Client now sends request/response heartbeat every 3 seconds, allows one in flight, marks tray degraded after first missed response, and reconnects after three consecutive misses. Firmware lease expiry is 10 seconds as safety margin. Degradation stays in tray; reconnecting/recovery remains visible through lifecycle state and OSD.
+Resident-session timing changed after board power-loss testing showed one-second heartbeats and three-second lease expiry left too little room for transient Wi-Fi loss. Client now sends request/response heartbeat every 3 seconds, allows one in flight, and marks tray degraded after missed responses while keeping the established route alive. Confirmed peer or channel loss triggers reconnect. Firmware lease expiry is 10 seconds as safety margin. Degradation stays in tray; reconnecting/recovery remains visible through lifecycle state and OSD.
 
 Board diagnostics available as `wifi-test [COMx]`. Command reads RSSI, channel, Wi-Fi reconnect/disconnect counters, last disconnect reason, then sends 20 ICMP echo requests to station default gateway with 100 ms interval and 500 ms timeout. Reports sent/received, loss, minimum/average/maximum RTT. Diagnostic snapshot, not replacement for sustained packet-loss testing.
 

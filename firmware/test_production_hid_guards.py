@@ -27,6 +27,9 @@ assert "tud_hid_mouse_report" in hid
 assert "hid_bench_disarm" in transport
 assert "static int accept_mini_event" in transport
 assert "result = accept_scripted_event_locked" in transport
+mini_ready = transport[transport.index("static bool mini_lease_ready("):transport.index("static int accept_mini_event")]
+assert "bool lease_was_inactive = !s_lease.active" in mini_ready
+assert "queue_state_locked(slot, NULL)" in mini_ready
 mini_accept = transport[transport.index("static int accept_mini_event"):transport.index("/* Mini HIDRPC", transport.index("static int accept_mini_event"))]
 assert mini_accept.count("lease_lock()") == 1
 assert "accept_scripted_event(" not in mini_accept
@@ -37,6 +40,8 @@ assert "accept_mini_event" in mini_path
 assert "mini_lease_ready" not in mini_path
 assert "lease_set_held" not in mini_path
 assert "note_mini_motion" in mini_path
+mini_decode = transport[transport.index("static bool decode_mini_hid"):transport.index("static int on_data_impl")]
+assert "event->motion_buttons_present = true" in mini_decode
 assert "mini_motion_interval_min_us" in transport
 assert "mini_lease_lock_wait_max_us" in transport
 assert "hid_bench_fifo_high_water" in transport

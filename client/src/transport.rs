@@ -2242,9 +2242,6 @@ where
                 heartbeat_request_sequence = None;
                 missed_heartbeats = missed_heartbeats.saturating_add(1);
                 log::warn!("session heartbeat missed count={missed_heartbeats}");
-                if missed_heartbeats >= 3 {
-                    return Ok(SessionExit::Lost("heartbeat response timeout".into()));
-                }
                 if !degraded {
                     degraded = true;
                     on_event(SessionEvent::ConnectionDegraded {
@@ -2832,9 +2829,6 @@ async fn run_mini_session_once<F: FnMut(SessionEvent)>(
                 ping_sent_at = None;
                 missed = missed.saturating_add(1);
                 max_missed = max_missed.max(missed);
-                if missed >= 3 {
-                    return Ok(SessionExit::Lost("heartbeat response timeout".into()));
-                }
                 if !degraded && missed >= MINI_DEGRADE_WARN_MISSES {
                     degraded = true;
                     degradation_count += 1;

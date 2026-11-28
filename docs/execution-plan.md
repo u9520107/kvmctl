@@ -113,7 +113,7 @@ Status: **Closed - 2026-11-25**.
 - Reuse the CLI's session functionality, target settings, and enrollment records. Selecting a target connects with input local. Connected/local retains the lease and heartbeats. Takeover returns input local before showing an actionable prompt. Reconnect restores the connection with input local and requires explicit remote activation.
 - Show no-target and connected/local icons, target tooltips, and visible connecting, recovering, unavailable, and ownership states. Add short OSD notices for connection and recovery changes.
 
-Resilience follow-up: use 3-second request/response heartbeats, three consecutive missed responses for client reconnect, and a 10-second endpoint lease safety expiry. Tray exposes an amber degraded state; degradation does not create an OSD notice. `wifi-test [COMx]` reports board RSSI/channel, Wi-Fi reconnect/disconnect counters, last disconnect reason, and gateway ping quality. This remains diagnostic evidence for M2.3/M2.4; it does not close live input safety work.
+Resilience follow-up: use 3-second request/response heartbeats, keep missed responses in amber degraded state while channels remain open, reconnect on confirmed peer or channel loss, and use a 10-second endpoint lease safety expiry. Tray exposes an amber degraded state; degradation does not create an OSD notice. `wifi-test [COMx]` reports board RSSI/channel, Wi-Fi reconnect/disconnect counters, last disconnect reason, and gateway ping quality. This remains diagnostic evidence for M2.3/M2.4; it does not close live input safety work.
 
 Exit: A user can select a saved target from the tray, stay connected and owned with input local, handle takeover, and recover from a dropped connection with input still local.
 

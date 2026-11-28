@@ -882,7 +882,9 @@ static bool mini_lease_ready(transport_peer_t *slot)
                  (uint32_t)(locked_us - lock_started_us));
     uint64_t now = locked_us / 1000ULL;
     lease_tick_locked(now, &log);
+    bool lease_was_inactive = !s_lease.active;
     bool ready = mini_lease_ready_locked(slot, now);
+    if (ready && lease_was_inactive && !queue_state_locked(slot, NULL)) ready = false;
     uint64_t released_us = (uint64_t)esp_timer_get_time();
     note_max_u32(&s_mini_lease_lock_hold_max_us,
                  released_us - locked_us > UINT32_MAX ? UINT32_MAX :
@@ -955,6 +957,7 @@ static bool decode_mini_hid(const uint8_t *data, size_t size, bool motion_channe
             event->first_delta = (int8_t)data[1];
             event->second_delta = (int8_t)data[2];
             event->button_mask = data[3];
+            event->motion_buttons_present = true;
         } else {
             if (data[1] != 0 || data[2] != 0) return false;
             event->type = KVMCTL_HID_MOUSE_BUTTONS;
@@ -1200,9 +1203,16 @@ static void peer_cleanup(transport_peer_t *slot)
     lease_unlock();
     emit_lease_log(&lease_log);
     uint32_t cleanup_wait_ms = 0;
-    while (wait_for_hid_cleanup && !hid_bench_cleanup_complete() &&
-           !hid_bench_cleanup_failed() && cleanup_wait_ms++ < PEER_CLEANUP_WAIT_MS)
+    while (wait_for_hid_cleanup && cleanup_wait_ms++ < PEER_CLEANUP_WAIT_MS) {
+        bool cleanup_complete;
+        bool cleanup_failed;
+        lease_lock();
+        cleanup_complete = hid_bench_cleanup_complete();
+        cleanup_failed = hid_bench_cleanup_failed();
+        lease_unlock();
+        if (cleanup_complete || cleanup_failed) break;
         vTaskDelay(pdMS_TO_TICKS(1));
+    }
     atomic_fetch_sub(&s_open_channels, slot->open_channels);
     mbedtls_platform_zeroize(slot->sdp, sizeof(*slot->sdp));
     memset(&slot->control, 0, sizeof(slot->control));

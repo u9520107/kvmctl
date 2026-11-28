@@ -35,6 +35,7 @@ typedef struct {
     uint8_t key_count;
     uint16_t keys[KVMCTL_HID_MAX_KEYS][2];
     uint8_t button_mask;
+    bool motion_buttons_present;
     int16_t first_delta;
     int16_t second_delta;
     bool owner_present;

@@ -36,7 +36,8 @@ failed_recovery = service[service.index("if (failed)"):service.index("if (!faile
 assert failed_recovery.count("return false;") == 1
 assert "hid_bench_cleanup_complete" in hid
 assert "KVMCTL_HID_BENCH_FAIL_TRANSFER_ONCE" in hid
-assert "report.buttons = event->button_mask" in block(hid, "hid_bench_enqueue")
+enqueue = block(hid, "hid_bench_enqueue")
+assert "if (event->motion_buttons_present) report.buttons = event->button_mask;" in enqueue
 
 peer_cleanup = block(transport, "peer_cleanup")
 assert peer_cleanup.index("hid_bench_cleanup_complete") < peer_cleanup.index(
@@ -44,6 +45,9 @@ assert peer_cleanup.index("hid_bench_cleanup_complete") < peer_cleanup.index(
 )
 assert "hid_bench_cleanup_failed" in peer_cleanup
 assert "PEER_CLEANUP_WAIT_MS" in peer_cleanup
+poll = peer_cleanup[peer_cleanup.index("uint32_t cleanup_wait_ms"):]
+assert poll.index("lease_lock()") < poll.index("hid_bench_cleanup_complete")
+assert poll.index("hid_bench_cleanup_failed") < poll.index("lease_unlock()")
 
 lease_request = protocol.split("case KVMCTL_HID_LEASE_REQUEST:", 1)[1].split("case ", 1)[0]
 assert re.search(
