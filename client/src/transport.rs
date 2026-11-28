@@ -974,6 +974,7 @@ async fn test_competing_signaling(
 struct SignalingPeer<P> {
     session: crate::signaling::Session,
     pc: P,
+    peer_failed: Arc<AtomicBool>,
     rpc: Arc<dyn DataChannel>,
     hidrpc: Arc<dyn DataChannel>,
     hidrpc_unreliable_nonordered: Arc<dyn DataChannel>,
@@ -1075,6 +1076,7 @@ async fn open_signaling_peer(
         Ok((control, input, _motion_ordered, motion, offer_sdp, proof)) => Ok(SignalingPeer {
             session,
             pc,
+            peer_failed,
             rpc: control.clone(),
             hidrpc: input.clone(),
             hidrpc_unreliable_nonordered: motion.clone(),
@@ -2190,6 +2192,9 @@ where
         let session_id = peer.session.session_id();
         takeover_epoch = epoch;
         loop {
+            if peer.peer_failed.load(Ordering::Acquire) {
+                return Ok(SessionExit::Lost("peer connection failed".into()));
+            }
             if control.is_cancelled() {
                 if control.input_set_local()? {
                     on_event(SessionEvent::InputLocalConfirmed);
@@ -2237,6 +2242,9 @@ where
                 heartbeat_request_sequence = None;
                 missed_heartbeats = missed_heartbeats.saturating_add(1);
                 log::warn!("session heartbeat missed count={missed_heartbeats}");
+                if missed_heartbeats >= 3 {
+                    return Ok(SessionExit::Lost("heartbeat response timeout".into()));
+                }
                 if !degraded {
                     degraded = true;
                     on_event(SessionEvent::ConnectionDegraded {
@@ -2788,13 +2796,31 @@ async fn run_mini_session_once<F: FnMut(SessionEvent)>(
         let mut missed = 0u8;
         let mut degraded = false;
         let mut ping_id = 0u64;
+        let mut mini_responses = ResponseCursor::new(peer.session.session_id());
+        let mut mini_control_sequence = 0u64;
+        let mut mini_takeover_epoch = None;
+        let mut mini_lease_epoch = None;
         loop {
+            if peer.peer_failed.load(Ordering::Acquire) {
+                return Ok(SessionExit::Lost("peer connection failed".into()));
+            }
             if control.is_cancelled() {
                 if control.input_is_remote() {
                     mini_send_neutral(&peer.hidrpc).await?;
                 }
                 if control.input_set_local()? {
                     on_event(SessionEvent::InputLocalConfirmed);
+                }
+                if let Some(lease_epoch) = mini_lease_epoch {
+                    mini_release(
+                        &*runtime,
+                        &peer.rpc,
+                        &mut mini_responses,
+                        peer.session.session_id(),
+                        lease_epoch,
+                        &mut mini_control_sequence,
+                    )
+                    .await?;
                 }
                 return Ok(SessionExit::Disconnected);
             }
@@ -2806,6 +2832,9 @@ async fn run_mini_session_once<F: FnMut(SessionEvent)>(
                 ping_sent_at = None;
                 missed = missed.saturating_add(1);
                 max_missed = max_missed.max(missed);
+                if missed >= 3 {
+                    return Ok(SessionExit::Lost("heartbeat response timeout".into()));
+                }
                 if !degraded && missed >= MINI_DEGRADE_WARN_MISSES {
                     degraded = true;
                     degradation_count += 1;
@@ -2840,7 +2869,16 @@ async fn run_mini_session_once<F: FnMut(SessionEvent)>(
                 &mut input,
                 on_event,
             ).await?;
-            match timeout(&*runtime, Duration::from_millis(5), peer.rpc.poll()).await {
+            let motion_wait = input
+                .last_motion_sent
+                .map(|sent| control.input_motion_interval().saturating_sub(sent.elapsed()))
+                .unwrap_or_default();
+            let rpc_poll_timeout = if input.motion != (0, 0) {
+                motion_wait.min(Duration::from_millis(5))
+            } else {
+                Duration::from_millis(5)
+            };
+            match timeout(&*runtime, rpc_poll_timeout, peer.rpc.poll()).await {
                 Ok(Some(DataChannelEvent::OnMessage(message))) => {
                     if message.data.first() == Some(&b'{') {
                         if let Some(sent) = ping_sent_at.take() {
@@ -2862,12 +2900,71 @@ async fn run_mini_session_once<F: FnMut(SessionEvent)>(
                             missed = 0;
                             degraded = false;
                         }
+                    } else {
+                        let (response, response_epoch) =
+                            mini_responses.decode_any_epoch(&message.data)?;
+                        match response {
+                            EndpointResponse::LeaseState { .. } => {
+                                mini_lease_epoch = Some(response_epoch);
+                            }
+                            EndpointResponse::TakeoverNotice {
+                                request_id,
+                                requester,
+                                response_window_ms,
+                            } if control.pending_takeover().is_none() => {
+                                mini_takeover_epoch = Some(response_epoch);
+                                if control.input_is_remote() {
+                                    mini_send_neutral(&peer.hidrpc).await?;
+                                    if control.input_set_local()? {
+                                        on_event(SessionEvent::InputLocalConfirmed);
+                                    }
+                                }
+                                control.start_takeover(request_id, response_window_ms);
+                                on_event(SessionEvent::TakeoverPending {
+                                    request_id,
+                                    requester,
+                                    response_window_ms,
+                                });
+                            }
+                            EndpointResponse::TakeoverNotice { .. }
+                            | EndpointResponse::TakeoverResponse { .. }
+                            | EndpointResponse::Error { .. } => {}
+                        }
                     }
                 }
                 Ok(Some(DataChannelEvent::OnClose)) | Ok(None) => {
                     return Ok(SessionExit::Lost("Mini rpc channel closed".into()));
                 }
                 Ok(_) | Err(_) => {}
+            }
+            if let Some(request_id) = control.pending_takeover()
+                && let Some(accepted) = control.take_takeover_decision(request_id)
+            {
+                send_hid_event(
+                    &peer.rpc,
+                    crate::hid_protocol::Envelope {
+                        message_type: crate::hid_protocol::TAKEOVER_RESPONSE,
+                        session_id: peer.session.session_id(),
+                        lease_epoch: mini_takeover_epoch.unwrap_or(epoch),
+                        sequence: mini_control_sequence,
+                        event: crate::hid_protocol::Event::TakeoverResponse {
+                            request_id,
+                            accepted,
+                        },
+                    },
+                )
+                .await?;
+                mini_control_sequence += 1;
+                on_event(SessionEvent::Notice(if accepted {
+                    "Takeover accepted; input remains local until ownership changes.".into()
+                } else {
+                    "Takeover rejected; input remains local.".into()
+                }));
+            }
+            if control.takeover_expired() {
+                on_event(SessionEvent::Notice(
+                    "Takeover request expired; input remains local.".into(),
+                ));
             }
         }
     }.await;
@@ -2973,6 +3070,57 @@ async fn mini_send_neutral(channel: &Arc<dyn DataChannel>) -> Result<()> {
     .await
 }
 
+async fn mini_release(
+    runtime: &dyn Runtime,
+    channel: &Arc<dyn DataChannel>,
+    responses: &mut ResponseCursor,
+    session_id: [u8; 16],
+    lease_epoch: u32,
+    sequence: &mut u64,
+) -> Result<()> {
+    let request_sequence = *sequence;
+    send_hid_event(
+        channel,
+        crate::hid_protocol::Envelope {
+            message_type: crate::hid_protocol::LIVE_INPUT_DISARM,
+            session_id,
+            lease_epoch,
+            sequence: request_sequence,
+            event: crate::hid_protocol::Event::LiveInputDisarm,
+        },
+    )
+    .await?;
+    *sequence += 1;
+    loop {
+        match timeout(runtime, Duration::from_secs(5), channel.poll()).await? {
+            Some(DataChannelEvent::OnMessage(message)) => {
+                if message.data.first() == Some(&b'{') {
+                    continue;
+                }
+                let (response, _) = responses.decode_any_epoch(&message.data)?;
+                let response_sequence = responses.take_request_sequence();
+                match response {
+                    EndpointResponse::LeaseState { .. }
+                        if response_sequence == Some(request_sequence) =>
+                    {
+                        return Ok(());
+                    }
+                    EndpointResponse::Error { code }
+                        if response_sequence == Some(request_sequence) =>
+                    {
+                        bail!("Mini lease release rejected: {code}");
+                    }
+                    _ => {}
+                }
+            }
+            Some(DataChannelEvent::OnClose) | None => {
+                bail!("Mini RPC closed before cleanup completed")
+            }
+            Some(_) => {}
+        }
+    }
+}
+
 async fn process_mini_input_events<F: FnMut(SessionEvent)>(
     hidrpc: &Arc<dyn DataChannel>,
     motion_channel: &Arc<dyn DataChannel>,
@@ -2992,11 +3140,11 @@ async fn process_mini_input_events<F: FnMut(SessionEvent)>(
             if control.input_set_local()? {
                 on_event(SessionEvent::InputLocalConfirmed);
             }
+            if control.input_mode() == Some(SessionMode::Cli) {
+                control.cancel();
+            }
         } else if input_capture::capture_supported() {
             control.request_remote(0)?;
-            if control.confirm_remote(epoch) {
-                on_event(SessionEvent::InputRemoteConfirmed);
-            }
         }
     }
     let keepalive_interval = if control.input_keyboard_active() || control.input_buttons() != 0 {
@@ -3015,6 +3163,11 @@ async fn process_mini_input_events<F: FnMut(SessionEvent)>(
         input.last_keyboard_keepalive = Some(Instant::now());
     }
     if !control.input_is_remote() {
+        while let Some(event) = control.next_input_event()? {
+            if matches!(event, InputEvent::RemoteReady(0)) && control.confirm_remote(epoch) {
+                on_event(SessionEvent::InputRemoteConfirmed);
+            }
+        }
         input.motion = (0, 0);
         input.last_motion_sent = None;
         return Ok(());
@@ -3302,6 +3455,9 @@ async fn process_input_events<F: FnMut(SessionEvent)>(
                 on_event,
             )
             .await?;
+            if control.input_mode() == Some(SessionMode::Cli) {
+                control.cancel();
+            }
             return Ok(());
         }
         if live.rearm_requested {

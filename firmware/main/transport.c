@@ -33,6 +33,7 @@ extern bool esp_peer_remote_fingerprint_rejected(esp_peer_handle_t peer);
 #define MOTION_CAPACITY 64
 #define RESPONSE_QUEUE_DEPTH 4
 #define INPUT_SEQUENCE_BASE 0x8000000000000000ULL
+#define PEER_CLEANUP_WAIT_MS 500
 #define BIT_ANSWER BIT0
 #define BIT_FAILED BIT1
 #define BIT_CLOSED BIT2
@@ -629,7 +630,7 @@ static int accept_scripted_event_locked(int slot, const kvmctl_hid_event_t *even
             queue_error_locked(&s_peers[slot], event, "stale_epoch");
             break;
         }
-        if (s_peers[slot].live_input_protocol &&
+        if ((s_peers[slot].live_input_protocol || s_bench_owner == &s_peers[slot]) &&
             (!s_bench_owner || s_bench_owner == &s_peers[slot])) {
             bench_disarm_locked();
             (void)lease_set_held(&s_lease, lease_slot_identity(slot), event->lease_epoch, false, false);
@@ -903,11 +904,14 @@ static int accept_mini_event(int slot, kvmctl_hid_event_t *event, bool motion_ch
     uint64_t now = locked_us / 1000ULL;
     lease_tick_locked(now, &lease_log);
     int result = -1;
+    bool lease_was_inactive = !s_lease.active;
     if (mini_lease_ready_locked(&s_peers[slot], now)) {
         memcpy(event->session_id, s_peers[slot].session_id, sizeof(event->session_id));
         event->lease_epoch = s_lease.epoch;
         event->sequence = s_peers[slot].input_sequence++;
         result = accept_scripted_event_locked(slot, event, motion_channel, now, &lease_log);
+        if (result > 0 && lease_was_inactive &&
+            !queue_state_locked(&s_peers[slot], NULL)) result = -1;
     }
     uint64_t released_us = (uint64_t)esp_timer_get_time();
     note_max_u32(&s_mini_lease_lock_hold_max_us,
@@ -1160,6 +1164,7 @@ static bool send_response(esp_peer_handle_t peer, transport_peer_t *slot)
 static void peer_cleanup(transport_peer_t *slot)
 {
     lease_log_snapshot_t lease_log = {0};
+    bool wait_for_hid_cleanup = false;
     lease_lock();
     char fingerprint_prefix[9];
     identity_prefix(slot ? slot->client_fingerprint : NULL, fingerprint_prefix);
@@ -1174,7 +1179,10 @@ static void peer_cleanup(transport_peer_t *slot)
                      fingerprint_prefix,
                      owner_match,
                      pending_match);
-    if (s_bench_owner == slot) bench_disarm_locked();
+    if (s_bench_owner == slot) {
+        wait_for_hid_cleanup = true;
+        bench_disarm_locked();
+    }
     lease_result_t revoke_result = LEASE_NOOP;
     if (owner_match) {
         revoke_result = lease_revoke(&s_lease, slot->client_fingerprint,
@@ -1184,12 +1192,17 @@ static void peer_cleanup(transport_peer_t *slot)
                                      (uint64_t)esp_timer_get_time() / 1000ULL);
     }
     if (owner_match && revoke_result == LEASE_REVOKED) {
+        wait_for_hid_cleanup = true;
         begin_lease_cleanup_locked(&lease_log);
     } else if (pending_match && revoke_result == LEASE_REVOKED) {
         if (!s_lease_cleanup_pending) queue_state_to_peers_locked();
     }
     lease_unlock();
     emit_lease_log(&lease_log);
+    uint32_t cleanup_wait_ms = 0;
+    while (wait_for_hid_cleanup && !hid_bench_cleanup_complete() &&
+           !hid_bench_cleanup_failed() && cleanup_wait_ms++ < PEER_CLEANUP_WAIT_MS)
+        vTaskDelay(pdMS_TO_TICKS(1));
     atomic_fetch_sub(&s_open_channels, slot->open_channels);
     mbedtls_platform_zeroize(slot->sdp, sizeof(*slot->sdp));
     memset(&slot->control, 0, sizeof(slot->control));

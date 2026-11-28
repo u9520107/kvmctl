@@ -851,7 +851,9 @@ fn apply_session_event(
             );
         }
         transport::SessionEvent::InputLocalConfirmed => {
-            set_tray_state(state, TrayState::ConnectedLocal);
+            if !matches!(state.tray_state, TrayState::ConnectionDegraded) {
+                set_tray_state(state, TrayState::ConnectedLocal);
+            }
             tray_notice(
                 &state.tray,
                 "kvmctl input local",

@@ -870,9 +870,7 @@ esp_err_t signaling_init(void)
             {.key = "path", .value = "/v1/ws"},
             {.key = "v", .value = "1"},
             {.key = "hb", .value = "1"},
-#ifdef KVMCTL_HID_BENCH
             {.key = "live", .value = "1"},
-#endif
             {.key = "fw", .value = esp_app_get_description()->version},
         };
         if (err == ESP_OK) err = mdns_init();

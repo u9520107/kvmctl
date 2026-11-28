@@ -8,6 +8,8 @@ transport = (ROOT / "main" / "transport.c").read_text()
 project = (ROOT / "CMakeLists.txt").read_text()
 main_cmake = (ROOT / "main" / "CMakeLists.txt").read_text()
 hid = (ROOT / "hid_bench" / "hid_bench.c").read_text()
+signaling = (ROOT / "main" / "signaling.c").read_text()
+build_script = (ROOT / "build-transport.sh").read_text()
 
 assert "#ifdef KVMCTL_HID_BENCH" not in transport
 assert "#if defined(KVMCTL_HID_BENCH)" not in transport
@@ -28,6 +30,8 @@ assert "result = accept_scripted_event_locked" in transport
 mini_accept = transport[transport.index("static int accept_mini_event"):transport.index("/* Mini HIDRPC", transport.index("static int accept_mini_event"))]
 assert mini_accept.count("lease_lock()") == 1
 assert "accept_scripted_event(" not in mini_accept
+assert "bool lease_was_inactive = !s_lease.active" in mini_accept
+assert "queue_state_locked(&s_peers[slot], NULL)" in mini_accept
 mini_path = transport[transport.index("if ((input_channel || motion_channel)"):transport.index("if (frame->size > 0 && (frame->data[0] >> 5) == 5)")]
 assert "accept_mini_event" in mini_path
 assert "mini_lease_ready" not in mini_path
@@ -38,5 +42,8 @@ assert "mini_lease_lock_wait_max_us" in transport
 assert "hid_bench_fifo_high_water" in transport
 assert "hid_bench_fifo_overflows" in transport
 assert "hid_bench_reset_fifo_metrics()" in transport
+assert '{.key = "live", .value = "1"}' in signaling
+assert '#ifdef KVMCTL_HID_BENCH' not in signaling
+assert "if (($# > 0)); then" in build_script
 
 print("production Mini HID wiring guards passed")

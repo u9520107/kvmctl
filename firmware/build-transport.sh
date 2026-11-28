@@ -3,7 +3,9 @@ set -euo pipefail
 
 firmware=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)
 peer_source=${1:-"$firmware/third_party/esp_peer"}
-shift
+if (($# > 0)); then
+    shift
+fi
 if (($# == 0)); then
     set -- reconfigure build
 fi

@@ -475,7 +475,9 @@ fn capture_surface_window() -> Result<HWND, String> {
         CreateWindowExW(
             WS_EX_NOACTIVATE | WS_EX_TOOLWINDOW | WS_EX_TOPMOST,
             windows_sys::core::w!("STATIC"),
-            windows_sys::core::w!("kvmctl: remote input active | Ctrl+Shift+F10 to release"),
+            windows_sys::core::w!(
+                "kvmctl: remote input active | configured escape shortcut to release"
+            ),
             WS_POPUP | WS_BORDER,
             width.saturating_sub(CAPTURE_SURFACE_WIDTH + 20),
             20,

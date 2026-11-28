@@ -36,12 +36,23 @@ failed_recovery = service[service.index("if (failed)"):service.index("if (!faile
 assert failed_recovery.count("return false;") == 1
 assert "hid_bench_cleanup_complete" in hid
 assert "KVMCTL_HID_BENCH_FAIL_TRANSFER_ONCE" in hid
+assert "report.buttons = event->button_mask" in block(hid, "hid_bench_enqueue")
+
+peer_cleanup = block(transport, "peer_cleanup")
+assert peer_cleanup.index("hid_bench_cleanup_complete") < peer_cleanup.index(
+    "xEventGroupSetBits(slot->events, BIT_CLOSED)"
+)
+assert "hid_bench_cleanup_failed" in peer_cleanup
+assert "PEER_CLEANUP_WAIT_MS" in peer_cleanup
 
 lease_request = protocol.split("case KVMCTL_HID_LEASE_REQUEST:", 1)[1].split("case ", 1)[0]
 assert re.search(
     r"if \(field_count == 1\) \{[^{}]*event->heartbeat_ack_supported = true;\s*\}\s*return true;",
     lease_request,
 )
+disarm = release[release.index("case KVMCTL_HID_LIVE_INPUT_DISARM:"):]
+assert "s_peers[slot].live_input_protocol || s_bench_owner == &s_peers[slot]" in disarm
+assert "hid_bench_cleanup_complete()" in disarm
 assert "slot->heartbeat_ack_supported = false;" in block(transport, "transport_offer_internal")
 
 print("M1.4 cleanup, transfer-failure, and lease compatibility guards passed")

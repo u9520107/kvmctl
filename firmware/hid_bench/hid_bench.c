@@ -199,6 +199,7 @@ const char *hid_bench_enqueue(const kvmctl_hid_event_t *event)
             event->second_delta < -127 || event->second_delta > 127)
             return "invalid_capability";
         if (event->type == KVMCTL_HID_MOTION) {
+            report.buttons = event->button_mask;
             report.x = (int8_t)event->first_delta;
             report.y = (int8_t)event->second_delta;
         } else {
@@ -326,6 +327,11 @@ bool hid_bench_cleanup_complete(void)
 {
     return !s_releasing && !s_cleanup_failed && s_count == 0 &&
            atomic_load(&s_transfer) == TRANSFER_IDLE;
+}
+
+bool hid_bench_cleanup_failed(void)
+{
+    return s_cleanup_failed;
 }
 
 bool hid_bench_releasing(void)
