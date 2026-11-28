@@ -5,6 +5,10 @@ param(
 )
 
 $ErrorActionPreference = 'Stop'
+$provider = $null
+$InstallDirectory = $ExecutionContext.SessionState.Path.GetUnresolvedProviderPathFromPSPath(
+    $InstallDirectory, [ref]$provider, [ref]$null)
+if ($provider.Name -ne 'FileSystem') { throw 'InstallDirectory must be a filesystem path.' }
 $dist = Join-Path $PSScriptRoot '..\dist'
 $files = 'kvmctl.exe', 'kvmctl-tray.exe', 'README.md', 'LICENSE', 'THIRD_PARTY_NOTICES.md'
 $build = Get-ChildItem -Path $dist -Directory -Filter 'kvmctl-*-windows-x64' |

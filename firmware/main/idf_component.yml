@@ -6,6 +6,9 @@ dependencies:
   espressif/esp_libsrtp:
     version: "==1.0.0"
     override_path: "${KVMCTL_LIBSRTP_SOURCE}"
+    # The vendored esp_peer manifest pins the registry dependency when this override is inactive.
+    rules:
+      - if: "$KVMCTL_USE_LOCAL_LIBSRTP == 1"
   espressif/led_strip:
     version: "3.0.3"
   espressif/mdns:

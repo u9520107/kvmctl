@@ -27,9 +27,6 @@ if ($env:KVMCTL_LIBSRTP_SOURCE) { $libCandidates += $env:KVMCTL_LIBSRTP_SOURCE }
 $libCandidates += Join-Path $project 'managed_components/espressif__esp_libsrtp'
 $libCandidates += Join-Path $WebrtcSource 'components/esp_peer/examples/peer_demo/managed_components/espressif__esp_libsrtp'
 $lib = $libCandidates | Where-Object { Test-Path -LiteralPath (Join-Path $_ 'CMakeLists.txt') } | Select-Object -First 1
-if (-not $lib) {
-    throw 'Missing pinned esp_libsrtp 1.0.0 component. Set KVMCTL_LIBSRTP_SOURCE or provide the ESP WebRTC checkout used for its managed component.'
-}
 
 $buildRoot = [IO.Path]::GetFullPath((Join-Path $project 'build'))
 $build = [IO.Path]::GetFullPath($BuildDirectory)
@@ -40,12 +37,18 @@ if (-not $build.StartsWith($buildRoot + [IO.Path]::DirectorySeparatorChar, [Stri
 New-Item -ItemType Directory -Force -Path $build | Out-Null
 
 $env:KVMCTL_PEER_SOURCE = (Resolve-Path -LiteralPath $peer).Path
-$env:KVMCTL_LIBSRTP_SOURCE = (Resolve-Path -LiteralPath $lib).Path
-$lock = Join-Path $build 'dependencies.lock'
+# Keep separate locks so changing source mode triggers the correct resolution.
+if ($lib) {
+    $env:KVMCTL_LIBSRTP_SOURCE = (Resolve-Path -LiteralPath $lib).Path
+    $lock = Join-Path $build 'dependencies.lock'
+} else {
+    Remove-Item Env:KVMCTL_LIBSRTP_SOURCE -ErrorAction SilentlyContinue
+    $lock = Join-Path $build 'dependencies-registry.lock'
+}
 $sdkconfig = Join-Path $build 'sdkconfig'
 Write-Host "ESP-IDF: $idfVersion"
 Write-Host "Peer source: $env:KVMCTL_PEER_SOURCE"
-Write-Host "libSRTP source: $env:KVMCTL_LIBSRTP_SOURCE"
+Write-Host "libSRTP source: $(if ($lib) { $env:KVMCTL_LIBSRTP_SOURCE } else { 'ESP Component Registry' })"
 Write-Host "Build directory: $build"
 
 $arguments = @(
