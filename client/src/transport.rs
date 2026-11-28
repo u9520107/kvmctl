@@ -2777,8 +2777,10 @@ async fn run_mini_session_once<F: FnMut(SessionEvent)>(
         let mut input = MiniInput::default();
         loop {
             if control.is_cancelled() {
-                if control.input_set_local()? {
+                if control.input_is_remote() {
                     mini_send_neutral(&peer.hidrpc).await?;
+                }
+                if control.input_set_local()? {
                     on_event(SessionEvent::InputLocalConfirmed);
                 }
                 return Ok(SessionExit::Disconnected);
@@ -2789,6 +2791,12 @@ async fn run_mini_session_once<F: FnMut(SessionEvent)>(
                 missed = missed.saturating_add(1);
                 if !degraded {
                     degraded = true;
+                    if control.input_is_remote() {
+                        mini_send_neutral(&peer.hidrpc).await?;
+                        if control.input_set_local()? {
+                            on_event(SessionEvent::InputLocalConfirmed);
+                        }
+                    }
                     on_event(SessionEvent::ConnectionDegraded { missed });
                 }
             }
@@ -2830,8 +2838,10 @@ async fn run_mini_session_once<F: FnMut(SessionEvent)>(
         }
     }.await;
 
-    if control.input_set_local().unwrap_or(false) {
+    if control.input_is_remote() {
         let _ = mini_send_neutral(&peer.hidrpc).await;
+    }
+    if control.input_set_local().unwrap_or(false) {
         on_event(SessionEvent::InputLocalConfirmed);
     }
     control.input_fail_closed();
@@ -2908,8 +2918,8 @@ async fn process_mini_input_events<F: FnMut(SessionEvent)>(
     }
     if control.take_escape() {
         if control.input_is_remote() {
+            mini_send_neutral(hidrpc).await?;
             if control.input_set_local()? {
-                mini_send_neutral(hidrpc).await?;
                 on_event(SessionEvent::InputLocalConfirmed);
             }
         } else if input_capture::capture_supported() {
@@ -2939,7 +2949,7 @@ async fn process_mini_input_events<F: FnMut(SessionEvent)>(
             }
         }
     }
-    if control.input_keyboard_active()
+    if (control.input_keyboard_active() || control.input_buttons() != 0)
         && input
             .last_keyboard_keepalive
             .is_none_or(|sent| sent.elapsed() >= Duration::from_millis(50))
@@ -2948,7 +2958,7 @@ async fn process_mini_input_events<F: FnMut(SessionEvent)>(
             .send(BytesMut::from(crate::mini_hid::KEEPALIVE.as_slice()))
             .await?;
         input.last_keyboard_keepalive = Some(Instant::now());
-    } else if !control.input_keyboard_active() {
+    } else if !control.input_keyboard_active() && control.input_buttons() == 0 {
         input.last_keyboard_keepalive = None;
     }
     if input.motion != (0, 0)

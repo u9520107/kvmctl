@@ -20,11 +20,9 @@
 #include "mbedtls/platform_util.h"
 #include "wifi_setup.h"
 
-#ifdef KVMCTL_HID_BENCH
 #include "device_identity.h"
 #include "freertos/semphr.h"
 #include "hid_bench.h"
-#endif
 
 /* Provided by the pinned ESP peer fingerprint patch. */
 extern bool esp_peer_remote_fingerprint_rejected(esp_peer_handle_t peer);
@@ -133,7 +131,6 @@ typedef struct {
 /* Endpoint-global lease: one owner, one pending requester. */
 static lease_state_t s_lease;
 static bool s_lease_cleanup_pending;
-#ifdef KVMCTL_HID_BENCH
 /* The USB worker must serialize report submission with lease transitions, but
  * must not call the USB driver with interrupts masked. */
 static SemaphoreHandle_t s_lease_mux;
@@ -148,11 +145,6 @@ static struct {
 } s_live_disarm;
 #define lease_lock() xSemaphoreTake(s_lease_mux, portMAX_DELAY)
 #define lease_unlock() xSemaphoreGive(s_lease_mux)
-#else
-static portMUX_TYPE s_lease_mux = portMUX_INITIALIZER_UNLOCKED;
-#define lease_lock() portENTER_CRITICAL(&s_lease_mux)
-#define lease_unlock() portEXIT_CRITICAL(&s_lease_mux)
-#endif
 static portMUX_TYPE s_response_mux[MAX_TRANSPORT_PEERS] = {
     portMUX_INITIALIZER_UNLOCKED, portMUX_INITIALIZER_UNLOCKED,
 };
@@ -261,7 +253,6 @@ static bool event_session_matches(transport_peer_t *slot, const kvmctl_hid_event
     return memcmp(slot->session_id, event->session_id, sizeof(slot->session_id)) == 0;
 }
 
-#ifdef KVMCTL_HID_BENCH
 static void bench_disarm_locked(void)
 {
     if (!s_bench_owner) return;
@@ -269,7 +260,6 @@ static void bench_disarm_locked(void)
     s_live_report_pending = false;
     hid_bench_disarm();
 }
-#endif
 
 static bool pending_requester_eligible_locked(void)
 {
@@ -288,9 +278,7 @@ static bool pending_requester_eligible_locked(void)
 static void finish_lease_cleanup_locked(lease_log_snapshot_t *log)
 {
     if (!s_lease_cleanup_pending) return;
-#ifdef KVMCTL_HID_BENCH
     if (!hid_bench_cleanup_complete()) return;
-#endif
     s_lease_cleanup_pending = false;
     if (s_lease.pending) {
         bool eligible = pending_requester_eligible_locked();
@@ -314,9 +302,7 @@ static void finish_lease_cleanup_locked(lease_log_snapshot_t *log)
 
 static void begin_lease_cleanup_locked(lease_log_snapshot_t *log)
 {
-#ifdef KVMCTL_HID_BENCH
     bench_disarm_locked();
-#endif
     s_lease_cleanup_pending = true;
     finish_lease_cleanup_locked(log);
 }
@@ -467,7 +453,6 @@ static bool event_is_current_locked(int slot, const kvmctl_hid_event_t *event)
     return lease_can_emit(&s_lease, lease_slot_identity(slot), event->lease_epoch);
 }
 
-#ifdef KVMCTL_HID_BENCH
 static transport_peer_t *live_disarm_owner_locked(void)
 {
     transport_peer_t *peer = s_live_disarm.peer;
@@ -488,7 +473,6 @@ static void revoke_bench_owner_locked(uint64_t now, lease_log_snapshot_t *log)
         bench_disarm_locked();
     }
 }
-#endif
 
 /* 1 apply, 0 stale/drop, -1 reject. */
 static int accept_scripted_event(int slot, const kvmctl_hid_event_t *event, bool motion_channel)
@@ -601,7 +585,6 @@ static int accept_scripted_event(int slot, const kvmctl_hid_event_t *event, bool
             queue_error_locked(&s_peers[slot], event, "stale_epoch");
             break;
         }
-#ifdef KVMCTL_HID_BENCH
         if (event->type == KVMCTL_HID_LIVE_INPUT_ARM && s_bench_owner != &s_peers[slot])
             s_peers[slot].live_input_protocol = true;
         if (!s_peers[slot].usb && !s_bench_owner && !s_lease.pending &&
@@ -614,7 +597,6 @@ static int accept_scripted_event(int slot, const kvmctl_hid_event_t *event, bool
             else result = -1;
             break;
         }
-#endif
         queue_error_locked(&s_peers[slot], event, "invalid_capability");
         break;
     case KVMCTL_HID_LIVE_INPUT_DISARM:
@@ -623,7 +605,6 @@ static int accept_scripted_event(int slot, const kvmctl_hid_event_t *event, bool
             queue_error_locked(&s_peers[slot], event, "stale_epoch");
             break;
         }
-#ifdef KVMCTL_HID_BENCH
         if (s_peers[slot].live_input_protocol &&
             (!s_bench_owner || s_bench_owner == &s_peers[slot])) {
             bench_disarm_locked();
@@ -638,7 +619,6 @@ static int accept_scripted_event(int slot, const kvmctl_hid_event_t *event, bool
             }
             break;
         }
-#endif
         queue_error_locked(&s_peers[slot], event, "invalid_capability");
         break;
     case KVMCTL_HID_KEYBOARD_STATE:
@@ -651,7 +631,6 @@ static int accept_scripted_event(int slot, const kvmctl_hid_event_t *event, bool
             queue_error_locked(&s_peers[slot], event, "invalid_capability");
             result = 2;
         }
-#ifdef KVMCTL_HID_BENCH
         if (result == 1 && s_peers[slot].live_input_protocol && s_bench_owner != &s_peers[slot]) {
             queue_error_locked(&s_peers[slot], event, "invalid_capability");
             result = 2;
@@ -676,7 +655,6 @@ static int accept_scripted_event(int slot, const kvmctl_hid_event_t *event, bool
                 s_live_report_sequence = event->sequence;
             }
         }
-#endif
         if (result == 1 && event->type == KVMCTL_HID_KEYBOARD_STATE) {
             (void)lease_set_held(&s_lease, lease_slot_identity(slot), event->lease_epoch,
                                  event->key_count != 0 || event->modifier_mask != 0,
@@ -843,10 +821,19 @@ static bool mini_lease_ready(transport_peer_t *slot)
     lease_lock();
     uint64_t now = (uint64_t)esp_timer_get_time() / 1000ULL;
     lease_tick_locked(now, &log);
-    if (!s_lease.active) {
+    if (s_lease_cleanup_pending) {
+        ready = false;
+    } else if (!s_lease.active) {
         ready = lease_request(&s_lease, lease_slot_identity((int)(slot - s_peers)), NULL, now) == LEASE_GRANTED;
     } else {
-        ready = memcmp(s_lease.owner, lease_slot_identity((int)(slot - s_peers)), LEASE_ID_SIZE) == 0;
+        ready = lease_heartbeat(&s_lease, lease_slot_identity((int)(slot - s_peers)),
+                                s_lease.epoch, now) == LEASE_HEARTBEAT_ACCEPTED;
+    }
+    if (ready && (!s_bench_owner || s_bench_owner == slot)) {
+        if (!s_bench_owner) ready = hid_bench_can_arm();
+        if (ready) s_bench_owner = slot;
+    } else {
+        ready = false;
     }
     if (ready) slot->heartbeat_ack_supported = false;
     lease_unlock();
@@ -1082,9 +1069,7 @@ static void peer_cleanup(transport_peer_t *slot)
                      fingerprint_prefix,
                      owner_match,
                      pending_match);
-#ifdef KVMCTL_HID_BENCH
     if (s_bench_owner == slot) bench_disarm_locked();
-#endif
     lease_result_t revoke_result = LEASE_NOOP;
     if (owner_match) {
         revoke_result = lease_revoke(&s_lease, slot->client_fingerprint,
@@ -1206,7 +1191,6 @@ static void certificate_task(void *arg)
     vTaskDelete(NULL);
 }
 
-#ifdef KVMCTL_HID_BENCH
 static void service_bench_locked(uint64_t now, lease_log_snapshot_t *log)
 {
     if (s_bench_owner) {
@@ -1250,16 +1234,13 @@ static void hid_bench_task(void *arg)
         vTaskDelay(pdMS_TO_TICKS(1));
     }
 }
-#endif
 
 esp_err_t transport_init(void)
 {
     lease_init(&s_lease);
     memset(s_lease_diagnostic, 0, sizeof(s_lease_diagnostic));
-#ifdef KVMCTL_HID_BENCH
     s_lease_mux = xSemaphoreCreateMutex();
     if (!s_lease_mux) return ESP_ERR_NO_MEM;
-#endif
     s_certificate_events = xEventGroupCreate();
     if (!s_certificate_events) return ESP_ERR_NO_MEM;
     for (size_t i = 0; i < MAX_TRANSPORT_PEERS; ++i) {
@@ -1275,7 +1256,6 @@ esp_err_t transport_init(void)
                                        MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
     if (!sdp) return ESP_ERR_NO_MEM;
     for (size_t i = 0; i < MAX_TRANSPORT_PEERS; ++i) s_peers[i].sdp = &sdp[i];
-#ifdef KVMCTL_HID_BENCH
     uint8_t fingerprint[32], tls_hash[32], spki[DEVICE_IDENTITY_SPKI_MAX];
     size_t spki_len = 0;
     esp_err_t status = device_identity_status(fingerprint, tls_hash, spki, &spki_len);
@@ -1283,7 +1263,6 @@ esp_err_t transport_init(void)
     status = hid_bench_init(fingerprint);
     if (status != ESP_OK) return status;
     if (xTaskCreate(hid_bench_task, "hid_bench", 4096, NULL, 4, NULL) != pdPASS) return ESP_ERR_NO_MEM;
-#endif
     return ESP_OK;
 }
 
@@ -1575,11 +1554,7 @@ void transport_get_metrics(transport_metrics_t *metrics)
     metrics->normalized_keys = s_lease.held_keys ? 1 : 0;
     metrics->normalized_buttons = s_lease.held_buttons ? 1 : 0;
     lease_unlock();
-#ifdef KVMCTL_HID_BENCH
     metrics->hid_reports = hid_bench_reports();
-#else
-    metrics->hid_reports = 0;
-#endif
     metrics->total_soc_cpu_us = atomic_load(&s_total_soc_cpu_us);
     if (monitoring) {
         metrics->total_soc_cpu_us = total_soc_cpu_counter() - atomic_load(&s_soc_cpu_start);

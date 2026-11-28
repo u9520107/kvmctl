@@ -61,6 +61,14 @@ mod tests {
     }
 
     #[test]
+    fn keyboard_modifiers_and_neutral_state_use_mini_keyboard_report() {
+        assert_eq!(keyboard(0x08, &[]), [2, 0x08, 0, 0, 0, 0, 0, 0]);
+        assert_eq!(keyboard(0, &[]), [2, 0, 0, 0, 0, 0, 0, 0]);
+        assert_eq!(relative(0, 0, 1), [6, 0, 0, 1]);
+        assert_eq!(relative(0, 0, 0), [6, 0, 0, 0]);
+    }
+
+    #[test]
     fn non_keyboard_pages_are_not_sent_as_keyboard_usage() {
         assert_eq!(keyboard(0, &[(1, 1)]), [2, 0, 0, 0, 0, 0, 0, 0]);
     }
