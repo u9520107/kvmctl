@@ -51,6 +51,7 @@ static struct {
 static uint64_t s_last_event_timestamp_ms, s_last_event_sequence, s_scripted_drops;
 static bool usb_attached = true, usb_held, usb_cleanup;
 static bool usb_report_pending;
+static bool drop_next_motion;
 static kvmctl_hid_event_t usb_queued_report;
 static uint8_t usb_sent_buttons;
 static int usb_drag_x, usb_drag_y;
@@ -99,6 +100,10 @@ static bool hid_bench_releasing(void) { return false; }
 static const char *hid_bench_enqueue(const kvmctl_hid_event_t *event)
 {
     if (!usb_attached) return "invalid_capability";
+    if (event->type == KVMCTL_HID_MOTION && drop_next_motion) {
+        drop_next_motion = false;
+        return "resource_exhausted";
+    }
     if (event->type == KVMCTL_HID_KEYBOARD_STATE) usb_held = !!event->key_count;
     if (event->type == KVMCTL_HID_MOUSE_BUTTONS) usb_held = !!event->button_mask;
     usb_queued_report = *event;
@@ -258,6 +263,29 @@ int run_checks(void)
     if (failure) return failure;
     failure = check_drag(owner, &event, 2000);
     if (failure) return failure;
+    event.type = KVMCTL_HID_MOUSE_BUTTONS;
+    event.button_mask = 1;
+    ++event.sequence;
+    CHECK(accept_scripted_event(owner, &event, false) == 1);
+    complete_usb_report();
+    service_bench_locked(1, &log);
+    CHECK(s_lease.held_buttons);
+    drop_next_motion = true;
+    event.type = KVMCTL_HID_MOTION;
+    event.button_mask = 1;
+    ++event.sequence;
+    CHECK(accept_scripted_event(owner, &event, true) == 2);
+    CHECK(s_lease.held_buttons);
+    event.type = KVMCTL_HID_MOUSE_BUTTONS;
+    event.button_mask = 0;
+    ++event.sequence;
+    CHECK(accept_scripted_event(owner, &event, false) == 1);
+    CHECK(!s_lease.held_buttons);
+    event.type = KVMCTL_HID_MOTION;
+    event.button_mask = 1;
+    ++event.sequence;
+    CHECK(accept_scripted_event(owner, &event, true) == 1);
+    CHECK(!s_lease.held_buttons);
     event.type = KVMCTL_HID_MOUSE_BUTTONS;
     event.button_mask = 1;
     ++event.sequence;

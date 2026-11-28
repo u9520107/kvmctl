@@ -42,6 +42,14 @@ typedef struct {
     uint32_t total_soc_cpu_us;
     uint32_t event_processing_us;
     uint32_t response_queue_residence_us;
+    uint32_t mini_motion_events;
+    uint32_t mini_motion_interval_min_us;
+    uint32_t mini_motion_interval_max_us;
+    uint32_t mini_callback_max_us;
+    uint32_t mini_lease_lock_wait_max_us;
+    uint32_t mini_lease_lock_hold_max_us;
+    uint32_t hid_fifo_high_water;
+    uint32_t hid_fifo_overflows;
     char tls_diagnostic[TRANSPORT_DIAGNOSTIC_CAPACITY];
 } transport_metrics_t;
 

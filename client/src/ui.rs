@@ -18,12 +18,13 @@ use windows_sys::Win32::UI::WindowsAndMessaging::{
     AppendMenuW, BM_GETCHECK, BM_SETCHECK, CB_ADDSTRING, CB_GETCURSEL, CB_RESETCONTENT,
     CB_SETCURSEL, CBN_SELCHANGE, CS_HREDRAW, CS_VREDRAW, CW_USEDEFAULT, CreatePopupMenu,
     CreateWindowExW, DefWindowProcW, DestroyMenu, DestroyWindow, DispatchMessageW, GetCursorPos,
-    GetMessageW, GetWindowTextLengthW, GetWindowTextW, KillTimer, MF_GRAYED, MF_SEPARATOR,
-    MF_STRING, MSG, PostMessageW, PostQuitMessage, RegisterClassW, RegisterWindowMessageW,
-    SendMessageW, SetForegroundWindow, SetTimer, SetWindowTextW, ShowWindow, TPM_NONOTIFY,
-    TPM_RETURNCMD, TPM_RIGHTBUTTON, TrackPopupMenu, TranslateMessage, WM_APP, WM_CLOSE, WM_COMMAND,
-    WM_DESTROY, WM_LBUTTONUP, WM_NULL, WM_RBUTTONUP, WM_TIMER, WNDCLASSW, WS_BORDER, WS_CHILD,
-    WS_OVERLAPPEDWINDOW, WS_TABSTOP, WS_VISIBLE, WS_VSCROLL,
+    GetMessageW, GetWindowTextLengthW, GetWindowTextW, KillTimer, LB_ADDSTRING, LB_GETCURSEL,
+    LB_RESETCONTENT, MF_GRAYED, MF_SEPARATOR, MF_STRING, MSG, PostMessageW, PostQuitMessage,
+    RegisterClassW, RegisterWindowMessageW, SendMessageW, SetForegroundWindow, SetTimer,
+    SetWindowTextW, ShowWindow, TPM_NONOTIFY, TPM_RETURNCMD, TPM_RIGHTBUTTON, TrackPopupMenu,
+    TranslateMessage, WM_APP, WM_CLOSE, WM_COMMAND, WM_DESTROY, WM_LBUTTONUP, WM_NULL,
+    WM_RBUTTONUP, WM_TIMER, WNDCLASSW, WS_BORDER, WS_CHILD, WS_OVERLAPPEDWINDOW, WS_TABSTOP,
+    WS_VISIBLE, WS_VSCROLL,
 };
 
 const PORTS: u16 = 1;
@@ -38,6 +39,12 @@ const LED_SAVE: u16 = 9;
 const REFRESH: u16 = 10;
 const RESCAN: u16 = 11;
 const WIFI_SCAN: u16 = 12;
+const MOTION_RATE: u16 = 13;
+const MOTION_RATE_SAVE: u16 = 14;
+const ESCAPE_BINDINGS: u16 = 15;
+const ESCAPE_BINDING: u16 = 16;
+const ESCAPE_ADD: u16 = 17;
+const ESCAPE_REMOVE: u16 = 18;
 const WIFI_SCAN_TIMER: usize = 1;
 const SESSION_TIMER: usize = 2;
 const WIFI_SCAN_INTERVAL_MS: u32 = 350;
@@ -54,6 +61,7 @@ const ES_AUTOHSCROLL: u32 = 0x0080;
 const ES_PASSWORD: u32 = 0x0020;
 const BS_AUTOCHECKBOX: u32 = 0x0003;
 const BS_GROUPBOX: u32 = 0x0007;
+const LBS_NOTIFY: u32 = 0x0001;
 
 struct TraySession {
     target: String,
@@ -78,6 +86,9 @@ struct UiState {
     color: HWND,
     led_enabled: HWND,
     wifi_scan_button: HWND,
+    motion_rate: HWND,
+    escape_bindings: HWND,
+    escape_binding: HWND,
     wifi_scan_rx: Option<Receiver<Result<Vec<String>, String>>>,
     wifi_scan_frame: u8,
     wifi_scan_summary_stale: bool,
@@ -279,6 +290,78 @@ fn text(window: HWND) -> String {
 fn add_combo_item(combo: HWND, value: &str) {
     let value = wide(value);
     unsafe { SendMessageW(combo, CB_ADDSTRING, 0, value.as_ptr() as LPARAM) };
+}
+
+fn add_list_item(list: HWND, value: &str) {
+    let value = wide(value);
+    unsafe { SendMessageW(list, LB_ADDSTRING, 0, value.as_ptr() as LPARAM) };
+}
+
+fn refresh_input_settings(state: &UiState) -> Result<(), String> {
+    set_text(
+        state.motion_rate,
+        &settings::load_motion_rate_hz()?.to_string(),
+    );
+    unsafe { SendMessageW(state.escape_bindings, LB_RESETCONTENT, 0, 0) };
+    for binding in settings::load_escape_bindings()? {
+        add_list_item(state.escape_bindings, &binding.display());
+    }
+    Ok(())
+}
+
+fn save_motion_rate(state: &UiState) {
+    let result = (|| {
+        let rate = text(state.motion_rate)
+            .trim()
+            .parse::<u32>()
+            .map_err(|_| "motion rate must be an integer".to_owned())?;
+        settings::save_motion_rate_hz(rate)?;
+        refresh_input_settings(state)?;
+        Ok::<_, String>(format!("Motion rate saved: {rate} Hz"))
+    })();
+    set_text(
+        state.summary,
+        &result.unwrap_or_else(|error| format!("Input settings failed: {error}")),
+    );
+}
+
+fn add_escape_binding(state: &UiState) {
+    let result = (|| {
+        let binding = settings::EscapeBinding::parse(&text(state.escape_binding))?;
+        let mut bindings = settings::load_escape_bindings()?;
+        if !bindings.contains(&binding) {
+            bindings.push(binding);
+            settings::save_escape_bindings(&bindings)?;
+        }
+        refresh_input_settings(state)?;
+        set_text(state.escape_binding, "");
+        Ok::<_, String>("Escape binding saved".to_owned())
+    })();
+    set_text(
+        state.summary,
+        &result.unwrap_or_else(|error| format!("Input settings failed: {error}")),
+    );
+}
+
+fn remove_escape_binding(state: &UiState) {
+    let result = (|| {
+        let selected = unsafe { SendMessageW(state.escape_bindings, LB_GETCURSEL, 0, 0) };
+        if selected < 0 {
+            return Err("select an escape binding first".to_owned());
+        }
+        let mut bindings = settings::load_escape_bindings()?;
+        if bindings.len() == 1 {
+            return Err("at least one escape binding is required".to_owned());
+        }
+        bindings.remove(selected as usize);
+        settings::save_escape_bindings(&bindings)?;
+        refresh_input_settings(state)?;
+        Ok::<_, String>("Escape binding removed".to_owned())
+    })();
+    set_text(
+        state.summary,
+        &result.unwrap_or_else(|error| format!("Input settings failed: {error}")),
+    );
 }
 
 fn selected_port(state: &UiState) -> Result<serial::PortInfo, String> {
@@ -1004,7 +1087,15 @@ unsafe extern "system" fn window_proc(
         }
         if !matches!(
             id,
-            PORTS | WIFI_SAVE | LED_SAVE | REFRESH | RESCAN | WIFI_SCAN
+            PORTS
+                | WIFI_SAVE
+                | LED_SAVE
+                | REFRESH
+                | RESCAN
+                | WIFI_SCAN
+                | MOTION_RATE_SAVE
+                | ESCAPE_ADD
+                | ESCAPE_REMOVE
         ) || (id == PORTS && notification != CBN_SELCHANGE_U16)
         {
             return unsafe { DefWindowProcW(window, message, wparam, lparam) };
@@ -1020,6 +1111,9 @@ unsafe extern "system" fn window_proc(
                 (LED_SAVE, 0) => save_led(state),
                 (REFRESH, 0) | (PORTS, CBN_SELCHANGE_U16) => refresh(state),
                 (RESCAN, 0) => rescan(state),
+                (MOTION_RATE_SAVE, 0) => save_motion_rate(state),
+                (ESCAPE_ADD, 0) => add_escape_binding(state),
+                (ESCAPE_REMOVE, 0) => remove_escape_binding(state),
                 _ => return false,
             }
             true
@@ -1229,6 +1323,107 @@ fn create_controls(instance: HINSTANCE, window: HWND) -> Result<UiState, String>
         instance, window, "BUTTON", "Save RGB", basic, LED_SAVE, 480, 316, 90, 29,
     );
 
+    control(
+        instance,
+        window,
+        "BUTTON",
+        "Input settings",
+        BS_GROUPBOX,
+        0,
+        18,
+        410,
+        560,
+        145,
+    );
+    control(
+        instance,
+        window,
+        "STATIC",
+        "Motion rate",
+        0,
+        0,
+        30,
+        438,
+        95,
+        22,
+    );
+    let motion_rate = control(
+        instance,
+        window,
+        "EDIT",
+        "125",
+        WS_BORDER | ES_AUTOHSCROLL | basic,
+        MOTION_RATE,
+        125,
+        434,
+        65,
+        25,
+    );
+    control(instance, window, "STATIC", "Hz", 0, 0, 195, 438, 25, 22);
+    control(
+        instance,
+        window,
+        "BUTTON",
+        "Save rate",
+        basic,
+        MOTION_RATE_SAVE,
+        230,
+        432,
+        90,
+        29,
+    );
+    control(
+        instance,
+        window,
+        "STATIC",
+        "Escape combinations",
+        0,
+        0,
+        30,
+        472,
+        125,
+        22,
+    );
+    let escape_binding = control(
+        instance,
+        window,
+        "EDIT",
+        "CTRL+SHIFT+F10",
+        WS_BORDER | ES_AUTOHSCROLL | basic,
+        ESCAPE_BINDING,
+        155,
+        468,
+        180,
+        25,
+    );
+    control(
+        instance, window, "BUTTON", "Add", basic, ESCAPE_ADD, 345, 466, 70, 29,
+    );
+    let escape_bindings = control(
+        instance,
+        window,
+        "LISTBOX",
+        "",
+        WS_BORDER | WS_VSCROLL | LBS_NOTIFY | basic,
+        ESCAPE_BINDINGS,
+        30,
+        500,
+        305,
+        42,
+    );
+    control(
+        instance,
+        window,
+        "BUTTON",
+        "Remove",
+        basic,
+        ESCAPE_REMOVE,
+        345,
+        500,
+        70,
+        29,
+    );
+
     let mut state = UiState {
         window,
         ports,
@@ -1240,6 +1435,9 @@ fn create_controls(instance: HINSTANCE, window: HWND) -> Result<UiState, String>
         color,
         led_enabled,
         wifi_scan_button,
+        motion_rate,
+        escape_bindings,
+        escape_binding,
         wifi_scan_rx: None,
         wifi_scan_frame: 1,
         wifi_scan_summary_stale: false,
@@ -1249,6 +1447,12 @@ fn create_controls(instance: HINSTANCE, window: HWND) -> Result<UiState, String>
         selected_target: None,
         pending_target: None,
     };
+    if let Err(error) = refresh_input_settings(&state) {
+        set_text(
+            state.summary,
+            &format!("Input settings unavailable: {error}"),
+        );
+    }
     match serial::enumerate() {
         Ok(ports) => update_port_list(&mut state, ports),
         Err(error) => set_text(state.summary, &format!("Board scan failed: {error}")),
@@ -1293,7 +1497,7 @@ pub fn run() -> Result<(), String> {
             CW_USEDEFAULT,
             CW_USEDEFAULT,
             620,
-            465,
+            610,
             std::ptr::null_mut(),
             std::ptr::null_mut(),
             instance,

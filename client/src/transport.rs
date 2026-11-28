@@ -21,11 +21,14 @@ use webrtc::runtime::{Runtime, Sender, channel, default_runtime, timeout};
 static CERTIFICATE_REJECTED: AtomicBool = AtomicBool::new(false);
 static RTC_ERROR_LOGS: AtomicUsize = AtomicUsize::new(0);
 static RTC_ERROR_CLASS: AtomicU8 = AtomicU8::new(0);
+static RTC_SCTP_T3_TIMEOUTS: AtomicUsize = AtomicUsize::new(0);
+static RTC_SCTP_ACK_TIMEOUTS: AtomicUsize = AtomicUsize::new(0);
 static RTC_ERROR_LOCATION: OnceLock<(String, Option<u32>)> = OnceLock::new();
 static LOG_LEVEL: OnceLock<LevelFilter> = OnceLock::new();
 
 const HEARTBEAT_INTERVAL: Duration = Duration::from_secs(3);
 const LEGACY_HEARTBEAT_INTERVAL: Duration = Duration::from_secs(1);
+const MINI_DEGRADE_WARN_MISSES: u8 = 2;
 const LEGACY_HEARTBEAT_RESPONSE_TIMEOUT: Duration = Duration::from_millis(100);
 const INPUT_SEND_BUDGET: Duration = Duration::from_millis(5);
 // Responses carry only the originating request sequence, not its channel.
@@ -57,6 +60,13 @@ impl Log for CertificateLog {
     fn log(&self, record: &Record<'_>) {
         if self.enabled(record.metadata()) {
             let message = record.args().to_string();
+            let lower = message.to_ascii_lowercase();
+            if lower.contains("nt3timeouts") || lower.contains("t3 timeout") {
+                RTC_SCTP_T3_TIMEOUTS.fetch_add(1, Ordering::Relaxed);
+            }
+            if lower.contains("nacktimeouts") || lower.contains("ack timeout") {
+                RTC_SCTP_ACK_TIMEOUTS.fetch_add(1, Ordering::Relaxed);
+            }
             if let Some(class) = rtc_error_class(record.level(), &message) {
                 RTC_ERROR_LOGS.fetch_add(1, Ordering::Relaxed);
                 let _ = RTC_ERROR_LOCATION.set((
@@ -69,10 +79,7 @@ impl Log for CertificateLog {
                     Ordering::Relaxed,
                     Ordering::Relaxed,
                 );
-                if message
-                    .to_ascii_lowercase()
-                    .contains("remote certificate does not match any fingerprint")
-                {
+                if lower.contains("remote certificate does not match any fingerprint") {
                     CERTIFICATE_REJECTED.store(true, Ordering::Release);
                 }
             }
@@ -1276,7 +1283,9 @@ pub(crate) fn run_foreground_session_with_heartbeat_ack(
                 println!("Remote input active. Press Ctrl+Shift+F10 to toggle local.")
             }
             SessionEvent::ConnectionDegraded { missed } => {
-                println!("Connection degraded; heartbeat misses={missed}; input state unchanged")
+                println!(
+                    "Connection degraded; heartbeat misses={missed}; remote input may lag; press Escape for local control"
+                )
             }
             SessionEvent::ConnectionRecovered { rtt_ms } => {
                 println!("Connection recovered; heartbeat RTT={rtt_ms}ms")
@@ -2744,6 +2753,11 @@ async fn run_mini_session_once<F: FnMut(SessionEvent)>(
         Ok(peer) => peer,
         Err(error) => return Ok(SessionExit::Unavailable(error.to_string())),
     };
+    let sctp_t3_start = RTC_SCTP_T3_TIMEOUTS.load(Ordering::Relaxed);
+    let sctp_ack_start = RTC_SCTP_ACK_TIMEOUTS.load(Ordering::Relaxed);
+    let mut input = MiniInput::default();
+    let mut max_missed = 0u8;
+    let mut degradation_count = 0u32;
     let session_result: Result<SessionExit> = async {
         peer.session
             .send_transcript_proof(&peer.proof)
@@ -2774,7 +2788,6 @@ async fn run_mini_session_once<F: FnMut(SessionEvent)>(
         let mut missed = 0u8;
         let mut degraded = false;
         let mut ping_id = 0u64;
-        let mut input = MiniInput::default();
         loop {
             if control.is_cancelled() {
                 if control.input_is_remote() {
@@ -2787,17 +2800,27 @@ async fn run_mini_session_once<F: FnMut(SessionEvent)>(
             }
             let now = Instant::now();
             if ping_sent_at.is_some_and(|sent| now.duration_since(sent) >= HEARTBEAT_INTERVAL) {
+                // A missed ping is a warning only. Switching local while the
+                // user is still moving can inject those inputs into the host;
+                // Escape or an actual channel close remains the handoff path.
                 ping_sent_at = None;
                 missed = missed.saturating_add(1);
-                if !degraded {
+                max_missed = max_missed.max(missed);
+                if !degraded && missed >= MINI_DEGRADE_WARN_MISSES {
                     degraded = true;
-                    if control.input_is_remote() {
-                        mini_send_neutral(&peer.hidrpc).await?;
-                        if control.input_set_local()? {
-                            on_event(SessionEvent::InputLocalConfirmed);
-                        }
-                    }
+                    degradation_count += 1;
                     on_event(SessionEvent::ConnectionDegraded { missed });
+                    eprintln!(
+                        "M2.3 MINI DEGRADE missed={} input_remote={} action=warn_only sctp_t3_timeouts={} sctp_ack_timeouts={}",
+                        missed,
+                        control.input_is_remote(),
+                        RTC_SCTP_T3_TIMEOUTS
+                            .load(Ordering::Relaxed)
+                            .saturating_sub(sctp_t3_start),
+                        RTC_SCTP_ACK_TIMEOUTS
+                            .load(Ordering::Relaxed)
+                            .saturating_sub(sctp_ack_start),
+                    );
                 }
             }
             if now >= next_ping && ping_sent_at.is_none() {
@@ -2824,6 +2847,17 @@ async fn run_mini_session_once<F: FnMut(SessionEvent)>(
                             let rtt_ms = Instant::now().duration_since(sent).as_millis() as u64;
                             if degraded {
                                 on_event(SessionEvent::ConnectionRecovered { rtt_ms });
+                                eprintln!(
+                                    "M2.3 MINI RECOVER rtt_ms={} missed={} sctp_t3_timeouts={} sctp_ack_timeouts={}",
+                                    rtt_ms,
+                                    missed,
+                                    RTC_SCTP_T3_TIMEOUTS
+                                        .load(Ordering::Relaxed)
+                                        .saturating_sub(sctp_t3_start),
+                                    RTC_SCTP_ACK_TIMEOUTS
+                                        .load(Ordering::Relaxed)
+                                        .saturating_sub(sctp_ack_start),
+                                );
                             }
                             missed = 0;
                             degraded = false;
@@ -2844,6 +2878,20 @@ async fn run_mini_session_once<F: FnMut(SessionEvent)>(
     if control.input_set_local().unwrap_or(false) {
         on_event(SessionEvent::InputLocalConfirmed);
     }
+    eprintln!(
+        "M2.3 MINI TELEMETRY motion_sent={} cadence_min_us={} cadence_max_us={} degradation_count={} max_missed={} sctp_t3_timeouts={} sctp_ack_timeouts={}",
+        input.motion_sent,
+        input.motion_interval_min_us.unwrap_or_default(),
+        input.motion_interval_max_us.unwrap_or_default(),
+        degradation_count,
+        max_missed,
+        RTC_SCTP_T3_TIMEOUTS
+            .load(Ordering::Relaxed)
+            .saturating_sub(sctp_t3_start),
+        RTC_SCTP_ACK_TIMEOUTS
+            .load(Ordering::Relaxed)
+            .saturating_sub(sctp_ack_start),
+    );
     control.input_fail_closed();
     peer.close(&*runtime).await;
     match session_result {
@@ -2856,7 +2904,29 @@ async fn run_mini_session_once<F: FnMut(SessionEvent)>(
 struct MiniInput {
     motion: (i32, i32),
     last_motion_sent: Option<Instant>,
+    motion_sent: u64,
+    motion_interval_min_us: Option<u64>,
+    motion_interval_max_us: Option<u64>,
     last_keyboard_keepalive: Option<Instant>,
+}
+
+impl MiniInput {
+    fn note_motion_sent(&mut self) {
+        let sent = Instant::now();
+        if let Some(previous) = self.last_motion_sent {
+            let interval_us = sent.duration_since(previous).as_micros() as u64;
+            self.motion_interval_min_us = Some(
+                self.motion_interval_min_us
+                    .map_or(interval_us, |value| value.min(interval_us)),
+            );
+            self.motion_interval_max_us = Some(
+                self.motion_interval_max_us
+                    .map_or(interval_us, |value| value.max(interval_us)),
+            );
+        }
+        self.motion_sent += 1;
+        self.last_motion_sent = Some(sent);
+    }
 }
 
 async fn mini_hid_handshake(runtime: &dyn Runtime, channel: &Arc<dyn DataChannel>) -> Result<()> {
@@ -2929,7 +2999,24 @@ async fn process_mini_input_events<F: FnMut(SessionEvent)>(
             }
         }
     }
+    let keepalive_interval = if control.input_keyboard_active() || control.input_buttons() != 0 {
+        Duration::from_millis(50)
+    } else {
+        // Mini has no control-channel lease heartbeat. Keep idle sessions alive.
+        HEARTBEAT_INTERVAL
+    };
+    if input
+        .last_keyboard_keepalive
+        .is_none_or(|sent| sent.elapsed() >= keepalive_interval)
+    {
+        hidrpc
+            .send(BytesMut::from(crate::mini_hid::KEEPALIVE.as_slice()))
+            .await?;
+        input.last_keyboard_keepalive = Some(Instant::now());
+    }
     if !control.input_is_remote() {
+        input.motion = (0, 0);
+        input.last_motion_sent = None;
         return Ok(());
     }
     for _ in 0..8 {
@@ -2943,23 +3030,22 @@ async fn process_mini_input_events<F: FnMut(SessionEvent)>(
                 input.motion.1 += dy;
             }
             event => {
+                let buttons_before = control.input_buttons();
+                if matches!(event, InputEvent::MouseButton { .. }) && input.motion != (0, 0) {
+                    let (dx, dy) = take_motion_chunk(&mut input.motion);
+                    mini_send_event(
+                        motion_channel,
+                        &crate::hid_protocol::Event::Motion { dx, dy },
+                        buttons_before,
+                    )
+                    .await?;
+                    input.note_motion_sent();
+                }
                 if let Some(event) = control.input_update(event) {
                     mini_send_event(hidrpc, &event, control.input_buttons()).await?;
                 }
             }
         }
-    }
-    if (control.input_keyboard_active() || control.input_buttons() != 0)
-        && input
-            .last_keyboard_keepalive
-            .is_none_or(|sent| sent.elapsed() >= Duration::from_millis(50))
-    {
-        hidrpc
-            .send(BytesMut::from(crate::mini_hid::KEEPALIVE.as_slice()))
-            .await?;
-        input.last_keyboard_keepalive = Some(Instant::now());
-    } else if !control.input_keyboard_active() && control.input_buttons() == 0 {
-        input.last_keyboard_keepalive = None;
     }
     if input.motion != (0, 0)
         && input
@@ -2973,7 +3059,7 @@ async fn process_mini_input_events<F: FnMut(SessionEvent)>(
             control.input_buttons(),
         )
         .await?;
-        input.last_motion_sent = Some(Instant::now());
+        input.note_motion_sent();
     }
     Ok(())
 }

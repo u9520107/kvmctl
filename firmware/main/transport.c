@@ -103,6 +103,13 @@ static atomic_uint s_peer_task_cpu_us;
 static atomic_uint s_total_soc_cpu_us;
 static atomic_uint s_event_processing_us;
 static atomic_uint s_response_queue_residence_us;
+static atomic_uint s_mini_motion_events;
+static atomic_uint s_mini_motion_interval_min_us;
+static atomic_uint s_mini_motion_interval_max_us;
+static atomic_uint s_mini_callback_max_us;
+static atomic_uint s_mini_lease_lock_wait_max_us;
+static atomic_uint s_mini_lease_lock_hold_max_us;
+static atomic_ullong s_mini_motion_last_us;
 static atomic_uint s_soc_cpu_start;
 static atomic_uint s_tls_rate_limited;
 static atomic_uint s_scripted_events;
@@ -154,6 +161,25 @@ static void note_max_u32(atomic_uint *target, uint32_t value)
     uint32_t current = atomic_load(target);
     while (value > current &&
            !atomic_compare_exchange_weak(target, &current, value)) {}
+}
+
+static void note_min_u32(atomic_uint *target, uint32_t value)
+{
+    uint32_t current = atomic_load(target);
+    while (value < current &&
+           !atomic_compare_exchange_weak(target, &current, value)) {}
+}
+
+static void note_mini_motion(uint64_t now_us)
+{
+    uint64_t previous = atomic_exchange(&s_mini_motion_last_us, now_us);
+    if (previous && now_us > previous) {
+        uint64_t interval = now_us - previous;
+        uint32_t interval_us = interval > UINT32_MAX ? UINT32_MAX : (uint32_t)interval;
+        note_min_u32(&s_mini_motion_interval_min_us, interval_us);
+        note_max_u32(&s_mini_motion_interval_max_us, interval_us);
+    }
+    atomic_fetch_add(&s_mini_motion_events, 1);
 }
 
 static uint32_t total_soc_cpu_counter(void)
@@ -474,17 +500,15 @@ static void revoke_bench_owner_locked(uint64_t now, lease_log_snapshot_t *log)
     }
 }
 
-/* 1 apply, 0 stale/drop, -1 reject. */
-static int accept_scripted_event(int slot, const kvmctl_hid_event_t *event, bool motion_channel)
+/* Caller holds s_lease_mux. 1 apply, 0 stale/drop, -1 reject. */
+static int accept_scripted_event_locked(int slot, const kvmctl_hid_event_t *event,
+                                        bool motion_channel, uint64_t now,
+                                        lease_log_snapshot_t *lease_log)
 {
     if (!event || slot < 0 || slot >= MAX_TRANSPORT_PEERS) return -1;
     if (!event_session_matches(&s_peers[slot], event)) return -1;
-    uint64_t now = (uint64_t)esp_timer_get_time() / 1000ULL;
     int result = -1;
     lease_result_t lease_result = LEASE_REJECTED;
-    lease_log_snapshot_t lease_log = {0};
-    lease_lock();
-    lease_tick_locked(now, &lease_log);
     if (!s_peers[slot].session_id_seen) {
         memcpy(s_peers[slot].session_id, event->session_id, sizeof(s_peers[slot].session_id));
         s_peers[slot].session_id_seen = true;
@@ -504,7 +528,7 @@ static int accept_scripted_event(int slot, const kvmctl_hid_event_t *event, bool
             bool queued = queue_state_locked(&s_peers[slot], event);
             char owner_prefix[9];
             identity_prefix(lease_slot_identity(slot), owner_prefix);
-            lease_log_locked(&lease_log, false,
+            lease_log_locked(lease_log, false,
                              "heartbeat accepted slot=%d client=%s event_epoch=%u epoch=%u queued=%d t_ms=%llu",
                              slot,
                              owner_prefix,
@@ -517,7 +541,7 @@ static int accept_scripted_event(int slot, const kvmctl_hid_event_t *event, bool
             const char *error = s_lease.active ? "stale_epoch" : "lease_expired";
             char client_prefix[9];
             identity_prefix(lease_slot_identity(slot), client_prefix);
-            lease_log_locked(&lease_log, true,
+            lease_log_locked(lease_log, true,
                              "heartbeat rejected slot=%d client=%s event_epoch=%u epoch=%u active=%d error=%s t_ms=%llu",
                              slot,
                              client_prefix,
@@ -535,7 +559,7 @@ static int accept_scripted_event(int slot, const kvmctl_hid_event_t *event, bool
         {
             char requester_prefix[9];
             identity_prefix(lease_slot_identity(slot), requester_prefix);
-            lease_log_locked(&lease_log, false,
+            lease_log_locked(lease_log, false,
                              "takeover request slot=%d requester=%s request=%02x%02x%02x%02x epoch=%u",
                              slot,
                              requester_prefix,
@@ -544,10 +568,10 @@ static int accept_scripted_event(int slot, const kvmctl_hid_event_t *event, bool
                              (unsigned)s_lease.epoch);
         }
         lease_result = lease_request(&s_lease, lease_slot_identity(slot), event->request_id, now);
-        lease_log_locked(&lease_log, false,
+        lease_log_locked(lease_log, false,
                          "takeover request result=%d pending=%d epoch=%u",
                          (int)lease_result, s_lease.pending, (unsigned)s_lease.epoch);
-        if (lease_result == LEASE_TAKEOVER_PENDING) { queue_notice_locked(&s_peers[slot], event, &lease_log); queue_state_locked(&s_peers[slot], event); result = 2; }
+        if (lease_result == LEASE_TAKEOVER_PENDING) { queue_notice_locked(&s_peers[slot], event, lease_log); queue_state_locked(&s_peers[slot], event); result = 2; }
         else if (lease_result == LEASE_GRANTED) { queue_state_locked(&s_peers[slot], event); result = 2; }
         else { queue_error_locked(&s_peers[slot], event, "busy"); result = 2; }
         break;
@@ -573,7 +597,7 @@ static int accept_scripted_event(int slot, const kvmctl_hid_event_t *event, bool
     case KVMCTL_HID_LEASE_RELEASE:
         lease_result = lease_release(&s_lease, lease_slot_identity(slot), event->lease_epoch, now);
         if (lease_result == LEASE_TAKEOVER_GRANTED || lease_result == LEASE_RELEASED) {
-            begin_lease_cleanup_locked(&lease_log);
+            begin_lease_cleanup_locked(lease_log);
             result = 2;
         }
         else { queue_error_locked(&s_peers[slot], event, s_lease.active ? "stale_epoch" : "lease_expired"); result = 2; }
@@ -647,7 +671,7 @@ static int accept_scripted_event(int slot, const kvmctl_hid_event_t *event, bool
                     break;
                 }
                 queue_error_locked(&s_peers[slot], event, error);
-                if (live) revoke_bench_owner_locked(now, &lease_log);
+                if (live) revoke_bench_owner_locked(now, lease_log);
                 else bench_disarm_locked();
                 result = 2;
             } else if (live && !live_motion) {
@@ -671,9 +695,20 @@ static int accept_scripted_event(int slot, const kvmctl_hid_event_t *event, bool
         atomic_store(&s_last_event_timestamp_ms, now);
         atomic_store(&s_last_event_sequence, event->sequence);
     }
+    if (result == 0) atomic_fetch_add(&s_scripted_drops, 1);
+    return result;
+}
+
+/* 1 apply, 0 stale/drop, -1 reject. */
+static int accept_scripted_event(int slot, const kvmctl_hid_event_t *event, bool motion_channel)
+{
+    uint64_t now = (uint64_t)esp_timer_get_time() / 1000ULL;
+    lease_log_snapshot_t lease_log = {0};
+    lease_lock();
+    lease_tick_locked(now, &lease_log);
+    int result = accept_scripted_event_locked(slot, event, motion_channel, now, &lease_log);
     lease_unlock();
     emit_lease_log(&lease_log);
-    if (result == 0) atomic_fetch_add(&s_scripted_drops, 1);
     return result;
 }
 
@@ -814,13 +849,9 @@ static int on_channel_close(esp_peer_data_channel_info_t *channel, void *ctx)
     return 0;
 }
 
-static bool mini_lease_ready(transport_peer_t *slot)
+static bool mini_lease_ready_locked(transport_peer_t *slot, uint64_t now)
 {
     bool ready = false;
-    lease_log_snapshot_t log = {0};
-    lease_lock();
-    uint64_t now = (uint64_t)esp_timer_get_time() / 1000ULL;
-    lease_tick_locked(now, &log);
     if (s_lease_cleanup_pending) {
         ready = false;
     } else if (!s_lease.active) {
@@ -836,9 +867,55 @@ static bool mini_lease_ready(transport_peer_t *slot)
         ready = false;
     }
     if (ready) slot->heartbeat_ack_supported = false;
+    return ready;
+}
+
+static bool mini_lease_ready(transport_peer_t *slot)
+{
+    lease_log_snapshot_t log = {0};
+    uint64_t lock_started_us = (uint64_t)esp_timer_get_time();
+    lease_lock();
+    uint64_t locked_us = (uint64_t)esp_timer_get_time();
+    note_max_u32(&s_mini_lease_lock_wait_max_us,
+                 locked_us - lock_started_us > UINT32_MAX ? UINT32_MAX :
+                 (uint32_t)(locked_us - lock_started_us));
+    uint64_t now = locked_us / 1000ULL;
+    lease_tick_locked(now, &log);
+    bool ready = mini_lease_ready_locked(slot, now);
+    uint64_t released_us = (uint64_t)esp_timer_get_time();
+    note_max_u32(&s_mini_lease_lock_hold_max_us,
+                 released_us - locked_us > UINT32_MAX ? UINT32_MAX :
+                 (uint32_t)(released_us - locked_us));
     lease_unlock();
     emit_lease_log(&log);
     return ready;
+}
+
+static int accept_mini_event(int slot, kvmctl_hid_event_t *event, bool motion_channel)
+{
+    lease_log_snapshot_t lease_log = {0};
+    uint64_t lock_started_us = (uint64_t)esp_timer_get_time();
+    lease_lock();
+    uint64_t locked_us = (uint64_t)esp_timer_get_time();
+    note_max_u32(&s_mini_lease_lock_wait_max_us,
+                 locked_us - lock_started_us > UINT32_MAX ? UINT32_MAX :
+                 (uint32_t)(locked_us - lock_started_us));
+    uint64_t now = locked_us / 1000ULL;
+    lease_tick_locked(now, &lease_log);
+    int result = -1;
+    if (mini_lease_ready_locked(&s_peers[slot], now)) {
+        memcpy(event->session_id, s_peers[slot].session_id, sizeof(event->session_id));
+        event->lease_epoch = s_lease.epoch;
+        event->sequence = s_peers[slot].input_sequence++;
+        result = accept_scripted_event_locked(slot, event, motion_channel, now, &lease_log);
+    }
+    uint64_t released_us = (uint64_t)esp_timer_get_time();
+    note_max_u32(&s_mini_lease_lock_hold_max_us,
+                 released_us - locked_us > UINT32_MAX ? UINT32_MAX :
+                 (uint32_t)(released_us - locked_us));
+    lease_unlock();
+    emit_lease_log(&lease_log);
+    return result;
 }
 
 /* Mini HIDRPC is deliberately exact-size and has no kvmctl envelope. */
@@ -886,7 +963,7 @@ static bool decode_mini_hid(const uint8_t *data, size_t size, bool motion_channe
     return event->type != 0;
 }
 
-static int on_data(esp_peer_data_frame_t *frame, void *ctx)
+static int on_data_impl(esp_peer_data_frame_t *frame, void *ctx)
 {
     transport_peer_t *slot = ctx;
     if (!slot || atomic_load(&slot->close_requested) ||
@@ -939,21 +1016,14 @@ static int on_data(esp_peer_data_frame_t *frame, void *ctx)
     if ((input_channel || motion_channel) && frame->type == ESP_PEER_DATA_CHANNEL_DATA &&
         frame->size > 0 && frame->data[0] != 0x01 && (frame->data[0] == 0x02 || frame->data[0] == 0x04 || frame->data[0] == 0x06)) {
         kvmctl_hid_event_t event;
-        if (!mini_lease_ready(slot) || !decode_mini_hid(frame->data, (size_t)frame->size, motion_channel, &event)) {
+        if (!decode_mini_hid(frame->data, (size_t)frame->size, motion_channel, &event)) {
             atomic_fetch_add(&s_scripted_rejections, 1); fail_session(slot); return -1;
         }
-        memcpy(event.session_id, slot->session_id, sizeof(event.session_id));
-        event.lease_epoch = s_lease.epoch;
-        event.sequence = slot->input_sequence++;
-        int accepted = accept_scripted_event((int)(slot - s_peers), &event, motion_channel);
+        if (event.type == KVMCTL_HID_MOTION) note_mini_motion((uint64_t)esp_timer_get_time());
+        int accepted = accept_mini_event((int)(slot - s_peers), &event, motion_channel);
         if (accepted < 0) { atomic_fetch_add(&s_scripted_rejections, 1); fail_session(slot); return -1; }
-        if (event.type == KVMCTL_HID_MOTION) {
-            lease_lock();
-            (void)lease_set_held(&s_lease, lease_slot_identity((int)(slot - s_peers)), event.lease_epoch,
-                                 s_lease.held_keys, event.button_mask != 0);
-            lease_unlock();
-        }
-        atomic_fetch_add(&s_scripted_events, 1);
+        if (accepted == 2) atomic_fetch_add(&s_scripted_drops, 1);
+        else atomic_fetch_add(&s_scripted_events, 1);
         atomic_fetch_add(&s_application_bytes_received, (uint32_t)frame->size);
         return 0;
     }
@@ -1006,6 +1076,41 @@ static int on_data(esp_peer_data_frame_t *frame, void *ctx)
     target->echo.data = target->data;
     target->pending = true;
     return 0;
+}
+
+static bool is_mini_data_frame(const esp_peer_data_frame_t *frame,
+                               const transport_peer_t *slot)
+{
+    if (!frame || !slot || frame->type != ESP_PEER_DATA_CHANNEL_DATA ||
+        frame->size <= 0 || !frame->data) return false;
+    bool input_channel = slot->input.open && frame->stream_id == slot->input.stream;
+    bool motion_channel = (slot->motion_ordered.open && frame->stream_id == slot->motion_ordered.stream) ||
+                          (slot->motion.open && frame->stream_id == slot->motion.stream);
+    if (!input_channel && !motion_channel) return false;
+    switch (frame->data[0]) {
+    case 0x01:
+    case 0x02:
+    case 0x04:
+    case 0x06:
+    case 0x09:
+        return true;
+    default:
+        return false;
+    }
+}
+
+static int on_data(esp_peer_data_frame_t *frame, void *ctx)
+{
+    transport_peer_t *slot = ctx;
+    bool mini = is_mini_data_frame(frame, slot);
+    uint64_t started_us = mini ? (uint64_t)esp_timer_get_time() : 0;
+    int result = on_data_impl(frame, ctx);
+    if (mini) {
+        uint64_t elapsed = (uint64_t)esp_timer_get_time() - started_us;
+        note_max_u32(&s_mini_callback_max_us,
+                     elapsed > UINT32_MAX ? UINT32_MAX : (uint32_t)elapsed);
+    }
+    return result;
 }
 
 static bool send_echo(esp_peer_handle_t peer, echo_channel_t *channel)
@@ -1354,6 +1459,14 @@ static esp_err_t transport_offer_internal(const uint8_t *client_fingerprint,
         atomic_store(&s_total_soc_cpu_us, 0);
         atomic_store(&s_event_processing_us, 0);
         atomic_store(&s_response_queue_residence_us, 0);
+        atomic_store(&s_mini_motion_events, 0);
+        atomic_store(&s_mini_motion_interval_min_us, UINT32_MAX);
+        atomic_store(&s_mini_motion_interval_max_us, 0);
+        atomic_store(&s_mini_callback_max_us, 0);
+        atomic_store(&s_mini_lease_lock_wait_max_us, 0);
+        atomic_store(&s_mini_lease_lock_hold_max_us, 0);
+        atomic_store(&s_mini_motion_last_us, 0);
+        hid_bench_reset_fifo_metrics();
         atomic_store(&s_soc_cpu_start, total_soc_cpu_counter());
         atomic_store(&s_scripted_events, 0);
         atomic_store(&s_scripted_rejections, 0);
@@ -1561,6 +1674,15 @@ void transport_get_metrics(transport_metrics_t *metrics)
     }
     metrics->event_processing_us = atomic_load(&s_event_processing_us);
     metrics->response_queue_residence_us = atomic_load(&s_response_queue_residence_us);
+    metrics->mini_motion_events = atomic_load(&s_mini_motion_events);
+    metrics->mini_motion_interval_min_us = atomic_load(&s_mini_motion_interval_min_us);
+    if (metrics->mini_motion_interval_min_us == UINT32_MAX) metrics->mini_motion_interval_min_us = 0;
+    metrics->mini_motion_interval_max_us = atomic_load(&s_mini_motion_interval_max_us);
+    metrics->mini_callback_max_us = atomic_load(&s_mini_callback_max_us);
+    metrics->mini_lease_lock_wait_max_us = atomic_load(&s_mini_lease_lock_wait_max_us);
+    metrics->mini_lease_lock_hold_max_us = atomic_load(&s_mini_lease_lock_hold_max_us);
+    metrics->hid_fifo_high_water = hid_bench_fifo_high_water();
+    metrics->hid_fifo_overflows = hid_bench_fifo_overflows();
     portENTER_CRITICAL(&s_tls_diagnostic_mux);
     memcpy(metrics->tls_diagnostic, s_tls_diagnostic, sizeof(metrics->tls_diagnostic));
     portEXIT_CRITICAL(&s_tls_diagnostic_mux);

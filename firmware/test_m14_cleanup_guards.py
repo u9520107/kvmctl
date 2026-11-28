@@ -20,7 +20,7 @@ def block(source: str, name: str) -> str:
     return source[start:end]
 
 
-release = block(transport, "accept_scripted_event")
+release = block(transport, "accept_scripted_event_locked")
 cleanup = release.index("begin_lease_cleanup_locked(")
 assert release.index("lease_release(") < cleanup
 assert cleanup < release.index("result = 2", cleanup)

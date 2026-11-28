@@ -101,6 +101,14 @@ struct TransportMetrics {
     total_soc_cpu_us: u32,
     event_processing_us: u32,
     response_queue_residence_us: u32,
+    mini_motion_events: u32,
+    mini_motion_interval_min_us: u32,
+    mini_motion_interval_max_us: u32,
+    mini_callback_max_us: u32,
+    mini_lease_lock_wait_max_us: u32,
+    mini_lease_lock_hold_max_us: u32,
+    hid_fifo_high_water: u32,
+    hid_fifo_overflows: u32,
 }
 
 impl Default for TransportMetrics {
@@ -133,6 +141,14 @@ impl Default for TransportMetrics {
             total_soc_cpu_us: 0,
             event_processing_us: 0,
             response_queue_residence_us: 0,
+            mini_motion_events: 0,
+            mini_motion_interval_min_us: 0,
+            mini_motion_interval_max_us: 0,
+            mini_callback_max_us: 0,
+            mini_lease_lock_wait_max_us: 0,
+            mini_lease_lock_hold_max_us: 0,
+            hid_fifo_high_water: 0,
+            hid_fifo_overflows: 0,
         }
     }
 }
@@ -359,7 +375,7 @@ fn decode_transport_status_response(
     }
     r.expect_uint(5)?;
     let (result_major, result_fields) = r.head()?;
-    if result_major != 5 || !matches!(result_fields, 12 | 22 | 23 | 25 | 26) {
+    if result_major != 5 || !matches!(result_fields, 12 | 22 | 23 | 25 | 26 | 34) {
         return Err("invalid transport telemetry field count".into());
     }
     let mut values = [0; 10];
@@ -378,32 +394,40 @@ fn decode_transport_status_response(
             *value = r.uint()?;
         }
     }
-    let hid_reports = if matches!(result_fields, 23 | 26) {
+    let hid_reports = if matches!(result_fields, 23 | 26 | 34) {
         r.expect_uint(22)?;
         Some(u32::try_from(r.uint()?).map_err(|_| "invalid HID report count")?)
     } else {
         None
     };
-    let (total_soc_cpu_us, event_processing_us, response_queue_residence_us) = if result_fields
-        == 25
-        || result_fields == 26
-    {
-        r.expect_uint(23)?;
-        let cpu = u32::try_from(r.uint()?).map_err(|_| "invalid SoC CPU time")?;
-        r.expect_uint(24)?;
-        let processing = u32::try_from(r.uint()?).map_err(|_| "invalid event processing time")?;
-        r.expect_uint(25)?;
-        let residence = u32::try_from(r.uint()?).map_err(|_| "invalid response queue residence")?;
-        (cpu, processing, residence)
-    } else {
-        (0, 0, 0)
-    };
+    let (total_soc_cpu_us, event_processing_us, response_queue_residence_us) =
+        if result_fields == 25 || result_fields == 26 || result_fields == 34 {
+            r.expect_uint(23)?;
+            let cpu = u32::try_from(r.uint()?).map_err(|_| "invalid SoC CPU time")?;
+            r.expect_uint(24)?;
+            let processing =
+                u32::try_from(r.uint()?).map_err(|_| "invalid event processing time")?;
+            r.expect_uint(25)?;
+            let residence =
+                u32::try_from(r.uint()?).map_err(|_| "invalid response queue residence")?;
+            (cpu, processing, residence)
+        } else {
+            (0, 0, 0)
+        };
+    let mut mini = [0u64; 8];
+    if result_fields == 34 {
+        for (index, value) in mini.iter_mut().enumerate() {
+            r.expect_uint((index + 26) as u64)?;
+            *value = r.uint()?;
+        }
+    }
     if values[0] > 4
         || values[1..].iter().any(|value| *value > u32::MAX as u64)
         || diagnostic.len() > 96
         || tls_rate_limited > u32::MAX as u64
         || telemetry[1] > u32::MAX as u64
         || telemetry[3..].iter().any(|value| *value > u32::MAX as u64)
+        || mini.iter().any(|value| *value > u32::MAX as u64)
         || !r.done()
     {
         return Err("invalid transport status response".into());
@@ -438,6 +462,14 @@ fn decode_transport_status_response(
         total_soc_cpu_us,
         event_processing_us,
         response_queue_residence_us,
+        mini_motion_events: mini[0] as u32,
+        mini_motion_interval_min_us: mini[1] as u32,
+        mini_motion_interval_max_us: mini[2] as u32,
+        mini_callback_max_us: mini[3] as u32,
+        mini_lease_lock_wait_max_us: mini[4] as u32,
+        mini_lease_lock_hold_max_us: mini[5] as u32,
+        hid_fifo_high_water: mini[6] as u32,
+        hid_fifo_overflows: mini[7] as u32,
     })
 }
 
@@ -2557,6 +2589,22 @@ fn run() -> Result<(), String> {
                     .hid_reports
                     .map_or_else(|| "n/a".into(), |value| value.to_string())
             );
+            println!("mini_motion_events={}", metrics.mini_motion_events);
+            println!(
+                "mini_motion_interval_us={}..{}",
+                metrics.mini_motion_interval_min_us, metrics.mini_motion_interval_max_us
+            );
+            println!("mini_callback_max_us={}", metrics.mini_callback_max_us);
+            println!(
+                "mini_lease_lock_wait_max_us={}",
+                metrics.mini_lease_lock_wait_max_us
+            );
+            println!(
+                "mini_lease_lock_hold_max_us={}",
+                metrics.mini_lease_lock_hold_max_us
+            );
+            println!("hid_fifo_high_water={}", metrics.hid_fifo_high_water);
+            println!("hid_fifo_overflows={}", metrics.hid_fifo_overflows);
             println!(
                 "tls_diagnostic={}",
                 String::from_utf8_lossy(&metrics.tls_diagnostic[..metrics.tls_diagnostic_len])
@@ -3060,6 +3108,29 @@ mod tests {
         assert_eq!(metrics.total_soc_cpu_us, 456);
         assert_eq!(metrics.event_processing_us, 789);
         assert_eq!(metrics.response_queue_residence_us, 123);
+        response[result_header + 1] = 34;
+        for (key, value) in [
+            (26, 100_u64),
+            (27, 7),
+            (28, 9),
+            (29, 11),
+            (30, 13),
+            (31, 17),
+            (32, 5),
+            (33, 2),
+        ] {
+            put_uint(&mut response, key);
+            put_uint(&mut response, value);
+        }
+        let metrics = decode_transport_status_response(&response, &id).unwrap();
+        assert_eq!(metrics.mini_motion_events, 100);
+        assert_eq!(metrics.mini_motion_interval_min_us, 7);
+        assert_eq!(metrics.mini_motion_interval_max_us, 9);
+        assert_eq!(metrics.mini_callback_max_us, 11);
+        assert_eq!(metrics.mini_lease_lock_wait_max_us, 13);
+        assert_eq!(metrics.mini_lease_lock_hold_max_us, 17);
+        assert_eq!(metrics.hid_fifo_high_water, 5);
+        assert_eq!(metrics.hid_fifo_overflows, 2);
     }
 
     #[test]

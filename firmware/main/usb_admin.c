@@ -340,7 +340,7 @@ static size_t encode_transport_status_response(const admin_request_t *request)
     transport_metrics_t metrics;
     transport_get_metrics(&metrics);
     if (!begin_response(request, 0, true, &pos) ||
-        !put_head(s_response, sizeof(s_response), &pos, 5, 26) ||
+        !put_head(s_response, sizeof(s_response), &pos, 5, 34) ||
         !put_uint(s_response, sizeof(s_response), &pos, 0) || !put_uint(s_response, sizeof(s_response), &pos, metrics.state) ||
         !put_uint(s_response, sizeof(s_response), &pos, 1) || !put_uint(s_response, sizeof(s_response), &pos, metrics.internal_free_start) ||
         !put_uint(s_response, sizeof(s_response), &pos, 2) || !put_uint(s_response, sizeof(s_response), &pos, metrics.internal_free_min) ||
@@ -370,7 +370,23 @@ static size_t encode_transport_status_response(const admin_request_t *request)
         !put_uint(s_response, sizeof(s_response), &pos, 24) ||
         !put_uint(s_response, sizeof(s_response), &pos, metrics.event_processing_us) ||
         !put_uint(s_response, sizeof(s_response), &pos, 25) ||
-        !put_uint(s_response, sizeof(s_response), &pos, metrics.response_queue_residence_us)) return 0;
+        !put_uint(s_response, sizeof(s_response), &pos, metrics.response_queue_residence_us) ||
+        !put_uint(s_response, sizeof(s_response), &pos, 26) ||
+        !put_uint(s_response, sizeof(s_response), &pos, metrics.mini_motion_events) ||
+        !put_uint(s_response, sizeof(s_response), &pos, 27) ||
+        !put_uint(s_response, sizeof(s_response), &pos, metrics.mini_motion_interval_min_us) ||
+        !put_uint(s_response, sizeof(s_response), &pos, 28) ||
+        !put_uint(s_response, sizeof(s_response), &pos, metrics.mini_motion_interval_max_us) ||
+        !put_uint(s_response, sizeof(s_response), &pos, 29) ||
+        !put_uint(s_response, sizeof(s_response), &pos, metrics.mini_callback_max_us) ||
+        !put_uint(s_response, sizeof(s_response), &pos, 30) ||
+        !put_uint(s_response, sizeof(s_response), &pos, metrics.mini_lease_lock_wait_max_us) ||
+        !put_uint(s_response, sizeof(s_response), &pos, 31) ||
+        !put_uint(s_response, sizeof(s_response), &pos, metrics.mini_lease_lock_hold_max_us) ||
+        !put_uint(s_response, sizeof(s_response), &pos, 32) ||
+        !put_uint(s_response, sizeof(s_response), &pos, metrics.hid_fifo_high_water) ||
+        !put_uint(s_response, sizeof(s_response), &pos, 33) ||
+        !put_uint(s_response, sizeof(s_response), &pos, metrics.hid_fifo_overflows)) return 0;
     return pos;
 }
 

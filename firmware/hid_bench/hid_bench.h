@@ -13,3 +13,6 @@ bool hid_bench_service(bool *detached);
 bool hid_bench_cleanup_complete(void);
 bool hid_bench_releasing(void);
 uint32_t hid_bench_reports(void);
+uint32_t hid_bench_fifo_high_water(void);
+uint32_t hid_bench_fifo_overflows(void);
+void hid_bench_reset_fifo_metrics(void);

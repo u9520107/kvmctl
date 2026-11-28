@@ -56,6 +56,7 @@ static const char *s_strings[] = {
 static bench_report_t s_reports[REPORT_QUEUE_DEPTH];
 static size_t s_head;
 static size_t s_count;
+static atomic_uint s_high_water;
 static uint8_t s_queued_buttons;
 static uint8_t s_sent_buttons;
 static bool s_sent_keys;
@@ -64,6 +65,7 @@ static atomic_bool s_detached;
 static bench_report_t s_inflight;
 static atomic_int s_transfer;
 static atomic_uint s_completed_reports;
+static atomic_uint s_overflows;
 static bool s_cleanup_failed;
 static uint64_t s_transfer_deadline_ms;
 static uint64_t s_cleanup_deadline_ms;
@@ -163,6 +165,9 @@ bool hid_bench_can_arm(void)
 static void push_report(const bench_report_t *report)
 {
     s_reports[(s_head + s_count++) % REPORT_QUEUE_DEPTH] = *report;
+    uint32_t current = atomic_load(&s_high_water);
+    while (s_count > current &&
+           !atomic_compare_exchange_weak(&s_high_water, &current, (uint32_t)s_count)) {}
 }
 
 const char *hid_bench_enqueue(const kvmctl_hid_event_t *event)
@@ -206,7 +211,10 @@ const char *hid_bench_enqueue(const kvmctl_hid_event_t *event)
     default:
         return "invalid_capability";
     }
-    if (s_count + 1 + (size_t)split_wheel > REPORT_QUEUE_DEPTH) return "resource_exhausted";
+    if (s_count + 1 + (size_t)split_wheel > REPORT_QUEUE_DEPTH) {
+        atomic_fetch_add(&s_overflows, 1);
+        return "resource_exhausted";
+    }
     if (split_wheel) {
         bench_report_t vertical = report;
         vertical.pan = 0;
@@ -328,4 +336,20 @@ bool hid_bench_releasing(void)
 uint32_t hid_bench_reports(void)
 {
     return atomic_load(&s_completed_reports);
+}
+
+uint32_t hid_bench_fifo_high_water(void)
+{
+    return atomic_load(&s_high_water);
+}
+
+uint32_t hid_bench_fifo_overflows(void)
+{
+    return atomic_load(&s_overflows);
+}
+
+void hid_bench_reset_fifo_metrics(void)
+{
+    atomic_store(&s_high_water, 0);
+    atomic_store(&s_overflows, 0);
 }
