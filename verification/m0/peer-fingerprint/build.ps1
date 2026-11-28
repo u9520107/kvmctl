@@ -8,19 +8,29 @@ $project = (Resolve-Path -LiteralPath $ProjectDirectory).Path
 if (-not (Test-Path -LiteralPath (Join-Path $project 'CMakeLists.txt'))) {
     throw 'ProjectDirectory must contain an ESP-IDF CMakeLists.txt.'
 }
-$trustedSource = (Resolve-Path -LiteralPath $WebrtcSource).Path.Replace('\', '/')
-$revision = git -c "safe.directory=$trustedSource" -C $WebrtcSource rev-parse HEAD
-if ($LASTEXITCODE -ne 0 -or $revision -ne '3971094e2e7c2ab7cb4de59e4eae710e1902d2b4') {
-    throw 'Expected the recorded esp-webrtc-solution v1.3.0 revision.'
+$localPeer = Join-Path $project 'third_party/esp_peer'
+$useLocalPeer = Test-Path -LiteralPath (Join-Path $localPeer 'CMakeLists.txt')
+if ($useLocalPeer) {
+    $env:KVMCTL_PEER_SOURCE = $localPeer
+    Write-Output "Using JetKVM Mini source-built esp_peer: $localPeer"
+} else {
+    $trustedSource = (Resolve-Path -LiteralPath $WebrtcSource).Path.Replace('\', '/')
+    $revision = git -c "safe.directory=$trustedSource" -C $WebrtcSource rev-parse HEAD
+    if ($LASTEXITCODE -ne 0 -or $revision -ne '3971094e2e7c2ab7cb4de59e4eae710e1902d2b4') {
+        throw 'Expected the recorded esp-webrtc-solution v1.3.0 revision.'
+    }
+    git -c "safe.directory=$trustedSource" -C $WebrtcSource diff --quiet HEAD -- components/esp_peer/src components/esp_peer/include components/esp_peer/libs components/esp_peer/CMakeLists.txt components/esp_peer/idf_component.yml
+    if ($LASTEXITCODE -ne 0) { throw 'Peer implementation differs from the recorded revision.' }
+    $env:KVMCTL_PEER_SOURCE = Join-Path $WebrtcSource 'components/esp_peer'
 }
-git -c "safe.directory=$trustedSource" -C $WebrtcSource diff --quiet HEAD -- components/esp_peer/src components/esp_peer/include components/esp_peer/libs components/esp_peer/CMakeLists.txt components/esp_peer/idf_component.yml
-if ($LASTEXITCODE -ne 0) { throw 'Peer implementation differs from the recorded revision.' }
-$env:KVMCTL_PEER_SOURCE = Join-Path $WebrtcSource 'components/esp_peer'
 . C:/Espressif/tools/Microsoft.v6.1.1.PowerShell_profile.ps1
 $env:IDF_CCACHE_ENABLE = '0'
 $env:CCACHE_DISABLE = '1'
 Set-Location $PSScriptRoot
-if ($Harden) {
+if ($Harden -and $useLocalPeer) {
+    $source = Get-Content -LiteralPath (Join-Path $localPeer 'src/esp_peer.c') -Raw
+    if (-not $source.Contains('dtls_fingerprint_expect')) { throw 'Local Mini peer source lacks SDP fingerprint enforcement.' }
+} elseif ($Harden) {
     $patch = Join-Path $PSScriptRoot 'esp-peer-fingerprint.patch'
     $sha = [Security.Cryptography.SHA256]::Create()
     try { $patchHash = [BitConverter]::ToString($sha.ComputeHash([IO.File]::ReadAllBytes($patch))).Replace('-', '').ToLowerInvariant() }

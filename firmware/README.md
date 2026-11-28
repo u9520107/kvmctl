@@ -10,10 +10,9 @@ for `esp32s3` with Espressif Installation Manager, including CMake, Ninja, and
 the ESP-IDF Python environment. The repository build script loads the installed
 profile from `C:\Espressif\tools\Microsoft.v6.1.1.PowerShell_profile.ps1`.
 
-The pinned `esp-webrtc-solution` checkout must be at
-`$env:TEMP\esp-peer-v1.3.0`, or pass `-WebrtcSource` with its path. It must
-contain the cached `esp_libsrtp` 1.0.0 component at
-`components\esp_peer\examples\peer_demo\managed_components\espressif__esp_libsrtp`.
+The repository vendors JetKVM Mini's source-built `third_party/esp_peer`
+snapshot. A cached `esp_libsrtp` component may still be supplied through
+`KVMCTL_LIBSRTP_SOURCE`; no prebuilt peer library is used.
 
 ```powershell
 $env:PYTHONUTF8 = '1'
@@ -21,8 +20,8 @@ powershell.exe -NoProfile -ExecutionPolicy Bypass -File .\firmware\build-transpo
 certutil -hashfile .\firmware\build\kvmctl_firmware.bin SHA256
 ```
 
-The script verifies the pinned peer revision, applies the fingerprint patch,
-and builds `firmware\build\kvmctl_firmware.bin`. The first build may fetch
+The script verifies the vendored Mini peer's SDP fingerprint enforcement and
+builds `firmware\build\kvmctl_firmware.bin`. The first build may fetch
 pinned components from the ESP Component Registry. The build does not flash a
 board.
 
@@ -69,26 +68,24 @@ RGB LED**; firmware logs that LED controls are unavailable.
 The product adds a no-HID DataChannel echo endpoint. It accepts offer/close
 commands only over the USB administration protocol; USB SDP exchange is an
 internal test path, not production signaling. The firmware starts a peer only
-when Wi-Fi is associated. It supports reliable ordered `control` and `input`
-channels plus an unordered `motion` channel with zero retransmissions. No
-physical input is captured and no HID reports are emitted.
+when Wi-Fi is associated. It supports Mini's reliable ordered `rpc` and
+`hidrpc` channels plus ordered and unordered `hidrpc-unreliable-*` channels
+with zero retransmissions. HIDRPC uses Mini's binary reports; `rpc` uses
+JSON-RPC text. No physical input is captured and no HID reports are emitted.
 
-The transport build requires ESP-IDF 6.1.1 and the pinned Espressif
-`esp-webrtc-solution` checkout at commit
-`3971094e2e7c2ab7cb4de59e4eae710e1902d2b4`. The script exports that source to a
-content-addressed temporary component tree and applies
-`verification/m0/peer-fingerprint/esp-peer-fingerprint.patch`; it verifies the
-upstream revision and checks that the peer implementation matches it before
-building. By default, it expects the checkout at
-`$env:TEMP\esp-peer-v1.3.0`. If it is elsewhere, pass the checkout path:
+The transport build requires ESP-IDF 6.1.1 and uses the vendored Mini peer
+source directly. Its source-built SCTP advertises twenty negotiated stream
+IDs (ten slots per direction), and the firmware logs DCEP labels, stream IDs,
+association close state, application bytes, and channel-open counts. DTLS
+fingerprint rejection remains fail-closed.
 
 ```powershell
 powershell.exe -NoProfile -ExecutionPolicy Bypass -File .\build-transport.ps1 -WebrtcSource C:\path\to\esp-webrtc-solution
 ```
 
-The Windows script also expects `esp_libsrtp` 1.0.0 under
-`components/esp_peer/examples/peer_demo/managed_components/espressif__esp_libsrtp`
-inside the peer checkout.
+An older Espressif checkout can still be passed for the managed libSRTP cache,
+but it is not used as the peer implementation when the vendored Mini source is
+present.
 
 The build does not flash the board. For an on-board ESP32-to-Windows test after
 the firmware is installed and Wi-Fi is configured, run this from the workspace

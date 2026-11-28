@@ -304,11 +304,23 @@ async fn exchange(
     let (command_tx, command_rx) = std::sync::mpsc::channel();
     let (closed_tx, mut closed_rx) = channel(1);
     let result = async {
-        let control = pc.create_data_channel("control", None).await?;
-        let input = pc.create_data_channel("input", None).await?;
+        // Browser-created Mini channels consume even SCTP stream IDs in this
+        // order: rpc=0, hidrpc=2, ordered-unreliable=4, unordered=6.
+        let control = pc.create_data_channel("rpc", None).await?;
+        let input = pc.create_data_channel("hidrpc", None).await?;
+        let motion_ordered = pc
+            .create_data_channel(
+                "hidrpc-unreliable-ordered",
+                Some(RTCDataChannelInit {
+                    ordered: true,
+                    max_retransmits: Some(0),
+                    ..Default::default()
+                }),
+            )
+            .await?;
         let motion = pc
             .create_data_channel(
-                "motion",
+                "hidrpc-unreliable-nonordered",
                 Some(RTCDataChannelInit {
                     ordered: false,
                     max_retransmits: Some(0),
@@ -316,29 +328,38 @@ async fn exchange(
                 }),
             )
             .await?;
-        ensure!(
-            control.label().await? == "control",
-            "invalid control channel label"
-        );
-        ensure!(control.ordered().await?, "control channel must be ordered");
+        ensure!(control.label().await? == "rpc", "invalid rpc channel label");
+        ensure!(control.ordered().await?, "rpc channel must be ordered");
         ensure!(
             control.max_retransmits().await?.is_none()
                 && control.max_packet_life_time().await?.is_none(),
-            "control channel must be reliable"
+            "rpc channel must be reliable"
         );
         ensure!(
-            input.label().await? == "input",
-            "invalid input channel label"
+            input.label().await? == "hidrpc",
+            "invalid hidrpc channel label"
         );
-        ensure!(input.ordered().await?, "input channel must be ordered");
+        ensure!(input.ordered().await?, "hidrpc channel must be ordered");
         ensure!(
             input.max_retransmits().await?.is_none()
                 && input.max_packet_life_time().await?.is_none(),
-            "input channel must be reliable"
+            "hidrpc channel must be reliable"
         );
         ensure!(
-            motion.label().await? == "motion",
-            "invalid motion channel label"
+            motion_ordered.label().await? == "hidrpc-unreliable-ordered",
+            "invalid ordered unreliable HID channel label"
+        );
+        ensure!(
+            motion_ordered.ordered().await?,
+            "ordered unreliable HID channel must be ordered"
+        );
+        ensure!(
+            motion_ordered.max_retransmits().await? == Some(0),
+            "ordered unreliable HID channel must use zero retransmissions"
+        );
+        ensure!(
+            motion.label().await? == "hidrpc-unreliable-nonordered",
+            "invalid unordered unreliable HID channel label"
         );
         ensure!(!motion.ordered().await?, "motion channel must be unordered");
         ensure!(
@@ -449,6 +470,7 @@ async fn exchange(
             &*runtime,
             &control,
             &input,
+            &motion_ordered,
             &motion,
             &peer_failed,
             &device_status,
@@ -504,6 +526,7 @@ async fn wait_open(
     runtime: &dyn Runtime,
     control: &Arc<dyn DataChannel>,
     input: &Arc<dyn DataChannel>,
+    motion_ordered: &Arc<dyn DataChannel>,
     motion: &Arc<dyn DataChannel>,
     peer_failed: &AtomicBool,
     device_status: &AtomicU8,
@@ -511,8 +534,8 @@ async fn wait_open(
     expected_fingerprint_mismatch: bool,
 ) -> Result<()> {
     let started = Instant::now();
-    let mut open = [false, false, false];
-    while !open[0] || !open[1] || !open[2] {
+    let mut open = [false, false, false, false];
+    while !open.iter().all(|value| *value) {
         if expected_fingerprint_mismatch && CERTIFICATE_REJECTED.load(Ordering::Acquire) {
             let opened = open.into_iter().filter(|value| *value).count();
             if opened != 0 {
@@ -561,7 +584,10 @@ async fn wait_open(
                 error_location,
             );
         }
-        for (index, channel) in [control, input, motion].into_iter().enumerate() {
+        for (index, channel) in [control, input, motion_ordered, motion]
+            .into_iter()
+            .enumerate()
+        {
             if open[index] {
                 continue;
             }
@@ -941,6 +967,10 @@ async fn test_competing_signaling(
 struct SignalingPeer<P> {
     session: crate::signaling::Session,
     pc: P,
+    rpc: Arc<dyn DataChannel>,
+    hidrpc: Arc<dyn DataChannel>,
+    hidrpc_unreliable_nonordered: Arc<dyn DataChannel>,
+    // Compatibility aliases for the existing diagnostics/bench paths.
     control: Arc<dyn DataChannel>,
     input: Arc<dyn DataChannel>,
     motion: Arc<dyn DataChannel>,
@@ -991,16 +1021,22 @@ async fn open_signaling_peer(
         .build()
         .await?;
     let result = async {
-        let control = pc.create_data_channel("control", None).await?;
-        let input = pc.create_data_channel("input", None).await?;
+        let control = pc.create_data_channel("rpc", None).await?;
+        let input = pc.create_data_channel("hidrpc", None).await?;
+        let motion_ordered = pc.create_data_channel(
+            "hidrpc-unreliable-ordered",
+            Some(RTCDataChannelInit { ordered: true, max_retransmits: Some(0), ..Default::default() }),
+        ).await?;
         let motion = pc.create_data_channel(
-            "motion",
+            "hidrpc-unreliable-nonordered",
             Some(RTCDataChannelInit { ordered: false, max_retransmits: Some(0), ..Default::default() }),
         ).await?;
         ensure!(control.ordered().await? && control.max_retransmits().await?.is_none(),
-                "control channel must be reliable and ordered");
+                "rpc channel must be reliable and ordered");
         ensure!(input.ordered().await? && input.max_retransmits().await?.is_none(),
-                "input channel must be reliable and ordered");
+                "hidrpc channel must be reliable and ordered");
+        ensure!(motion_ordered.ordered().await? && motion_ordered.max_retransmits().await? == Some(0),
+                "ordered unreliable HID channel must be ordered with zero retransmissions");
         ensure!(!motion.ordered().await? && motion.max_retransmits().await? == Some(0),
                 "motion channel must be unordered with zero retransmissions");
 
@@ -1016,21 +1052,25 @@ async fn open_signaling_peer(
             &*runtime,
             &control,
             &input,
+            &motion_ordered,
             &motion,
             &peer_failed,
             device_status,
             &connection_states,
             false,
         ).await?;
-        eprintln!("M1.3 DTLS_OPEN elapsed_ms={} control=ordered-reliable input=ordered-reliable motion=unordered-zero-retransmit",
+        eprintln!("M1.3 DTLS_OPEN elapsed_ms={} rpc=ordered-reliable hidrpc=ordered-reliable hidrpc_unreliable_ordered=ordered-zero-retransmit hidrpc_unreliable_nonordered=unordered-zero-retransmit",
                   started.elapsed().as_millis());
 
-        Ok((control, input, motion, offer_sdp, offer_exchange.client_transcript_proof))
+        Ok((control, input, motion_ordered, motion, offer_sdp, offer_exchange.client_transcript_proof))
     }.await;
     match result {
-        Ok((control, input, motion, offer_sdp, proof)) => Ok(SignalingPeer {
+        Ok((control, input, _motion_ordered, motion, offer_sdp, proof)) => Ok(SignalingPeer {
             session,
             pc,
+            rpc: control.clone(),
+            hidrpc: input.clone(),
+            hidrpc_unreliable_nonordered: motion.clone(),
             control,
             input,
             motion,
@@ -1454,6 +1494,20 @@ impl SessionControl {
             .unwrap()
             .as_ref()
             .is_some_and(|input| input.remote)
+    }
+
+    fn input_buttons(&self) -> u8 {
+        self.input
+            .lock()
+            .unwrap()
+            .as_ref()
+            .map_or(0, |input| input.buttons)
+    }
+
+    fn input_keyboard_active(&self) -> bool {
+        self.input.lock().unwrap().as_ref().is_some_and(|input| {
+            input.keyboard.modifiers != 0 || !input.keyboard.reported_keys().is_empty()
+        })
     }
 
     fn input_faulted(&self) -> bool {
@@ -2007,6 +2061,19 @@ async fn run_session_once<F>(
 where
     F: FnMut(SessionEvent),
 {
+    if std::env::var_os("KVMCTL_LEGACY_PROTOCOL").is_none() {
+        return run_mini_session_once(
+            runtime,
+            address,
+            hostname,
+            status,
+            credential,
+            control,
+            on_event,
+            device_status,
+        )
+        .await;
+    }
     let mut peer = match open_signaling_peer(
         runtime.clone(),
         device_status,
@@ -2652,6 +2719,253 @@ async fn receive_endpoint_response_any_epoch(
             _ => {}
         }
     }
+}
+
+async fn run_mini_session_once<F: FnMut(SessionEvent)>(
+    runtime: Arc<dyn Runtime>,
+    address: SocketAddr,
+    hostname: &str,
+    status: &crate::Status,
+    credential: &crate::credentials::ClientCredential,
+    control: &SessionControl,
+    on_event: &mut F,
+    device_status: &AtomicU8,
+) -> Result<SessionExit> {
+    let mut peer = match open_signaling_peer(
+        runtime.clone(),
+        device_status,
+        address,
+        hostname,
+        status,
+        credential,
+    )
+    .await
+    {
+        Ok(peer) => peer,
+        Err(error) => return Ok(SessionExit::Unavailable(error.to_string())),
+    };
+    let session_result: Result<SessionExit> = async {
+        peer.session
+            .send_transcript_proof(&peer.proof)
+            .map_err(anyhow::Error::msg)
+            .context("foreground session authorization")?;
+        control.discard_pre_lease_shortcuts();
+        if control.is_cancelled() {
+            return Ok(SessionExit::Disconnected);
+        }
+        mini_hid_handshake(&*runtime, &peer.hidrpc).await?;
+        // Mini has no kvmctl lease frame.  Capture authority begins at the
+        // authenticated peer generation and is invalidated on close.
+        let epoch = 1;
+        control.input_ready(epoch)?;
+        eprintln!(
+            "M2.3 SESSION authenticated=true input_local=true physical_input_capture={} input_channels=hidrpc+hidrpc-unreliable-nonordered motion_rate_hz={} escape=ready",
+            if control.input_enabled() { "armed-local" } else { "off" },
+            if control.input_enabled() {
+                control.input_motion_rate_hz().to_string()
+            } else {
+                "off".to_owned()
+            },
+        );
+        on_event(SessionEvent::ConnectedLocal);
+
+        let mut next_ping = Instant::now();
+        let mut ping_sent_at = None;
+        let mut missed = 0u8;
+        let mut degraded = false;
+        let mut ping_id = 0u64;
+        let mut input = MiniInput::default();
+        loop {
+            if control.is_cancelled() {
+                if control.input_set_local()? {
+                    mini_send_neutral(&peer.hidrpc).await?;
+                    on_event(SessionEvent::InputLocalConfirmed);
+                }
+                return Ok(SessionExit::Disconnected);
+            }
+            let now = Instant::now();
+            if ping_sent_at.is_some_and(|sent| now.duration_since(sent) >= HEARTBEAT_INTERVAL) {
+                ping_sent_at = None;
+                missed = missed.saturating_add(1);
+                if !degraded {
+                    degraded = true;
+                    on_event(SessionEvent::ConnectionDegraded { missed });
+                }
+            }
+            if now >= next_ping && ping_sent_at.is_none() {
+                ping_id = ping_id.wrapping_add(1);
+                let request = format!(
+                    "{{\"jsonrpc\":\"2.0\",\"method\":\"ping\",\"params\":{{}},\"id\":{ping_id}}}"
+                );
+                peer.rpc.send_text(&request).await?;
+                ping_sent_at = Some(Instant::now());
+                next_ping += HEARTBEAT_INTERVAL;
+            }
+            process_mini_input_events(
+                &peer.hidrpc,
+                &peer.hidrpc_unreliable_nonordered,
+                control,
+                epoch,
+                &mut input,
+                on_event,
+            ).await?;
+            match timeout(&*runtime, Duration::from_millis(5), peer.rpc.poll()).await {
+                Ok(Some(DataChannelEvent::OnMessage(message))) => {
+                    if message.data.first() == Some(&b'{') {
+                        if let Some(sent) = ping_sent_at.take() {
+                            let rtt_ms = Instant::now().duration_since(sent).as_millis() as u64;
+                            if degraded {
+                                on_event(SessionEvent::ConnectionRecovered { rtt_ms });
+                            }
+                            missed = 0;
+                            degraded = false;
+                        }
+                    }
+                }
+                Ok(Some(DataChannelEvent::OnClose)) | Ok(None) => {
+                    return Ok(SessionExit::Lost("Mini rpc channel closed".into()));
+                }
+                Ok(_) | Err(_) => {}
+            }
+        }
+    }.await;
+
+    if control.input_set_local().unwrap_or(false) {
+        let _ = mini_send_neutral(&peer.hidrpc).await;
+        on_event(SessionEvent::InputLocalConfirmed);
+    }
+    control.input_fail_closed();
+    peer.close(&*runtime).await;
+    match session_result {
+        Ok(exit) => Ok(exit),
+        Err(error) => Ok(SessionExit::Lost(error.to_string())),
+    }
+}
+
+#[derive(Default)]
+struct MiniInput {
+    motion: (i32, i32),
+    last_motion_sent: Option<Instant>,
+    last_keyboard_keepalive: Option<Instant>,
+}
+
+async fn mini_hid_handshake(runtime: &dyn Runtime, channel: &Arc<dyn DataChannel>) -> Result<()> {
+    channel
+        .send(BytesMut::from(crate::mini_hid::HANDSHAKE.as_slice()))
+        .await?;
+    loop {
+        match timeout(runtime, Duration::from_secs(5), channel.poll()).await? {
+            Some(DataChannelEvent::OnMessage(message)) if message.data.as_ref() == [1, 1] => {
+                return Ok(());
+            }
+            Some(DataChannelEvent::OnClose) | None => bail!("Mini hidrpc closed during handshake"),
+            Some(_) => {}
+        }
+    }
+}
+
+async fn mini_send_event(
+    channel: &Arc<dyn DataChannel>,
+    event: &crate::hid_protocol::Event,
+    buttons: u8,
+) -> Result<()> {
+    let frame = crate::mini_hid::encode(event, buttons)
+        .context("event has no Mini HIDRPC representation")?;
+    channel.send(BytesMut::from(frame.as_slice())).await?;
+    Ok(())
+}
+
+async fn mini_send_neutral(channel: &Arc<dyn DataChannel>) -> Result<()> {
+    mini_send_event(
+        channel,
+        &crate::hid_protocol::Event::KeyboardState {
+            modifiers: 0,
+            keys: Vec::new(),
+        },
+        0,
+    )
+    .await?;
+    mini_send_event(
+        channel,
+        &crate::hid_protocol::Event::MouseButtons { mask: 0 },
+        0,
+    )
+    .await
+}
+
+async fn process_mini_input_events<F: FnMut(SessionEvent)>(
+    hidrpc: &Arc<dyn DataChannel>,
+    motion_channel: &Arc<dyn DataChannel>,
+    control: &SessionControl,
+    epoch: u32,
+    input: &mut MiniInput,
+    on_event: &mut F,
+) -> Result<()> {
+    use crate::input_capture::{self, InputEvent};
+    control.check_input_health()?;
+    if !control.input_epoch_matches(epoch) {
+        bail!("input capture generation changed");
+    }
+    if control.take_escape() {
+        if control.input_is_remote() {
+            if control.input_set_local()? {
+                mini_send_neutral(hidrpc).await?;
+                on_event(SessionEvent::InputLocalConfirmed);
+            }
+        } else if input_capture::capture_supported() {
+            control.request_remote(0)?;
+            if control.confirm_remote(epoch) {
+                on_event(SessionEvent::InputRemoteConfirmed);
+            }
+        }
+    }
+    if !control.input_is_remote() {
+        return Ok(());
+    }
+    for _ in 0..8 {
+        let Some(event) = control.next_input_event()? else {
+            break;
+        };
+        match event {
+            InputEvent::RemoteReady(_) => {}
+            InputEvent::Motion { dx, dy } => {
+                input.motion.0 += dx;
+                input.motion.1 += dy;
+            }
+            event => {
+                if let Some(event) = control.input_update(event) {
+                    mini_send_event(hidrpc, &event, control.input_buttons()).await?;
+                }
+            }
+        }
+    }
+    if control.input_keyboard_active()
+        && input
+            .last_keyboard_keepalive
+            .is_none_or(|sent| sent.elapsed() >= Duration::from_millis(50))
+    {
+        hidrpc
+            .send(BytesMut::from(crate::mini_hid::KEEPALIVE.as_slice()))
+            .await?;
+        input.last_keyboard_keepalive = Some(Instant::now());
+    } else if !control.input_keyboard_active() {
+        input.last_keyboard_keepalive = None;
+    }
+    if input.motion != (0, 0)
+        && input
+            .last_motion_sent
+            .is_none_or(|sent| sent.elapsed() >= control.input_motion_interval())
+    {
+        let (dx, dy) = take_motion_chunk(&mut input.motion);
+        mini_send_event(
+            motion_channel,
+            &crate::hid_protocol::Event::Motion { dx, dy },
+            control.input_buttons(),
+        )
+        .await?;
+        input.last_motion_sent = Some(Instant::now());
+    }
+    Ok(())
 }
 
 async fn send_hid_event(

@@ -73,8 +73,10 @@ typedef struct {
     uint32_t generation;
     peer_sdp_t *sdp;
     size_t answer_len;
+    esp_peer_handle_t peer;
     echo_channel_t control;
     echo_channel_t input;
+    echo_channel_t motion_ordered;
     echo_channel_t motion;
     response_queue_t responses;
     atomic_uchar open_channels;
@@ -771,7 +773,7 @@ static void peer_disconnected(transport_peer_t *slot)
 {
     if (!slot || atomic_load(&slot->close_requested)) return;
     /* Close callbacks can arrive before signaling teardown requests close. */
-    if (atomic_load(&slot->open_channels) == 3) {
+    if (atomic_load(&slot->open_channels) == 4) {
         atomic_store(&slot->close_requested, true);
     } else {
         fail_session(slot);
@@ -805,25 +807,96 @@ static int on_channel(esp_peer_data_channel_info_t *channel, void *ctx)
 {
     transport_peer_t *slot = ctx;
     if (!slot || !channel || !channel->label) { if (slot) fail_session(slot); return -1; }
-    echo_channel_t *target = strcmp(channel->label, "control") == 0 ? &slot->control :
-                             strcmp(channel->label, "input") == 0 ? &slot->input :
-                             strcmp(channel->label, "motion") == 0 ? &slot->motion : NULL;
+    echo_channel_t *target = strcmp(channel->label, "rpc") == 0 ? &slot->control :
+                             strcmp(channel->label, "hidrpc") == 0 ? &slot->input :
+                             strcmp(channel->label, "hidrpc-unreliable-ordered") == 0 ? &slot->motion_ordered :
+                             strcmp(channel->label, "hidrpc-unreliable-nonordered") == 0 ? &slot->motion : NULL;
     if (!target || target->open || (slot->control.open && channel->stream_id == slot->control.stream) ||
         (slot->input.open && channel->stream_id == slot->input.stream) ||
+        (slot->motion_ordered.open && channel->stream_id == slot->motion_ordered.stream) ||
         (slot->motion.open && channel->stream_id == slot->motion.stream)) { fail_session(slot); return -1; }
     target->stream = channel->stream_id;
     target->open = true;
     ++slot->open_channels;
     atomic_fetch_add(&s_open_channels, 1);
     atomic_fetch_add(&s_channel_opens, 1);
+    ESP_LOGI("kvmctl_signal", "DCEP OPEN label=%s stream=%u opens=%u", channel->label,
+             (unsigned)channel->stream_id, (unsigned)slot->open_channels);
     return 0;
 }
 
 static int on_channel_close(esp_peer_data_channel_info_t *channel, void *ctx)
 {
+    if (channel && channel->label) {
+        ESP_LOGI("kvmctl_signal", "DCEP CLOSE label=%s stream=%u", channel->label,
+                 (unsigned)channel->stream_id);
+    }
     (void)channel;
     peer_disconnected(ctx);
     return 0;
+}
+
+static bool mini_lease_ready(transport_peer_t *slot)
+{
+    bool ready = false;
+    lease_log_snapshot_t log = {0};
+    lease_lock();
+    uint64_t now = (uint64_t)esp_timer_get_time() / 1000ULL;
+    lease_tick_locked(now, &log);
+    if (!s_lease.active) {
+        ready = lease_request(&s_lease, lease_slot_identity((int)(slot - s_peers)), NULL, now) == LEASE_GRANTED;
+    } else {
+        ready = memcmp(s_lease.owner, lease_slot_identity((int)(slot - s_peers)), LEASE_ID_SIZE) == 0;
+    }
+    if (ready) slot->heartbeat_ack_supported = false;
+    lease_unlock();
+    emit_lease_log(&log);
+    return ready;
+}
+
+/* Mini HIDRPC is deliberately exact-size and has no kvmctl envelope. */
+static bool decode_mini_hid(const uint8_t *data, size_t size, bool motion_channel,
+                            kvmctl_hid_event_t *event)
+{
+    if (!data || !event || size == 0) return false;
+    memset(event, 0, sizeof(*event));
+    event->type = 0;
+    switch (data[0]) {
+    case 0x01:
+        return size == 2 && data[1] == 1;
+    case 0x02:
+        if (size != 8) return false;
+        event->type = KVMCTL_HID_KEYBOARD_STATE;
+        event->modifier_mask = data[1];
+        for (size_t i = 0; i < 6; ++i) if (data[2 + i]) {
+            if (event->key_count == KVMCTL_HID_MAX_KEYS) return false;
+            event->keys[event->key_count][0] = 7;
+            event->keys[event->key_count++][1] = data[2 + i];
+        }
+        break;
+    case 0x04:
+        if (size != 3) return false;
+        event->type = KVMCTL_HID_WHEEL;
+        event->first_delta = (int8_t)data[1];
+        event->second_delta = (int8_t)data[2];
+        break;
+    case 0x06:
+        if (size != 4) return false;
+        if (motion_channel) {
+            event->type = KVMCTL_HID_MOTION;
+            event->first_delta = (int8_t)data[1];
+            event->second_delta = (int8_t)data[2];
+            event->button_mask = data[3];
+        } else {
+            if (data[1] != 0 || data[2] != 0) return false;
+            event->type = KVMCTL_HID_MOUSE_BUTTONS;
+            event->button_mask = data[3];
+        }
+        break;
+    default:
+        return false;
+    }
+    return event->type != 0;
 }
 
 static int on_data(esp_peer_data_frame_t *frame, void *ctx)
@@ -832,10 +905,71 @@ static int on_data(esp_peer_data_frame_t *frame, void *ctx)
     if (!slot || atomic_load(&slot->close_requested) ||
         !atomic_load(&slot->application_authorized)) return 0;
     if (!frame || !frame->data) { if (slot) fail_session(slot); return -1; }
-    bool motion_channel = slot->motion.open && frame->stream_id == slot->motion.stream;
+    bool motion_ordered_channel = slot->motion_ordered.open && frame->stream_id == slot->motion_ordered.stream;
+    bool motion_channel = motion_ordered_channel || (slot->motion.open && frame->stream_id == slot->motion.stream);
     bool input_channel = slot->input.open && frame->stream_id == slot->input.stream;
     bool control_channel = slot->control.open && frame->stream_id == slot->control.stream;
     if (!control_channel && !input_channel && !motion_channel) { fail_session(slot); return -1; }
+    if (input_channel && frame->type == ESP_PEER_DATA_CHANNEL_DATA && frame->size == 2 &&
+        frame->data[0] == 0x01 && frame->data[1] == 0x01) {
+        if (!mini_lease_ready(slot)) { fail_session(slot); return -1; }
+        static uint8_t handshake[] = {0x01, 0x01};
+        esp_peer_data_frame_t reply = {.type = ESP_PEER_DATA_CHANNEL_DATA,
+                                       .stream_id = slot->input.stream,
+                                       .data = handshake, .size = sizeof(handshake)};
+        if (esp_peer_send_data(slot->peer, &reply) != ESP_PEER_ERR_NONE) {
+            fail_session(slot); return -1;
+        }
+        atomic_fetch_add(&s_application_bytes_received, (uint32_t)frame->size);
+        ESP_LOGI("kvmctl_signal", "HIDRPC handshake stream=%u", (unsigned)frame->stream_id);
+        return 0;
+    }
+    if (input_channel && frame->type == ESP_PEER_DATA_CHANNEL_DATA && frame->size == 1 &&
+        frame->data[0] == 0x09) {
+        if (!mini_lease_ready(slot)) { fail_session(slot); return -1; }
+        atomic_fetch_add(&s_application_bytes_received, (uint32_t)frame->size);
+        return 0;
+    }
+    if (control_channel && frame->type == ESP_PEER_DATA_CHANNEL_STRING) {
+        char rpc[128];
+        size_t length = frame->size > 0 && (size_t)frame->size < sizeof(rpc) ? (size_t)frame->size : 0;
+        if (!length) { fail_session(slot); return -1; }
+        memcpy(rpc, frame->data, length);
+        rpc[length] = 0;
+        if (strstr(rpc, "\"method\":\"ping\"") != NULL) {
+            static const char response[] = "{\"jsonrpc\":\"2.0\",\"result\":\"pong\",\"id\":1}";
+            esp_peer_data_frame_t reply = {.type = ESP_PEER_DATA_CHANNEL_STRING,
+                                           .stream_id = slot->control.stream,
+                                           .data = (uint8_t *)response,
+                                           .size = (int)(sizeof(response) - 1)};
+            if (esp_peer_send_data(slot->peer, &reply) != ESP_PEER_ERR_NONE) {
+                fail_session(slot); return -1;
+            }
+        }
+        atomic_fetch_add(&s_application_bytes_received, (uint32_t)frame->size);
+        return 0;
+    }
+    if ((input_channel || motion_channel) && frame->type == ESP_PEER_DATA_CHANNEL_DATA &&
+        frame->size > 0 && frame->data[0] != 0x01 && (frame->data[0] == 0x02 || frame->data[0] == 0x04 || frame->data[0] == 0x06)) {
+        kvmctl_hid_event_t event;
+        if (!mini_lease_ready(slot) || !decode_mini_hid(frame->data, (size_t)frame->size, motion_channel, &event)) {
+            atomic_fetch_add(&s_scripted_rejections, 1); fail_session(slot); return -1;
+        }
+        memcpy(event.session_id, slot->session_id, sizeof(event.session_id));
+        event.lease_epoch = s_lease.epoch;
+        event.sequence = slot->input_sequence++;
+        int accepted = accept_scripted_event((int)(slot - s_peers), &event, motion_channel);
+        if (accepted < 0) { atomic_fetch_add(&s_scripted_rejections, 1); fail_session(slot); return -1; }
+        if (event.type == KVMCTL_HID_MOTION) {
+            lease_lock();
+            (void)lease_set_held(&s_lease, lease_slot_identity((int)(slot - s_peers)), event.lease_epoch,
+                                 s_lease.held_keys, event.button_mask != 0);
+            lease_unlock();
+        }
+        atomic_fetch_add(&s_scripted_events, 1);
+        atomic_fetch_add(&s_application_bytes_received, (uint32_t)frame->size);
+        return 0;
+    }
     if (frame->size > 0 && (frame->data[0] >> 5) == 5) {
         uint64_t processing_started_us = (uint64_t)esp_timer_get_time();
         kvmctl_hid_event_t event;
@@ -970,6 +1104,7 @@ static void peer_cleanup(transport_peer_t *slot)
     mbedtls_platform_zeroize(slot->sdp, sizeof(*slot->sdp));
     memset(&slot->control, 0, sizeof(slot->control));
     memset(&slot->input, 0, sizeof(slot->input));
+    memset(&slot->motion_ordered, 0, sizeof(slot->motion_ordered));
     memset(&slot->motion, 0, sizeof(slot->motion));
     int response_peer = peer_index(slot);
     if (response_peer >= 0) {
@@ -978,6 +1113,7 @@ static void peer_cleanup(transport_peer_t *slot)
         portEXIT_CRITICAL(&s_response_mux[response_peer]);
     }
     slot->answer_len = 0;
+    slot->peer = NULL;
     slot->open_channels = 0;
     mbedtls_platform_zeroize(slot->client_fingerprint, sizeof(slot->client_fingerprint));
     mbedtls_platform_zeroize(slot->session_id, sizeof(slot->session_id));
@@ -1007,7 +1143,14 @@ static void peer_task(void *arg)
         .on_channel_open = on_channel, .on_channel_close = on_channel_close,
         .ctx = slot, .extra_cfg = &defaults, .extra_size = sizeof(defaults),
     };
+    /* Match browser/Mini DTLS suites; avoid legacy CBC selection by the Rust peer. */
+    if (esp_peer_set_dtls_cipher_pref(ESP_PEER_DTLS_CIPHER_AES_GCM) != 0) {
+        fail_session(slot);
+        vTaskDelete(NULL);
+        return;
+    }
     int ret = esp_peer_open(&config, esp_peer_get_default_impl(), &peer);
+    slot->peer = peer;
     const char *setup_stage = "open";
     if (ret == ESP_PEER_ERR_NONE) {
         setup_stage = "new connection";
@@ -1037,7 +1180,8 @@ static void peer_task(void *arg)
             lease_unlock();
             emit_lease_log(&lease_log);
             if (!send_response(peer, slot) || !send_echo(peer, &slot->control) ||
-                !send_echo(peer, &slot->input) || !send_echo(peer, &slot->motion)) fail_session(slot);
+                !send_echo(peer, &slot->input) || !send_echo(peer, &slot->motion_ordered) ||
+                !send_echo(peer, &slot->motion)) fail_session(slot);
             vTaskDelay(pdMS_TO_TICKS(1));
         }
     }
@@ -1258,6 +1402,7 @@ static esp_err_t transport_offer_internal(const uint8_t *client_fingerprint,
     }
     memset(&slot->control, 0, sizeof(slot->control));
     memset(&slot->input, 0, sizeof(slot->input));
+    memset(&slot->motion_ordered, 0, sizeof(slot->motion_ordered));
     memset(&slot->motion, 0, sizeof(slot->motion));
     int response_peer = peer_index(slot);
     if (response_peer >= 0) {
@@ -1345,7 +1490,7 @@ esp_err_t transport_authorize_client(const uint8_t fingerprint[32], uint32_t gen
     portENTER_CRITICAL(&s_peer_mux);
     transport_peer_t *slot = find_slot(fingerprint, generation);
     bool ready = slot && !atomic_load(&slot->close_requested) && !atomic_load(&slot->failed) &&
-                 !atomic_load(&slot->identity_rejected) && slot->open_channels == 3;
+                 !atomic_load(&slot->identity_rejected) && slot->open_channels == 4;
     if (ready) atomic_store(&slot->application_authorized, true);
     portEXIT_CRITICAL(&s_peer_mux);
     return ready && client_auth_is_enrolled(fingerprint) ? ESP_OK : ESP_ERR_INVALID_STATE;
@@ -1379,7 +1524,7 @@ transport_status_t transport_status(void)
     for (size_t i = 0; i < MAX_TRANSPORT_PEERS; ++i) {
         if (atomic_load(&s_peers[i].active)) {
             any_active = true;
-            any_open |= s_peers[i].open_channels == 3;
+            any_open |= s_peers[i].open_channels == 4;
             any_failed |= atomic_load(&s_peers[i].failed);
             any_identity_rejected |= atomic_load(&s_peers[i].identity_rejected);
         } else {

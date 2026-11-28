@@ -2,7 +2,7 @@
 set -euo pipefail
 
 firmware=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)
-peer_source=${1:?Usage: bash firmware/build-transport.sh PEER_CHECKOUT [menuconfig]}
+peer_source=${1:-"$firmware/third_party/esp_peer"}
 shift
 if (($# == 0)); then
     set -- reconfigure build
@@ -13,12 +13,19 @@ if ! idf_version=$(idf.py --version) || [[ "$idf_version" != "ESP-IDF v6.1.1" ]]
     exit 1
 fi
 
+mini_peer=false
+if [[ -f "$peer_source/src/core/sctp.c" && -f "$peer_source/CMakeLists.txt" ]]; then
+    mini_peer=true
+fi
 peer_revision=3971094e2e7c2ab7cb4de59e4eae710e1902d2b4
-if [[ $(git -C "$peer_source" rev-parse HEAD) != "$peer_revision" ]]; then
-    echo "Expected esp-webrtc-solution at $peer_revision." >&2
+if [[ "$mini_peer" != true && $(git -C "$peer_source" rev-parse HEAD) != "$peer_revision" ]]; then
+    echo "Expected esp-webrtc-solution at $peer_revision, or the local Mini peer source." >&2
     exit 1
 fi
-libsrtp_source=${KVMCTL_LIBSRTP_SOURCE:-"$peer_source/components/esp_peer/examples/peer_demo/managed_components/espressif__esp_libsrtp"}
+libsrtp_source=${KVMCTL_LIBSRTP_SOURCE:-"$firmware/managed_components/espressif__esp_libsrtp"}
+if [[ "$mini_peer" != true ]]; then
+    libsrtp_source=${KVMCTL_LIBSRTP_SOURCE:-"$peer_source/components/esp_peer/examples/peer_demo/managed_components/espressif__esp_libsrtp"}
+fi
 if [[ ! -f "$libsrtp_source/CMakeLists.txt" ]]; then
     echo "Set KVMCTL_LIBSRTP_SOURCE to the espressif__esp_libsrtp directory for version 1.0.0." >&2
     exit 1
@@ -38,20 +45,23 @@ mkdir -p -- "$build_dir"
 exec 9>"$build_dir/.build.lock"
 flock 9
 
-patch="$firmware/../verification/m0/peer-fingerprint/esp-peer-fingerprint.patch"
-patch_hash=$(sha256sum < "$patch")
-vendor="$build_dir/peer-$peer_revision-${patch_hash%% *}"
-if [[ ! -d "$vendor" ]]; then
-    staging=$(mktemp -d "$build_dir/peer.XXXXXXXX")
-    trap 'rm -rf -- "$staging"' EXIT
-    git -C "$peer_source" archive "$peer_revision" components/esp_peer | tar -xf - -C "$staging"
-    # Apply from the archive root without discovering the outer checkout.
-    GIT_CEILING_DIRECTORIES="$build_dir" git -C "$staging" apply "$patch"
-    mv -- "$staging" "$vendor"
-    trap - EXIT
+if [[ "$mini_peer" == true ]]; then
+    export KVMCTL_PEER_SOURCE=$(realpath -- "$peer_source")
+else
+    patch="$firmware/../verification/m0/peer-fingerprint/esp-peer-fingerprint.patch"
+    patch_hash=$(sha256sum < "$patch")
+    vendor="$build_dir/peer-$peer_revision-${patch_hash%% *}"
+    if [[ ! -d "$vendor" ]]; then
+        staging=$(mktemp -d "$build_dir/peer.XXXXXXXX")
+        trap 'rm -rf -- "$staging"' EXIT
+        git -C "$peer_source" archive "$peer_revision" components/esp_peer | tar -xf - -C "$staging"
+        GIT_CEILING_DIRECTORIES="$build_dir" git -C "$staging" apply "$patch"
+        mv -- "$staging" "$vendor"
+        trap - EXIT
+    fi
+    GIT_CEILING_DIRECTORIES="$build_dir" git -C "$vendor" apply --reverse --check "$patch"
+    export KVMCTL_PEER_SOURCE="$vendor/components/esp_peer"
 fi
-GIT_CEILING_DIRECTORIES="$build_dir" git -C "$vendor" apply --reverse --check "$patch"
-export KVMCTL_PEER_SOURCE="$vendor/components/esp_peer"
 
 source_hash=$(printf '%s\n' "$KVMCTL_PEER_SOURCE" "$KVMCTL_LIBSRTP_SOURCE" | sha256sum)
 idf.py -C "$firmware" -B "$build_dir" --no-ccache \

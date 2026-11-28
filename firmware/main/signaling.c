@@ -421,8 +421,9 @@ static esp_err_t send_challenge(httpd_req_t *req, signaling_session_t *s)
     cbor_writer_t w = {.data = payload, .capacity = sizeof(payload)};
     bool ok = write_uint(&w, 0) && write_bytes(&w, s->challenge.endpoint_fingerprint, 32) &&
               write_uint(&w, 1) && write_bytes(&w, s->challenge.device_nonce, 32) && write_uint(&w, 2) &&
-              write_head(&w, 4, 3) && write_text(&w, "control") && write_text(&w, "input") &&
-              write_text(&w, "motion") &&
+              write_head(&w, 4, 4) && write_text(&w, "hidrpc") &&
+              write_text(&w, "hidrpc-unreliable-nonordered") &&
+              write_text(&w, "hidrpc-unreliable-ordered") && write_text(&w, "rpc") &&
               write_uint(&w, 3) && write_bytes(&w, s->challenge.tls_spki_hash, 32) &&
               write_uint(&w, 4) && write_bytes(&w, signature, signature_len) &&
               write_uint(&w, 5) && write_bytes(&w, spki, spki_len);

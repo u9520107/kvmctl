@@ -65,8 +65,10 @@ static bool put_text(uint8_t *out, size_t capacity, size_t *pos, const char *val
 
 static bool put_capabilities(uint8_t *out, size_t capacity, size_t *pos)
 {
-    return put_head(out, capacity, pos, 4, 3) && put_text(out, capacity, pos, "control") &&
-           put_text(out, capacity, pos, "input") && put_text(out, capacity, pos, "motion");
+    return put_head(out, capacity, pos, 4, 4) && put_text(out, capacity, pos, "hidrpc") &&
+           put_text(out, capacity, pos, "hidrpc-unreliable-nonordered") &&
+           put_text(out, capacity, pos, "hidrpc-unreliable-ordered") &&
+           put_text(out, capacity, pos, "rpc");
 }
 
 esp_err_t signaling_encode_challenge(const signaling_challenge_t *c,

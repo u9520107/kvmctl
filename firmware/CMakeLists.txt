@@ -1,5 +1,12 @@
 cmake_minimum_required(VERSION 3.16)
 
+# JetKVM Mini's source-built peer is the transport authority.  It includes
+# the SCTP/DCEP fixes that the old prebuilt peer missed.  Keep this directory
+# first so a managed esp_peer component cannot silently replace it.
+if(EXISTS "${CMAKE_CURRENT_LIST_DIR}/third_party/esp_peer/CMakeLists.txt")
+    list(PREPEND EXTRA_COMPONENT_DIRS "${CMAKE_CURRENT_LIST_DIR}/third_party/esp_peer")
+endif()
+
 if("$ENV{KVMCTL_HID_BENCH}" STREQUAL "1")
     list(APPEND EXTRA_COMPONENT_DIRS "${CMAKE_CURRENT_LIST_DIR}/hid_bench")
     list(APPEND SDKCONFIG_DEFAULTS "sdkconfig.defaults" "hid_bench/sdkconfig.defaults")

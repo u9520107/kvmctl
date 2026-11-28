@@ -4,7 +4,12 @@ use crate::credentials::ClientCredential;
 const ENDPOINT_CHALLENGE_DOMAIN: &[u8] = b"kvmctl/challenge/v1";
 const CLIENT_PROOF_DOMAIN: &[u8] = b"kvmctl/client-proof/v1";
 const TRANSCRIPT_DOMAIN: &[u8] = b"kvmctl/transcript/v1";
-const CAPABILITIES: [&str; 3] = ["control", "input", "motion"];
+const CAPABILITIES: [&str; 4] = [
+    "hidrpc",
+    "hidrpc-unreliable-nonordered",
+    "hidrpc-unreliable-ordered",
+    "rpc",
+];
 
 pub struct Challenge<'a> {
     pub session_id: &'a [u8; 16],

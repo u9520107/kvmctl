@@ -13,6 +13,8 @@ mod hid_protocol;
 #[cfg(windows)]
 mod input_capture;
 #[cfg(windows)]
+mod mini_hid;
+#[cfg(windows)]
 mod osd;
 #[cfg(windows)]
 mod protocol;
